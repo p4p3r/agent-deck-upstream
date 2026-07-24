@@ -10,19 +10,43 @@
 
 set -u
 
-SKILL_DIR="$HOME/.claude/plugins/cache/agent-deck/agent-deck/12c0a65dfb13/skills/agent-deck"
-SOURCE_CONDUCTOR="$HOME/.agent-deck/conductor/agent-deck"
-SOURCE_PROMPTS="$SOURCE_CONDUCTOR/analysis/prompts"
+# Resolve the skill root from this script's own location rather than a hardcoded
+# plugin-cache hash. This file lives at
+#   <SKILL_DIR>/scripts/self-improvement/analyze-all-conductors.sh
+# so SKILL_DIR is two directories up. Overridable via the SKILL_DIR env var.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SKILL_DIR="${SKILL_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+
+if [[ ! -x "$SKILL_DIR/scripts/launch-subagent.sh" ]]; then
+    echo "analyze-all-conductors.sh: launch-subagent.sh not found under SKILL_DIR=$SKILL_DIR" >&2
+    echo "  Point SKILL_DIR at the skills/agent-deck directory and retry." >&2
+    exit 1
+fi
+
+# Conductor whose analyzer/synthesizer prompts are the template source.
+# Override via the SOURCE_CONDUCTOR env var; defaults to "agent-deck".
+SOURCE_CONDUCTOR="${SOURCE_CONDUCTOR:-agent-deck}"
+SOURCE_CONDUCTOR_DIR="$HOME/.agent-deck/conductor/$SOURCE_CONDUCTOR"
+SOURCE_PROMPTS="$SOURCE_CONDUCTOR_DIR/analysis/prompts"
 PACE=60
 PER_ANALYZER_TIMEOUT=600
 
-# Order: smallest → largest, so failures happen early
-CONDUCTORS=(ryan sherif opengraphdb si personal)
+# Conductors to analyze. Override by passing names as positional args;
+# defaults to the original author's small-conductor set (order: smallest →
+# largest, so failures happen early).
+if [[ $# -gt 0 ]]; then
+    CONDUCTORS=("$@")
+else
+    CONDUCTORS=(ryan sherif opengraphdb si personal)
+fi
 
 ts() { date -Is; }
 log() { echo "[$(ts)] $*"; }
 
 log "===== analyze-other-conductors start ====="
+log "SKILL_DIR=$SKILL_DIR"
+log "SOURCE_PROMPTS=$SOURCE_PROMPTS"
+log "conductors: ${CONDUCTORS[*]}"
 
 for conductor in "${CONDUCTORS[@]}"; do
     CDIR="$HOME/.agent-deck/conductor/$conductor"

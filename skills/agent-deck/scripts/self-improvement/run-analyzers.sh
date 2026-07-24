@@ -5,12 +5,29 @@
 
 set -u
 
-ANALYSIS_DIR="$HOME/.agent-deck/conductor/agent-deck/analysis"
+# Which conductor to analyze. Precedence: positional arg > CONDUCTOR env > default.
+# The historical default ("agent-deck") keeps behavior identical to before.
+CONDUCTOR="${1:-${CONDUCTOR:-agent-deck}}"
+
+# Resolve the skill root from this script's own location rather than a hardcoded
+# plugin-cache hash (which goes stale on every plugin update). This file lives at
+#   <SKILL_DIR>/scripts/self-improvement/run-analyzers.sh
+# so SKILL_DIR is two directories up. Overridable via the SKILL_DIR env var.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SKILL_DIR="${SKILL_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+
+if [[ ! -x "$SKILL_DIR/scripts/launch-subagent.sh" ]]; then
+    echo "run-analyzers.sh: launch-subagent.sh not found under SKILL_DIR=$SKILL_DIR" >&2
+    echo "  Point SKILL_DIR at the skills/agent-deck directory and retry." >&2
+    exit 1
+fi
+
+CONDUCTOR_DIR="$HOME/.agent-deck/conductor/$CONDUCTOR"
+ANALYSIS_DIR="$CONDUCTOR_DIR/analysis"
 DISTILLED_DIR="$ANALYSIS_DIR/distilled"
 REPORTS_DIR="$ANALYSIS_DIR/reports"
 PROMPT_PATH="$ANALYSIS_DIR/prompts/analyzer.md"
 STATUS_FILE="$ANALYSIS_DIR/run-status.log"
-SKILL_DIR="$HOME/.claude/plugins/cache/agent-deck/agent-deck/12c0a65dfb13/skills/agent-deck"
 
 PACE_SECONDS=30
 PER_ANALYZER_TIMEOUT=600   # seconds, for the --wait
@@ -24,7 +41,9 @@ log() {
 }
 
 log "===== run.sh start ====="
+log "CONDUCTOR=$CONDUCTOR"
 log "ANALYSIS_DIR=$ANALYSIS_DIR"
+log "SKILL_DIR=$SKILL_DIR"
 
 # Build worklist: distilled files without a matching report.
 worklist=()
@@ -71,7 +90,7 @@ Do not propose follow-up work. Do not touch any files except OUTPUT_PATH."
     if "$SKILL_DIR/scripts/launch-subagent.sh" \
             "analyze-$sid" \
             "$worker_prompt" \
-            --path "$HOME/.agent-deck/conductor/agent-deck" \
+            --path "$CONDUCTOR_DIR" \
             --wait \
             --timeout "$PER_ANALYZER_TIMEOUT" \
             >>"$STATUS_FILE" 2>&1; then

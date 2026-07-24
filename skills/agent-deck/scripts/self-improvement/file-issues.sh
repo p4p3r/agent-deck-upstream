@@ -12,14 +12,23 @@
 
 set -u
 
-CONDUCTOR_DIR="$HOME/.agent-deck/conductor/agent-deck"
+# Which conductor's findings to file. Precedence: positional arg > CONDUCTOR env
+# > default. The historical default ("agent-deck") keeps behavior identical.
+CONDUCTOR="${1:-${CONDUCTOR:-agent-deck}}"
+CONDUCTOR_DIR="$HOME/.agent-deck/conductor/$CONDUCTOR"
 ANALYSIS_DIR="$CONDUCTOR_DIR/analysis"
 SCRIPTS_DIR="$ANALYSIS_DIR/scripts"
 PROMPTS_DIR="$ANALYSIS_DIR/prompts"
 FINDINGS_PATH="$CONDUCTOR_DIR/FINDINGS.md"
 MANIFEST_PATH="$CONDUCTOR_DIR/analysis-manifest.json"
 GH_REPO="${GH_REPO:-asheshgoplani/agent-deck}"
-SKILL_DIR="${SKILL_DIR:-$HOME/.claude/plugins/cache/agent-deck/agent-deck/12c0a65dfb13/skills/agent-deck}"
+
+# Resolve the skill root from this script's own location rather than a hardcoded
+# plugin-cache hash. This file lives at
+#   <SKILL_DIR>/scripts/self-improvement/file-issues.sh
+# so SKILL_DIR is two directories up. Overridable via the SKILL_DIR env var.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SKILL_DIR="${SKILL_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # work dir for this session
 WORK_DIR=$(mktemp -d -t file-issues-XXXXXX)
@@ -48,7 +57,7 @@ require python3 jq gh agent-deck
 bold "================================================="
 bold "  agent-deck self-improvement: file issues"
 bold "================================================="
-echo "  conductor:  agent-deck"
+echo "  conductor:  $CONDUCTOR"
 echo "  findings:   $FINDINGS_PATH"
 echo "  manifest:   $MANIFEST_PATH"
 echo "  gh repo:    $GH_REPO"
