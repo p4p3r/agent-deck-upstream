@@ -78,8 +78,8 @@ func warnUnsafeTestPathOnce(resolved string) {
 	unsafeTestPathWarnMu.Unlock()
 	once.Do(func() {
 		fmt.Fprintf(sink,
-			"agentpaths: resolved agent-deck path under the real home (%s); "+
-				"this touches REAL user data. If this is a test, it is NOT sandboxed; "+
+			"agentpaths: TEST CONTAINMENT REFUSAL blocked an agent-deck path under the real home (%s); "+
+				"the caller receives an error and no path is returned or used. The test is NOT sandboxed; "+
 				"call testutil.IsolateHome() in TestMain and run with a temp HOME+XDG "+
 				"(2026-06-04 data-loss incident, S4).\n",
 			resolved)

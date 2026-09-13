@@ -59,3 +59,35 @@ func TestOperationalToolchainPinsMatchGoMod(t *testing.T) {
 		t.Errorf("Lighthouse workflow has %d forced-toolchain build commands, want 2", got)
 	}
 }
+
+func TestReproducibleBuildCarriesExactSourceMetadata(t *testing.T) {
+	repoRoot := filepath.Clean("..")
+	makefile, err := os.ReadFile(filepath.Join(repoRoot, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"build-reproducible:",
+		"verify-reproducible-build:",
+		`git status --porcelain=v1 -uall`,
+		`REPRO_SOURCE_COMMIT)" = "$$(git rev-parse --verify HEAD)`,
+		"GOTOOLCHAIN=go1.25.13",
+		"CGO_ENABLED=0",
+		"-trimpath",
+		"-buildvcs=false",
+		"-buildid=",
+		"main.SourceCommit=$(REPRO_SOURCE_COMMIT)",
+	} {
+		if !strings.Contains(string(makefile), required) {
+			t.Errorf("Makefile reproducible build is missing %q", required)
+		}
+	}
+
+	releaseConfig, err := os.ReadFile(filepath.Join(repoRoot, ".goreleaser.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(releaseConfig), "main.SourceCommit={{.FullCommit}}") {
+		t.Error("GoReleaser does not inject its exact source commit")
+	}
+}

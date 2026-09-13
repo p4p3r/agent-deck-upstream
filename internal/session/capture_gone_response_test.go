@@ -36,15 +36,15 @@ func TestGetTerminalLastResponse_GonePropagatesSentinel(t *testing.T) {
 	}
 }
 
-// TestGetLastResponseBestEffort_GoneReturnsEmpty verifies the conductor-facing
-// best-effort read degrades a vanished session to an empty response (no error)
-// for a non-Claude/Gemini tool — the exact case that was surfacing the scary
-// error string on codex children.
-func TestGetLastResponseBestEffort_GoneReturnsEmpty(t *testing.T) {
+// TestGetLastResponseBestEffort_GenericGoneReturnsEmpty verifies the
+// conductor-facing best-effort read still degrades a vanished generic session
+// to an empty response. Codex is deliberately excluded because terminal bytes
+// cannot prove structured rollout ownership.
+func TestGetLastResponseBestEffort_GenericGoneReturnsEmpty(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not available")
 	}
-	i := &Instance{Tool: "codex", tmuxSession: goneTmuxSession()}
+	i := &Instance{Tool: "custom-tool", tmuxSession: goneTmuxSession()}
 	resp, err := i.GetLastResponseBestEffort()
 	if err != nil {
 		t.Fatalf("GetLastResponseBestEffort returned error for vanished session: %v", err)
@@ -77,7 +77,7 @@ func TestGetLastResponseBestEffort_UsesFinalCaptureError(t *testing.T) {
 			t.Setenv("CAPTURE_STATE", filepath.Join(dir, "captured"))
 			t.Setenv("FIRST_ERROR", tc.first)
 			t.Setenv("LAST_ERROR", tc.last)
-			i := &Instance{Tool: "codex", tmuxSession: goneTmuxSession()}
+			i := &Instance{Tool: "custom-tool", tmuxSession: goneTmuxSession()}
 			resp, err := i.GetLastResponseBestEffort()
 			if tc.wantGone {
 				if err != nil || resp == nil || resp.Content != "" {

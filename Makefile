@@ -1,9 +1,22 @@
-.PHONY: build run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
+.PHONY: build build-reproducible verify-reproducible-build _build-reproducible-source run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo "dev")
-LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
+SOURCE_COMMIT=$(shell git rev-parse --verify HEAD 2>/dev/null || printf unknown)$(shell test -z "$$(git status --porcelain=v1 -uall 2>/dev/null)" || printf '%s' -dirty)
+LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.SourceCommit=$(SOURCE_COMMIT)"
+
+REPRO_GOOS ?= $(shell go env GOOS)
+REPRO_GOARCH ?= $(shell go env GOARCH)
+REPRO_SOURCE_COMMIT ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf unknown)
+REPRO_SHORT_COMMIT ?= $(shell git rev-parse --short=12 --verify HEAD 2>/dev/null || printf unknown)
+REPRO_BASE_VERSION ?= $(shell tag=$$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true); if test -n "$$tag"; then printf '%s' "$$tag" | sed 's/^v//'; else base=$$(sed -n 's/^var Version = "\([^"]*\)".*/\1/p' cmd/agent-deck/main.go | head -n 1); test -n "$$base" && printf '%s' "$$base" || printf 0.0.0; fi)
+REPRO_VERSION ?= $(REPRO_BASE_VERSION)+p4p3r.$(REPRO_SHORT_COMMIT)
+REPRO_SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null || printf 0)
+REPRO_LDFLAGS=-s -w -buildid= -X main.Version=$(REPRO_VERSION) -X main.SourceCommit=$(REPRO_SOURCE_COMMIT)
+REPRO_SOURCE_DIR ?= $(CURDIR)
+REPRO_GOCACHE ?= $(shell go env GOCACHE)
+REPRO_GOTMPDIR ?= $(abspath $(BUILD_DIR)/.gotmp)
 
 # Tailwind v4 standalone CLI (PERF-01)
 TAILWIND_VERSION=v4.2.2
@@ -15,6 +28,59 @@ export GOTOOLCHAIN=go1.25.13
 # Build the binary (requires compiled CSS via `make css`)
 build: css
 	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/agent-deck
+
+# Deterministic source build. A dirty tree is refused because HEAD would not
+# identify the bytes being compiled. The Go embed inputs (including compiled
+# CSS) are committed source-tree bytes and are therefore present in the exact
+# archive being built; Tailwind authoring inputs are not runtime build inputs.
+build-reproducible:
+	@test -n "$(REPRO_SOURCE_COMMIT)" -a "$(REPRO_SOURCE_COMMIT)" != unknown || \
+		(echo "ERROR: cannot resolve source commit" >&2; exit 1)
+	@test "$(REPRO_SOURCE_COMMIT)" = "$$(git rev-parse --verify HEAD)" || \
+		(echo "ERROR: REPRO_SOURCE_COMMIT must equal HEAD" >&2; exit 1)
+	@test -z "$$(git status --porcelain=v1 -uall)" || \
+		(echo "ERROR: reproducible build requires a clean source commit" >&2; exit 1)
+	$(MAKE) --no-print-directory _build-reproducible-source \
+		REPRO_SOURCE_DIR="$(CURDIR)" BUILD_DIR="$(abspath $(BUILD_DIR))"
+
+# Internal implementation used by the two supported public targets. The
+# caller supplies already-validated source identity and isolated build dirs.
+_build-reproducible-source:
+	mkdir -p "$(BUILD_DIR)" "$(REPRO_GOCACHE)" "$(REPRO_GOTMPDIR)"
+	cd "$(REPRO_SOURCE_DIR)" && \
+	TZ=UTC LC_ALL=C SOURCE_DATE_EPOCH=$(REPRO_SOURCE_DATE_EPOCH) \
+		GOCACHE="$(REPRO_GOCACHE)" GOTMPDIR="$(REPRO_GOTMPDIR)" \
+		CGO_ENABLED=0 GOOS=$(REPRO_GOOS) GOARCH=$(REPRO_GOARCH) GOTOOLCHAIN=go1.25.13 \
+		go build -mod=readonly -trimpath -buildvcs=false \
+		-ldflags "$(REPRO_LDFLAGS)" \
+		-o "$(BUILD_DIR)/$(BINARY_NAME)" ./cmd/agent-deck
+
+# Build the same clean commit from two independent git-archive source trees,
+# each with its own compiler cache and temporary directory, then compare bytes.
+# The printed digest is the reproducible artifact identity for this GOOS/GOARCH.
+verify-reproducible-build:
+	@set -eu; \
+	test -n "$(REPRO_SOURCE_COMMIT)" && test "$(REPRO_SOURCE_COMMIT)" != unknown || \
+		{ echo "ERROR: cannot resolve source commit" >&2; exit 1; }; \
+	test "$(REPRO_SOURCE_COMMIT)" = "$$(git rev-parse --verify HEAD)" || \
+		{ echo "ERROR: REPRO_SOURCE_COMMIT must equal HEAD" >&2; exit 1; }; \
+	test -z "$$(git status --porcelain=v1 -uall)" || \
+		{ echo "ERROR: reproducible build requires a clean source commit" >&2; exit 1; }; \
+	scratch=$$(mktemp -d); \
+	trap 'rm -rf "$$scratch"' EXIT INT TERM; \
+	for slot in first second; do \
+		source_dir="$$scratch/source-$$slot"; \
+		mkdir -p "$$source_dir" "$$scratch/gocache-$$slot" "$$scratch/gotmp-$$slot" "$$scratch/output-$$slot"; \
+		git archive --format=tar "$(REPRO_SOURCE_COMMIT)" | tar -xf - -C "$$source_dir"; \
+		$(MAKE) -C "$$source_dir" --no-print-directory _build-reproducible-source \
+			REPRO_SOURCE_DIR="$$source_dir" BUILD_DIR="$$scratch/output-$$slot" \
+			REPRO_GOCACHE="$$scratch/gocache-$$slot" REPRO_GOTMPDIR="$$scratch/gotmp-$$slot" \
+			REPRO_VERSION="$(REPRO_VERSION)" REPRO_SOURCE_COMMIT="$(REPRO_SOURCE_COMMIT)" \
+			REPRO_SOURCE_DATE_EPOCH="$(REPRO_SOURCE_DATE_EPOCH)" \
+			REPRO_GOOS="$(REPRO_GOOS)" REPRO_GOARCH="$(REPRO_GOARCH)"; \
+	done; \
+	cmp "$$scratch/output-first/$(BINARY_NAME)" "$$scratch/output-second/$(BINARY_NAME)"; \
+	sha256sum "$$scratch/output-first/$(BINARY_NAME)"
 
 # Download the pinned Tailwind v4 standalone CLI binary if missing or wrong version
 tools:

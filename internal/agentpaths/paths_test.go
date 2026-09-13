@@ -138,6 +138,9 @@ func TestConfigDir_RefusesUnderTestOnRealHome(t *testing.T) {
 	if !strings.Contains(err.Error(), "real home") {
 		t.Fatalf("error should mention real-home guard, got %v", err)
 	}
+	if dir != "" {
+		t.Fatalf("refusal returned a usable path %q", dir)
+	}
 }
 
 func TestLegacyDir_RefusesUnderTestOnRealHome(t *testing.T) {
@@ -150,6 +153,9 @@ func TestLegacyDir_RefusesUnderTestOnRealHome(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "real home") {
 		t.Fatalf("error should mention real-home guard, got %v", err)
+	}
+	if dir != "" {
+		t.Fatalf("refusal returned a usable path %q", dir)
 	}
 }
 
@@ -173,6 +179,9 @@ func TestUnsafeTestPathWarningDebounced(t *testing.T) {
 	}
 	if !strings.Contains(got, "testutil.IsolateHome") {
 		t.Fatalf("warning should explain the sandbox fix, got %q", got)
+	}
+	if !strings.Contains(got, "TEST CONTAINMENT REFUSAL") || !strings.Contains(got, "no path is returned or used") {
+		t.Fatalf("warning must distinguish an enforced refusal from a containment escape, got %q", got)
 	}
 }
 

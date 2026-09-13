@@ -43,6 +43,11 @@ import (
 
 var Version = "1.16.8" // overridden at build time via -ldflags "-X main.Version=..."
 
+// SourceCommit is injected by release and reproducible builds. "unknown" keeps
+// ad-hoc `go run` output backward-compatible while making packaged artifacts
+// traceable to the exact source commit.
+var SourceCommit = "unknown"
+
 // Table column widths for list command output
 const (
 	tableColTitle     = 20
@@ -124,6 +129,9 @@ func writeVersionOutput(w io.Writer, currentVersion string) {
 		fmt.Fprintf(w, " (update available: v%s)", info.LatestVersion)
 	}
 	fmt.Fprintln(w)
+	if SourceCommit != "" && SourceCommit != "unknown" {
+		fmt.Fprintf(w, "Source commit: %s\n", SourceCommit)
+	}
 }
 
 // printUpdateNotice checks for updates and prints a one-liner if available

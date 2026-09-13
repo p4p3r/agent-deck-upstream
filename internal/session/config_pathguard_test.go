@@ -78,6 +78,9 @@ func TestGetAgentDeckDir_RefusesUnderTestOnRealHome(t *testing.T) {
 	if !strings.Contains(err.Error(), "real home") {
 		t.Fatalf("error should mention the real-home guard; got: %v", err)
 	}
+	if dir != "" {
+		t.Fatalf("refusal returned a usable path %q", dir)
+	}
 }
 
 // TestGetConfigPath_RefusesUnderTestOnRealHome proves the refusal propagates

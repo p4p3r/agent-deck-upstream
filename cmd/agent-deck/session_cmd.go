@@ -2850,12 +2850,30 @@ func handleSessionSend(profile string, args []string) {
 		}
 	}
 
+	// A waiting send gives readiness and completion one absolute --timeout
+	// deadline. Local Codex final-answer correlation (including its DB
+	// reload/retry) also consumes only that remaining deadline. Claude and Pi
+	// retain their historical post-completion flush behavior in this packet.
+	var waitDeadline time.Time
+	if *wait {
+		waitDeadline = time.Now().Add(*timeout)
+	}
+
 	// Wait for agent to be ready (unless --no-wait is specified).
 	// Issue #957: honor --timeout for the readiness phase too, not just the
 	// post-ready completion wait. Otherwise --timeout 5m against a busy
 	// recipient silently fails at ~80s.
 	if !*noWait {
-		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, *timeout, send.PromptGates{
+		readyTimeout := *timeout
+		if !waitDeadline.IsZero() {
+			var budgetErr error
+			readyTimeout, budgetErr = remainingWaitBudget(waitDeadline, "readiness")
+			if budgetErr != nil {
+				out.Error(budgetErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
+		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, readyTimeout, send.PromptGates{
 			ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
 			CodexPrompt:    session.IsCodexCompatible(inst.Tool),
 		}); err != nil {
@@ -2867,6 +2885,14 @@ func handleSessionSend(profile string, args []string) {
 		// in that window is silently dropped. Hold back only when needed.
 		if shouldGateSlashRegistration(inst.Tool, message) {
 			slashTimeout := *timeout
+			if !waitDeadline.IsZero() {
+				var budgetErr error
+				slashTimeout, budgetErr = remainingWaitBudget(waitDeadline, "slash-command readiness")
+				if budgetErr != nil {
+					out.Error(budgetErr.Error(), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+			}
 			if slashTimeout <= 0 || slashTimeout > 10*time.Second {
 				slashTimeout = 10 * time.Second
 			}
@@ -2983,7 +3009,12 @@ func handleSessionSend(profile string, args []string) {
 
 	// If --wait, block until the agent finishes processing, then print output
 	if *wait {
-		finalStatus, err := waitForCompletion(tmuxSess, *timeout)
+		completionWait, budgetErr := remainingWaitBudget(waitDeadline, "completion")
+		if budgetErr != nil {
+			out.Error(budgetErr.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		finalStatus, err := waitForCompletion(tmuxSess, completionWait)
 		if err != nil {
 			out.Error(fmt.Sprintf("timeout waiting for completion: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -3006,13 +3037,47 @@ func handleSessionSend(profile string, args []string) {
 		// Wait for the JSONL to contain a response newer than sentAt.
 		// The status check (waitForCompletion) detects the UI prompt reappearing,
 		// but the JSONL file may not be flushed yet — poll until it is.
-		response, err := waitForFreshOutput(inst, sentAt, instances)
+		freshWait := time.Duration(0)
+		if session.IsCodexCompatible(inst.Tool) {
+			// A Codex final answer can be flushed after the TUI stops showing a
+			// busy footer. Start from the full caller-selected value (the updater
+			// gate tracks this wiring), then cap it to the single budget remaining.
+			freshWait = *timeout
+			remaining, budgetErr := remainingWaitBudget(waitDeadline, "Codex final-answer correlation")
+			if budgetErr != nil {
+				out.Error(budgetErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+			freshWait = min(freshWait, remaining)
+			// Preserve a DB-refresh opportunity for stale bindings without
+			// extending the absolute deadline. A late answer can still consume
+			// the entire aggregate budget on the refreshed instance below.
+			if freshWait > 5*time.Second {
+				freshWait = 5 * time.Second
+			}
+		}
+		response, err := waitForFreshOutput(inst, sentAt, instances, freshWait)
 		if err != nil {
-			// Fallback: reload session from DB in case tmux env was also stale
-			// (e.g., /clear created a new session that TUI or hooks detected)
-			if _, freshInstances, _, loadErr := loadSessionData(profile); loadErr == nil {
-				if freshInst, _, _ := ResolveSession(sessionRef, freshInstances); freshInst != nil {
-					response, err = waitForFreshOutput(freshInst, sentAt, freshInstances)
+			if session.IsCodexCompatible(inst.Tool) {
+				// A failed reload or nil re-resolution is not evidence that the
+				// original binding became invalid. Spend the caller's remaining
+				// absolute budget against that original snapshot instead of
+				// collapsing a long --timeout to the initial five-second probe.
+				response, err = retryCodexFreshOutputWithinDeadline(
+					profile, sessionRef, inst, sentAt, instances, waitDeadline,
+					codexFreshOutputRetryDeps{
+						load:    loadSessionData,
+						resolve: ResolveSession,
+						wait:    waitForFreshOutput,
+					},
+				)
+			} else {
+				// Fallback: reload session from DB in case tmux env was also stale
+				// (e.g., /clear created a new session that TUI or hooks detected).
+				if _, freshInstances, _, loadErr := loadSessionData(profile); loadErr == nil {
+					if freshInst, _, _ := ResolveSession(sessionRef, freshInstances); freshInst != nil {
+						response, err = waitForFreshOutput(freshInst, sentAt, freshInstances, freshWait)
+					}
 				}
 			}
 		}
@@ -4151,6 +4216,25 @@ type statusChecker interface {
 	GetStatus() (string, error)
 }
 
+func remainingWaitBudget(deadline time.Time, stage string) (time.Duration, error) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, fmt.Errorf("overall --timeout budget exhausted before %s", stage)
+	}
+	return remaining, nil
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // waitForCompletion polls until the agent finishes processing (status leaves "active").
 // Returns the final status string ("waiting", "idle", "inactive") or an error on timeout.
 func waitForCompletion(checker statusChecker, timeout time.Duration) (string, error) {
@@ -4161,7 +4245,9 @@ func waitForCompletion(checker statusChecker, timeout time.Duration) (string, er
 
 	// Initial grace period: wait for the agent to start processing.
 	// sendWithRetry already checks for "active", but give a small buffer.
-	time.Sleep(1 * time.Second)
+	if !sleepWithContext(ctx, time.Second) {
+		return "", fmt.Errorf("agent still running after %s", timeout)
+	}
 
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 5
@@ -4179,14 +4265,18 @@ func waitForCompletion(checker statusChecker, timeout time.Duration) (string, er
 			if consecutiveErrors >= maxConsecutiveErrors {
 				return "error", nil // Session likely died
 			}
-			time.Sleep(pollInterval)
+			if !sleepWithContext(ctx, pollInterval) {
+				return "", fmt.Errorf("agent still running after %s", timeout)
+			}
 			continue
 		}
 		consecutiveErrors = 0
 
 		// "active" means still processing, keep waiting
 		if status == "active" {
-			time.Sleep(pollInterval)
+			if !sleepWithContext(ctx, pollInterval) {
+				return "", fmt.Errorf("agent still running after %s", timeout)
+			}
 			continue
 		}
 
@@ -4202,6 +4292,47 @@ type freshOutputConfig struct {
 	timeout      time.Duration
 }
 
+// codexFreshOutputRetryDeps is a deliberately small seam around the retry's
+// observable dependencies. It keeps the CLI dataflow testable without a real
+// five-second first attempt or a live profile database.
+type codexFreshOutputRetryDeps struct {
+	load    func(string) (*session.Storage, []*session.Instance, []*session.GroupData, error)
+	resolve func(string, []*session.Instance) (*session.Instance, string, string)
+	wait    func(*session.Instance, time.Time, []*session.Instance, time.Duration) (*session.ResponseOutput, error)
+}
+
+// retryCodexFreshOutputWithinDeadline gives a stale-binding reload one chance
+// to improve the target and peer snapshot. Reload failure, nil resolution, or
+// resolution to another tool all retain the original Codex snapshot. In every
+// case the waiter receives only the budget left on the caller's one absolute
+// deadline; neither the reload nor the retry starts a new timeout.
+func retryCodexFreshOutputWithinDeadline(
+	profile, sessionRef string,
+	original *session.Instance,
+	sentAt time.Time,
+	originalPeers []*session.Instance,
+	waitDeadline time.Time,
+	deps codexFreshOutputRetryDeps,
+) (*session.ResponseOutput, error) {
+	// Do not start even a best-effort reload after the aggregate deadline.
+	if _, err := remainingWaitBudget(waitDeadline, "Codex final-answer correlation retry"); err != nil {
+		return nil, err
+	}
+
+	retryInst, retryPeers := original, originalPeers
+	if _, freshInstances, _, loadErr := deps.load(profile); loadErr == nil {
+		if freshInst, _, _ := deps.resolve(sessionRef, freshInstances); freshInst != nil && session.IsCodexCompatible(freshInst.Tool) {
+			retryInst, retryPeers = freshInst, freshInstances
+		}
+	}
+
+	retryWait, err := remainingWaitBudget(waitDeadline, "Codex final-answer correlation retry")
+	if err != nil {
+		return nil, err
+	}
+	return deps.wait(retryInst, sentAt, retryPeers, retryWait)
+}
+
 // freshOutputTestConfig, when non-nil, overrides the default timing constants.
 // Only set from tests.
 var freshOutputTestConfig *freshOutputConfig
@@ -4211,23 +4342,34 @@ var freshOutputTestConfig *freshOutputConfig
 // This bridges the gap between the UI prompt reappearing (detected by
 // waitForCompletion) and the JSONL being flushed to disk.
 //
-// Local Pi sessions also expose structured timestamps. Other tools and
-// nonlocal Pi sessions retain best-effort output without a freshness claim.
+// Local Codex and Pi sessions also expose structured timestamps. Other tools
+// and nonlocal Codex/Pi sessions retain best-effort output without a freshness
+// claim.
 //
-// Claude retains its best-effort response with a warning on timeout. Pi
-// returns an error instead of reporting an earlier turn as this send's reply.
+// Claude retains its best-effort response with a warning on timeout. Codex and
+// Pi return an error instead of reporting an earlier turn as this send's reply.
 //
 // peers carries the profile snapshot for the #1400 collision guard: a
 // claude_session_id shared by multiple live instances resolves to ONE
 // transcript, so waiting on it would return another session's output.
 // Fail fast (same semantics as --stream's #1352 guard) instead of polling
 // a colliding transcript until the freshness timeout.
-func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*session.Instance) (*session.ResponseOutput, error) {
-	// Pi's transcript lives in the tool's HOME. Legacy SSH/sandbox instances
-	// use terminal fallback, which does not provide timestamp evidence.
+func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*session.Instance, freshWait time.Duration) (*session.ResponseOutput, error) {
+	// Codex and Pi transcripts live in the tool's HOME. Legacy SSH/sandbox
+	// instances use terminal fallback, which does not provide timestamp evidence.
 	localPi := inst.Tool == "pi" && !inst.IsSSH() && !inst.IsSandboxed()
-	if !session.IsClaudeCompatible(inst.Tool) && !localPi {
+	localCodex := session.IsCodexCompatible(inst.Tool) && !inst.IsSSH() && !inst.IsSandboxed()
+	if !session.IsClaudeCompatible(inst.Tool) && !localPi && !localCodex {
 		return inst.GetLastResponseBestEffort()
+	}
+	if localCodex && strings.TrimSpace(inst.CodexSessionID) == "" {
+		// Give getCodexLastResponse one chance to bind from this pane's own
+		// CODEX_SESSION_ID. Without that identity, no local rollout can be
+		// attributed to this send, so terminal prose must not be substituted.
+		_, _ = inst.GetLastResponse()
+		if strings.TrimSpace(inst.CodexSessionID) == "" {
+			return nil, fmt.Errorf("cannot correlate Codex output: authoritative Codex session ID is unavailable; wait for CODEX_SESSION_ID binding and retry")
+		}
 	}
 
 	// #1400: refuse a colliding transcript before entering the poll loop.
@@ -4236,12 +4378,20 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 			return nil, fmt.Errorf("refusing to read a colliding transcript: %w", err)
 		}
 	}
+	if localCodex && inst.CodexSessionIDCollidesWith(peers) {
+		return nil, fmt.Errorf("refusing to read a colliding Codex rollout: codex_session_id %q is shared by more than one live local instance", inst.CodexSessionID)
+	}
 
 	pollInterval := 250 * time.Millisecond
 	timeout := 5 * time.Second
+	if freshWait > 0 {
+		timeout = freshWait
+	}
 	if cfg := freshOutputTestConfig; cfg != nil {
 		pollInterval = cfg.pollInterval
-		timeout = cfg.timeout
+		if freshWait <= 0 {
+			timeout = cfg.timeout
+		}
 	}
 
 	// Allow 250ms of clock skew / rounding tolerance.
@@ -4249,9 +4399,9 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 	// time.Now() can be slightly ahead of Claude's clock. Tighter than the
 	// original 2s to reduce false positives on genuinely stale output.
 	threshold := sentAt.Add(-250 * time.Millisecond)
-	if localPi {
-		// Pi records milliseconds; do not accept a previous turn under Claude's
-		// wider clock-skew allowance.
+	if localPi || localCodex {
+		// Codex and Pi record milliseconds; do not accept a previous turn under
+		// Claude's wider clock-skew allowance.
 		threshold = sentAt.Truncate(time.Millisecond)
 	}
 
@@ -4260,10 +4410,13 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 	var lastErr error
 
 	for time.Now().Before(deadline) {
+		if localCodex && inst.CodexSessionIDCollidesWith(peers) {
+			return nil, fmt.Errorf("refusing to read a colliding Codex rollout: codex_session_id %q is shared by more than one live local instance", inst.CodexSessionID)
+		}
 		resp, err := inst.GetLastResponseBestEffort()
 		if err != nil {
 			lastErr = err
-			time.Sleep(pollInterval)
+			time.Sleep(min(pollInterval, time.Until(deadline)))
 			continue
 		}
 		lastResp = resp
@@ -4282,16 +4435,21 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 			}
 		}
 
-		time.Sleep(pollInterval)
+		time.Sleep(min(pollInterval, time.Until(deadline)))
 	}
 
-	// Pi's send --wait result must belong to this turn. Neither stale text nor
-	// a terminal fallback without a timestamp can establish that relationship.
-	if localPi {
-		if lastErr != nil {
-			return nil, fmt.Errorf("Pi output freshness timeout (%s): %w", timeout, lastErr)
+	// A structured send --wait result must belong to this turn. Neither stale
+	// text nor a terminal fallback without a timestamp can establish that
+	// relationship.
+	if localPi || localCodex {
+		toolName := "Pi"
+		if localCodex {
+			toolName = "Codex"
 		}
-		return nil, fmt.Errorf("Pi output freshness timeout (%s): no fresh assistant response", timeout)
+		if lastErr != nil {
+			return nil, fmt.Errorf("%s output freshness timeout (%s): %w", toolName, timeout, lastErr)
+		}
+		return nil, fmt.Errorf("%s output freshness timeout (%s): no fresh assistant response", toolName, timeout)
 	}
 	// Preserve Claude's historical warning-and-best-effort timeout behavior.
 	if lastResp != nil {

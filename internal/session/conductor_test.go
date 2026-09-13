@@ -529,16 +529,19 @@ func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
 		t.Error("template should check if user_id is in allowed_users")
 	}
 
-	// Check for warning log
-	if !strings.Contains(template, `log.warning("Unauthorized Slack message from user %s", user_id)`) {
-		t.Error("template should log warning for unauthorized users")
+	// Rejections are observable without placing supplied user IDs in logs.
+	if !strings.Contains(template, `log.warning("Rejected unauthorized Slack event")`) {
+		t.Error("template should log a generic warning for unauthorized users")
+	}
+	if strings.Contains(template, `log.warning("Unauthorized Slack message from user %s", user_id)`) {
+		t.Error("template should not log the raw unauthorized Slack user ID")
 	}
 
 	// Check for authorization checks in handlers
 	authCheckPatterns := []string{
 		"user_id = event.get(\"user\", \"\")",                            // message/mention handlers
-		"user_id = command.get(\"user_id\", \"\")",                       // slash command handlers
 		"if not is_slack_authorized(user_id):",                           // authorization check
+		"if not is_slack_command_authorized(command):",                   // slash identity/channel check
 		"await respond(\"⛔ Unauthorized. Contact your administrator.\")", // slash command error
 	}
 
@@ -573,17 +576,35 @@ func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
 }
 
 func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
-	// Verify the config loading includes allowed_user_ids
+	// Slack routing and authorization identifiers support the same secret
+	// references as tokens. Unresolved allowlist entries remain present so the
+	// existing empty-list-means-allow-all compatibility rule fails closed.
 	template := conductorBridgePy
 
 	configPatterns := []string{
-		`sl_allowed_users = sl.get("allowed_user_ids", [])`,
+		`sl_channel_id = _resolve_secret(str(sl.get("channel_id", "") or ""))`,
+		`_resolve_secret(str(user_id or ""))`,
+		`for user_id in sl.get("allowed_user_ids", [])`,
 		`"allowed_user_ids": sl_allowed_users,`,
 	}
 
 	for _, pattern := range configPatterns {
 		if !strings.Contains(template, pattern) {
 			t.Errorf("template should contain config pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_RuntimeAwareRecreationAndCodexTimeout(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"def conductor_agent_command(name: str) -> str:",
+		"conductor_agent_command(name),",
+		"codex output freshness timeout",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain safety behavior: %q", pattern)
 		}
 	}
 }

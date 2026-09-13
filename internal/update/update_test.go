@@ -47,6 +47,7 @@ func TestCompareVersions(t *testing.T) {
 		{"numeric identifier far past int64", "1.0.0-rc.99999999999999999999999", "1.0.0-rc.3", 1},
 		{"leading zeros do not change the value", "1.0.0-rc.010", "1.0.0-rc.10", 0},
 		{"build metadata is ignored", "1.16.4+abc", "1.16.4", 0},
+		{"provenance build metadata equals base release", "1.16.8+p4p3r.9c884abdba47", "1.16.8", 0},
 	}
 
 	for _, tt := range tests {

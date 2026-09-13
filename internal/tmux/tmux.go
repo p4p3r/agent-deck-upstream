@@ -5043,15 +5043,25 @@ func (s *Session) hasBusyIndicatorResolved(content string) bool {
 		spinnerChars = patterns.SpinnerChars
 	}
 
-	// Find spinner in terminal content
-	char, spinnerLine, found := findSpinnerInContent(content, spinnerChars)
-
 	// Get or create spinner tracker
 	s.ensureStateTrackerLocked()
 	tracker := s.stateTracker.spinnerTracker
+	isDefaultCodex := strings.EqualFold(tool, "codex") && s.resolvedPatterns == nil
+	spinnerContent := content
+	if strings.EqualFold(tool, "codex") {
+		// Codex status cues are only authoritative at the bottom of the pane.
+		spinnerContent = strings.Join(lastNLines(content, 3), "\n")
+	}
+	char, spinnerLine, found := findSpinnerInContent(spinnerContent, spinnerChars)
+	if isDefaultCodex && HasCodexBusyIndicator(content) {
+		tracker.MarkBusy()
+		statusLog.Debug("codex_busy_status_line_match", slog.String("session", shortName))
+		return true
+	}
 
-	// BusyPatterns (regex + string) are authoritative because they capture
-	// real active-line semantics for each tool.
+	// BusyPatterns (regex + string) remain active for every preset, including
+	// default Codex. Codex interrupt strings get the stricter shaped/recent
+	// guard below because the same words commonly occur in model prose.
 	if patterns != nil {
 		recentLines := lastNLines(content, 25)
 		recentContent := strings.Join(recentLines, "\n")
@@ -5076,8 +5086,11 @@ func (s *Session) hasBusyIndicatorResolved(content string) bool {
 			if !strings.Contains(lowerContent, lowerStr) {
 				continue
 			}
-			if strings.Contains(lowerStr, "interrupt") &&
-				!hasInterruptBusyContext(statusBarLines, lowerStr, spinnerChars) {
+			interruptHasContext := hasInterruptBusyContext(statusBarLines, lowerStr, spinnerChars)
+			if strings.EqualFold(tool, "codex") && strings.Contains(lowerStr, "interrupt") {
+				interruptHasContext = HasCodexBusyIndicator(strings.Join(statusBarLines, "\n"))
+			}
+			if strings.Contains(lowerStr, "interrupt") && !interruptHasContext {
 				statusLog.Debug("busy_string_ignored_no_context",
 					slog.String("session", shortName),
 					slog.String("pattern", str))
@@ -5096,7 +5109,8 @@ func (s *Session) hasBusyIndicatorResolved(content string) bool {
 		lineClean := StripANSI(spinnerLine)
 		lineLower := strings.ToLower(lineClean)
 		hasActiveContext := strings.Contains(lineClean, "…") || strings.Contains(lineLower, "interrupt")
-		if !isClaude || isBrailleSpinnerChar(char) || hasActiveContext {
+		codexShaped := !strings.EqualFold(tool, "codex") || hasCodexSpinnerStatusLine(spinnerLine)
+		if codexShaped && (!isClaude || isBrailleSpinnerChar(char) || hasActiveContext) {
 			tracker.MarkBusy()
 			statusLog.Debug("busy_spinner_found", slog.String("session", shortName), slog.String("char", char))
 			return true

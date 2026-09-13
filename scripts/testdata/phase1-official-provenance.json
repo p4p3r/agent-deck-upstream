@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/asheshgoplani/agent-deck",
+  "ref": "refs/tags/v1.16.8",
+  "tag_object": "b4b032fba2127294af14186eec43999eb16d5699",
+  "commit": "9c884abdba47def96b2b811c87978def95ef79cf",
+  "tree": "c3b51ccbbaa79f179ca8b000420d1fa20cb369e9",
+  "commit_timestamp": "2026-09-13T16:57:54+02:00",
+  "commit_epoch": 1789311474,
+  "archive": {
+    "format": "tar",
+    "prefix": "agent-deck-v1.16.8/",
+    "sha256": "9d697081cee16c3cffa1b6efbe7c2ea8f0865ed5f214b8a86f86de31eb10a2bd"
+  },
+  "external_release_verification": {
+    "status": "independently_verified_by_root_incident_audit",
+    "verified_at_utc": "2026-09-13",
+    "release_published_at": "2026-09-13T15:15:13Z",
+    "asset": "agent-deck_1.16.8_linux_amd64.tar.gz",
+    "sha256": "26470bf567efcf456c1b514d7478d31bbbb0afedd46a129a97d51a3c2fc95028",
+    "checksums_txt_sha256": "7c678625c465fe818d94a0871bb95329425e1c8e3d02baa6015c7495e9e7b77d",
+    "official_checksums_match": true,
+    "attestation_command": "gh attestation verify agent-deck_1.16.8_linux_amd64.tar.gz --repo asheshgoplani/agent-deck --source-digest 9c884abdba47def96b2b811c87978def95ef79cf --source-ref refs/tags/v1.16.8 --signer-workflow asheshgoplani/agent-deck/.github/workflows/release.yml",
+    "predicate_type": "https://slsa.dev/provenance/v1",
+    "offline_fixture_scope": "recorded evidence only; ordinary offline tests do not repeat network, checksum-source, or cryptographic attestation verification"
+  }
+}

@@ -7448,17 +7448,21 @@ type ResponseOutput struct {
 	Tool      string `json:"tool"`                 // Tool type (claude, gemini, etc.)
 	Role      string `json:"role"`                 // Always "assistant" for now
 	Content   string `json:"content"`              // The actual response text
-	Timestamp string `json:"timestamp,omitempty"`  // When the response was generated (Claude only)
-	SessionID string `json:"session_id,omitempty"` // Claude session ID (if available)
+	Timestamp string `json:"timestamp,omitempty"`  // When the structured response was generated
+	SessionID string `json:"session_id,omitempty"` // Conversation/session ID (if available)
 }
 
 // GetLastResponse returns the last assistant response from the session
 // For Claude: Parses the JSONL file for the last assistant message
 // For Gemini: Parses the JSON session file for the last assistant message
-// For Codex/Others: Attempts to parse terminal output
+// For Codex: Parses the owned rollout JSONL for the last final answer
+// For Others: Attempts to parse terminal output
 func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
 	if IsClaudeCompatible(i.Tool) {
 		return i.getClaudeLastResponse()
+	}
+	if IsCodexCompatible(i.Tool) {
+		return i.getCodexLastResponse()
 	}
 	if i.Tool == "gemini" {
 		return i.getGeminiLastResponse()
@@ -7471,19 +7475,18 @@ func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
 
 // GetLastResponseBestEffortChecked is the collision-aware variant of
 // GetLastResponseBestEffort (issue #1400). `session output` (including -q)
-// parses the transcript that ClaudeSessionID resolves to; when multiple LIVE
-// instances share one claude_session_id they all resolve to the SAME transcript
-// and return byte-identical "last responses". Given the instance's profile
-// peers, this refuses the read with the same collision semantics #1352 gave
-// `session output --stream` (GetJSONLPathChecked: live peers sharing both the
-// session id and the transcript dir), instead of silently returning another
-// session's output. Non-Claude tools and the no-collision case delegate to
-// GetLastResponseBestEffort unchanged.
+// parses the transcript/rollout a native session ID resolves to. Given the
+// instance's profile peers, this refuses a many-live-instances-to-one-artifact
+// mapping for both Claude and local Codex instead of silently returning another
+// pane's output. Other tools and the no-collision case delegate unchanged.
 func (i *Instance) GetLastResponseBestEffortChecked(peers []*Instance) (*ResponseOutput, error) {
 	if IsClaudeCompatible(i.Tool) {
 		if _, err := i.GetJSONLPathChecked(peers); err != nil {
 			return nil, fmt.Errorf("refusing to read a colliding transcript: %w", err)
 		}
+	}
+	if IsCodexCompatible(i.Tool) && i.CodexSessionIDCollidesWith(peers) {
+		return nil, fmt.Errorf("refusing to read a colliding Codex rollout: codex_session_id %q is shared by more than one live local instance", i.CodexSessionID)
 	}
 	return i.GetLastResponseBestEffort()
 }
@@ -7491,6 +7494,11 @@ func (i *Instance) GetLastResponseBestEffortChecked(peers []*Instance) (*Respons
 // GetLastResponseBestEffort returns the last assistant response with fallback logic
 // intended for CLI read paths (like `session output`) where we prefer useful output
 // over hard errors.
+//
+// Behavior for Codex-compatible tools:
+//  1. Read only the exact locally owned rollout, including one recovery attempt
+//     from this instance's own CODEX_SESSION_ID tmux environment.
+//  2. Return the structured correlation error without scraping terminal prose.
 //
 // Behavior for Claude:
 // 1. Try structured JSONL read via stored ClaudeSessionID.
@@ -7508,6 +7516,14 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 	resp, err := i.GetLastResponse()
 	if err == nil {
 		return resp, nil
+	}
+	// A Codex TUI pane can contain an old answer, commentary, tool output, or a
+	// visible composer while a new turn is still running. None of those bytes
+	// carry a session/turn identity. getCodexLastResponse already gets one safe
+	// recovery opportunity from this instance's own CODEX_SESSION_ID; after that,
+	// preserve its correlation refusal instead of relabeling pane prose as output.
+	if IsCodexCompatible(i.Tool) {
+		return nil, fmt.Errorf("structured Codex response unavailable: %w", err)
 	}
 
 	// Claude-specific recovery path
@@ -7610,6 +7626,30 @@ func (i *Instance) ClaudeSessionIDCollidesWith(peers []*Instance) bool {
 			continue
 		}
 		if p.claudeTranscriptDir() == mine {
+			return true
+		}
+	}
+	return false
+}
+
+// CodexSessionIDCollidesWith reports whether another live local Codex instance
+// resolves the same non-empty session ID inside the same Codex home. Codex
+// rollouts are keyed by that pair, so reading while it is shared could return a
+// different pane's answer. Remote and sandboxed instances cannot resolve this
+// process's local rollout and therefore do not collide here.
+func (i *Instance) CodexSessionIDCollidesWith(peers []*Instance) bool {
+	if i == nil || strings.TrimSpace(i.CodexSessionID) == "" || i.IsSSH() || i.IsSandboxed() {
+		return false
+	}
+	mine := filepath.Clean(i.getCodexHomeDir())
+	for _, p := range peers {
+		if p == nil || p.ID == i.ID || p.IsSSH() || p.IsSandboxed() {
+			continue
+		}
+		if !IsCodexCompatible(p.Tool) || p.CodexSessionID != i.CodexSessionID || !isLiveSessionStatus(p.Status) {
+			continue
+		}
+		if filepath.Clean(p.getCodexHomeDir()) == mine {
 			return true
 		}
 	}

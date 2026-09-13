@@ -9,6 +9,7 @@
 package tmux
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -17,6 +18,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// isolatedSystemdRunLauncher exercises Start's service/scope argv construction
+// without contacting the user service manager. Successful systemd-run calls
+// are translated back to their inner tmux command, which inherits TestMain's
+// private TMUX_TMPDIR. This preserves the success/fallback control flow while
+// making an uncontained manager launch impossible from this unit-test file.
+func isolatedSystemdRunLauncher(t *testing.T, failService bool, calls *[]string) func(string, ...string) *exec.Cmd {
+	t.Helper()
+	require.NotEmpty(t, os.Getenv("TMUX_TMPDIR"), "package TestMain must isolate the tmux socket")
+	require.Equal(t, "1", os.Getenv(testIsolationMarkerEnv), "package TestMain must attest tmux isolation")
+	require.Empty(t, os.Getenv("TMUX"), "isolated launcher must not inherit a tmux client socket")
+	require.NotEqual(t, "/tmp", os.Getenv("TMUX_TMPDIR"), "tmux's default base is not isolated")
+	return func(name string, arg ...string) *exec.Cmd {
+		*calls = append(*calls, name+" "+strings.Join(arg, " "))
+		if name != "systemd-run" {
+			return exec.Command(name, arg...)
+		}
+		if failService && containsServiceUnitFlag(arg) {
+			return exec.Command("false")
+		}
+		inner := stripSystemdRunPrefix(arg)
+		if len(inner) == 0 || (len(inner) == len(arg) && strings.Join(inner, "\x00") == strings.Join(arg, "\x00")) {
+			t.Errorf("systemd-run argv did not contain an inner tmux command: %v", arg)
+			return exec.Command("false")
+		}
+		return exec.Command("tmux", inner...)
+	}
+}
+
 // TestStart_Service_SuccessPath: service spawn works first time, no
 // scope/direct retries attempted. Negative guard: execCommand counter
 // asserts exactly one systemd-run invocation.
@@ -24,16 +53,10 @@ func TestStart_Service_SuccessPath(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skipf("no tmux binary available: %v", err)
 	}
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		t.Skipf("no systemd-run available: %v", err)
-	}
 
 	original := execCommand
 	var calls []string
-	execCommand = func(name string, arg ...string) *exec.Cmd {
-		calls = append(calls, name)
-		return exec.Command(name, arg...)
-	}
+	execCommand = isolatedSystemdRunLauncher(t, false, &calls)
 	t.Cleanup(func() { execCommand = original })
 
 	displayName := "test-svcok-" + randomServerSuffix(t)
@@ -41,10 +64,6 @@ func TestStart_Service_SuccessPath(t *testing.T) {
 	s.LaunchAs = "service"
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "kill-session", "-t", s.Name).Run()
-		// Also best-effort stop the service unit in case
-		unitName := "agentdeck-tmux-" + sanitizeSystemdUnitComponent(s.Name) + ".service"
-		_ = exec.Command("systemctl", "--user", "stop", unitName).Run()
-		_ = exec.Command("systemctl", "--user", "reset-failed", unitName).Run()
 	})
 
 	if err := s.Start(""); err != nil {
@@ -55,7 +74,7 @@ func TestStart_Service_SuccessPath(t *testing.T) {
 	// (tmux binary probes from inside tmux itself don't go through execCommand).
 	var systemdRunCalls int
 	for _, c := range calls {
-		if c == "systemd-run" {
+		if strings.HasPrefix(c, "systemd-run ") {
 			systemdRunCalls++
 		}
 	}
@@ -73,17 +92,10 @@ func TestStart_Service_WhenServiceFails_FallbackToScope(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skipf("no tmux binary available: %v", err)
 	}
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		t.Skipf("no systemd-run available: %v", err)
-	}
 
 	original := execCommand
-	execCommand = func(name string, arg ...string) *exec.Cmd {
-		if name == "systemd-run" && containsServiceUnitFlag(arg) {
-			return exec.Command("false")
-		}
-		return exec.Command(name, arg...)
-	}
+	var calls []string
+	execCommand = isolatedSystemdRunLauncher(t, true, &calls)
 	t.Cleanup(func() { execCommand = original })
 
 	buf := captureStatusLog(t)
@@ -100,6 +112,8 @@ func TestStart_Service_WhenServiceFails_FallbackToScope(t *testing.T) {
 	logs := buf.String()
 	assert.Contains(t, logs, "tmux_systemd_run_fallback",
 		"service→scope fallback must emit a structured log for observability")
+	require.Len(t, calls, 2, "service failure must make exactly one contained scope retry")
+	assert.Contains(t, calls[1], "--scope", "second call must retain the scope fallback argv")
 }
 
 // TestStart_Service_WhenAllSystemdFail_FallbackToDirect: service AND

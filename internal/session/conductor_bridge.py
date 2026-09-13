@@ -239,9 +239,16 @@ def load_config() -> dict:
     sl = conductor_cfg.get("slack", {})
     sl_bot_token = _resolve_secret(sl.get("bot_token", ""))
     sl_app_token = _resolve_secret(sl.get("app_token", ""))
-    sl_channel_id = sl.get("channel_id", "")
+    sl_channel_id = _resolve_secret(str(sl.get("channel_id", "") or ""))
     sl_listen_mode = sl.get("listen_mode", "mentions")  # "mentions" or "all"
-    sl_allowed_users = sl.get("allowed_user_ids", [])  # List of authorized Slack user IDs
+    # Preserve unresolved entries as empty strings instead of filtering them:
+    # an empty configured list means allow-all for backward compatibility, but
+    # a configured environment reference that is temporarily unavailable must
+    # fail closed and deny every sender.
+    sl_allowed_users = [
+        _resolve_secret(str(user_id or ""))
+        for user_id in sl.get("allowed_user_ids", [])
+    ]
     sl_configured = bool(sl_bot_token and sl_app_token and sl_channel_id)
 
     # Discord config
@@ -314,6 +321,28 @@ def discover_conductors() -> list[dict]:
 def conductor_session_title(name: str) -> str:
     """Return the conductor session title for a given conductor name."""
     return f"conductor-{name}"
+
+
+def conductor_agent_command(name: str) -> str:
+    """Return the runtime command recorded in the conductor's meta.json."""
+    commands = {
+        "claude": "claude",
+        "codex": "codex",
+        "hermes": "hermes",
+    }
+    for conductor in discover_conductors():
+        if conductor.get("name") != name:
+            continue
+        agent = str(conductor.get("agent") or "claude").strip().lower()
+        if agent in commands:
+            return commands[agent]
+        log.warning(
+            "Conductor %s has unsupported agent %r; defaulting to Claude",
+            name,
+            agent,
+        )
+        break
+    return "claude"
 
 
 def get_conductor_names() -> list[str]:
@@ -442,11 +471,19 @@ def _is_still_running_timeout(stderr: str) -> bool:
     The CLI reports this with stderr like:
         "timeout waiting for completion: agent still running after 5m0s"
 
+    Local Codex uses its timestamped rollout final_answer as the primary
+    completion signal, so the equivalent in-flight timeout is reported as:
+        "Codex output freshness timeout (5m0s): no fresh assistant response"
+
     Distinguishing this benign case from a genuine send failure lets callers
     deliver the reply asynchronously instead of reporting a false failure.
     """
     s = stderr.lower()
-    return "timeout waiting for completion" in s or "still running" in s
+    return (
+        "timeout waiting for completion" in s
+        or "still running" in s
+        or "codex output freshness timeout" in s
+    )
 
 
 def send_to_conductor(
@@ -1052,7 +1089,7 @@ async def ensure_conductor_running(name: str, profile: str) -> bool:
                 "-t",
                 session_title,
                 "-c",
-                "claude",
+                conductor_agent_command(name),
                 "-g",
                 "conductor",
                 "--title-lock",
@@ -1840,17 +1877,46 @@ def create_slack_app(config: dict):
 
     # Authorization setup
     allowed_users = config["slack"]["allowed_user_ids"]
+    unresolved_allowed_user = any(not str(value).strip() for value in allowed_users)
 
     def is_slack_authorized(user_id: str) -> bool:
         """Check if Slack user is authorized to use the bot.
 
-        If allowed_user_ids is empty, allow all users (backward compatible).
-        Otherwise, only allow users in the list.
+        A deliberately empty allowed_user_ids list allows any non-empty sender
+        for backward compatibility.  An unresolved configured entry poisons
+        the whole allowlist, including mixed resolved/unresolved lists, because
+        silently weakening an authorization boundary is unsafe.
         """
-        if not allowed_users:  # Empty list = no restrictions
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            log.warning("Rejected Slack event without a sender user ID")
+            return False
+        if unresolved_allowed_user:
+            log.error("Slack allowed_user_ids contains an unresolved value; denying event")
+            return False
+        if not allowed_users:  # Deliberately empty list = no user restriction
             return True
         if user_id not in allowed_users:
-            log.warning("Unauthorized Slack message from user %s", user_id)
+            # Do not place untrusted identity values in operational logs. The
+            # caller receives the same generic denial as channel mismatches.
+            log.warning("Rejected unauthorized Slack event")
+            return False
+        return True
+
+    def is_slack_command_authorized(command: dict) -> bool:
+        """Require slash-command identity and configured-channel confinement."""
+        if not is_slack_authorized(command.get("user_id", "")):
+            return False
+        configured_channel = str(channel_id or "")
+        command_channel = str(command.get("channel_id", "") or "")
+        if (
+            not configured_channel.strip()
+            or not command_channel.strip()
+            or command_channel != configured_channel
+        ):
+            # Keep identity and channel rejections indistinguishable to the
+            # caller, and do not log configured or supplied channel IDs.
+            log.warning("Rejected Slack command outside the configured channel")
             return False
         return True
 
@@ -2150,7 +2216,14 @@ def create_slack_app(config: dict):
 
     @app.event("app_mention")
     async def handle_slack_mention(event, say):
-        """Handle @bot mentions in any channel the bot is in. Always active."""
+        """Handle authorized human mentions in the configured channel."""
+
+        # Mentions cross the same authorization boundary as ordinary message
+        # events. Slack can emit subtype/bot mention-shaped events too.
+        if event.get("bot_id") or event.get("subtype"):
+            return
+        if event.get("channel") != channel_id:
+            return
 
         # Authorization check
         user_id = event.get("user", "")
@@ -2175,8 +2248,7 @@ def create_slack_app(config: dict):
         await ack()
 
         # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
+        if not is_slack_command_authorized(command):
             await respond("⛔ Unauthorized. Contact your administrator.")
             return
 
@@ -2209,8 +2281,7 @@ def create_slack_app(config: dict):
         await ack()
 
         # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
+        if not is_slack_command_authorized(command):
             await respond("⛔ Unauthorized. Contact your administrator.")
             return
 
@@ -2236,8 +2307,7 @@ def create_slack_app(config: dict):
         await ack()
 
         # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
+        if not is_slack_command_authorized(command):
             await respond("⛔ Unauthorized. Contact your administrator.")
             return
 
@@ -2274,8 +2344,7 @@ def create_slack_app(config: dict):
         await ack()
 
         # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
+        if not is_slack_command_authorized(command):
             await respond("⛔ Unauthorized. Contact your administrator.")
             return
 

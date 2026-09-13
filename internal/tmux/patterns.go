@@ -79,6 +79,7 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				"press esc to interrupt",
 			},
 			PromptPatterns: []string{"How can I help", "codex>", "Continue?", `re:(?m)^\s*›\s`},
+			SpinnerChars:   append(defaultSpinnerChars(), "▌"),
 		}
 	case "codewhale":
 		// codewhale CLI (deepseek-v4-pro TUI, #1577). The codex preset's

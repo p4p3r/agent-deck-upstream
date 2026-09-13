@@ -65,10 +65,10 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 
 	case "codex":
 		// Codex/OpenAI CLI patterns.
-		// Busy indicators take priority over prompt markers.
-		lower := strings.ToLower(content)
-		if strings.Contains(lower, "esc to interrupt") ||
-			strings.Contains(lower, "ctrl+c to interrupt") {
+		// Busy indicators take priority over prompt markers, but only when the
+		// interrupt phrase has the shape Codex renders as a status line. Model
+		// prose can legitimately discuss the same phrase.
+		if HasCodexBusyIndicator(content) {
 			return false
 		}
 		// Direct prompt strings
@@ -92,6 +92,26 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 		// Generic shell - check for common prompts
 		return d.hasShellPrompt(content)
 	}
+}
+
+var (
+	codexStatusGlyph               = `[•▌⠀-⣿]`
+	codexInterruptVariant          = `(?:(?:press\s+)?esc|ctrl\+c)`
+	codexStandaloneInterruptLineRE = regexp.MustCompile(`(?mi)^\s*(?:` + codexStatusGlyph + `\s*)?` + codexInterruptVariant + `\s+to interrupt(?:\s*·\s*[^\n]+)*\s*$`)
+	codexWorkingLineRE             = regexp.MustCompile(`(?mi)^\s*(?:` + codexStatusGlyph + `\s*)?(?:working|thinking|running)\b[^\n]*\([^\n]*` + codexInterruptVariant + `\s+to interrupt[^\n]*\)[^\n]*$`)
+	codexSpinnerStatusLineRE       = regexp.MustCompile(`(?mi)^\s*` + codexStatusGlyph + `\s+\S[^\n]*$`)
+)
+
+// HasCodexBusyIndicator recognizes complete Codex busy-status lines while
+// refusing prose that merely quotes an interrupt instruction.
+func HasCodexBusyIndicator(content string) bool {
+	recent := strings.Join(lastNLines(StripANSI(content), 3), "\n")
+	return codexWorkingLineRE.MatchString(recent) ||
+		codexStandaloneInterruptLineRE.MatchString(recent)
+}
+
+func hasCodexSpinnerStatusLine(line string) bool {
+	return codexSpinnerStatusLineRE.MatchString(StripANSI(line))
 }
 
 // hasDeepSeekPrompt detects a DeepSeek Harness pane that is waiting.

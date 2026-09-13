@@ -61,6 +61,9 @@ def test_is_still_running_timeout_matches_cli_phrasings():
     )
     assert _is_still_running_timeout("agent still running after 5m0s")
     assert _is_still_running_timeout("TIMEOUT WAITING FOR COMPLETION")
+    assert _is_still_running_timeout(
+        "Codex output freshness timeout (5m0s): no fresh assistant response"
+    )
 
 
 def test_is_still_running_timeout_rejects_genuine_failures():

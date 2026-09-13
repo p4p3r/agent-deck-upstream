@@ -59,7 +59,7 @@ func TestWaitForFreshOutputPi(t *testing.T) {
 					}
 				})
 			}
-			got, err := waitForFreshOutput(&session.Instance{ID: "pi-fresh", Tool: "pi"}, sentAt, nil)
+			got, err := waitForFreshOutput(&session.Instance{ID: "pi-fresh", Tool: "pi"}, sentAt, nil, 0)
 			if fresh {
 				if err != nil {
 					t.Fatal(err)

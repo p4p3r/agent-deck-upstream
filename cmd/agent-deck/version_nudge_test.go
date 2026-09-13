@@ -129,3 +129,19 @@ func TestVersionOutput_NoAnnotationWhenEnvSkipped(t *testing.T) {
 		t.Fatalf("version output mismatch:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+func TestVersionOutputIncludesSourceCommitWithoutChangingFirstLine(t *testing.T) {
+	isolateVersionUpdatePaths(t)
+	previous := SourceCommit
+	SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	t.Cleanup(func() { SourceCommit = previous })
+
+	var buf bytes.Buffer
+	writeVersionOutput(&buf, "1.16.8-local")
+	got := buf.String()
+	want := "Agent Deck v1.16.8-local\n" +
+		"Source commit: 0123456789abcdef0123456789abcdef01234567\n"
+	if got != want {
+		t.Fatalf("version provenance mismatch:\n got: %q\nwant: %q", got, want)
+	}
+}

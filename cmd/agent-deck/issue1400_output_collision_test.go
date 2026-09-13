@@ -59,7 +59,7 @@ func TestWaitForFreshOutput_RefusesCollidingTranscript(t *testing.T) {
 	setFastFreshOutputConfig(t, 2*time.Second)
 
 	start := time.Now()
-	resp, err := waitForFreshOutput(a, time.Now(), peers)
+	resp, err := waitForFreshOutput(a, time.Now(), peers, 0)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -110,7 +110,7 @@ func TestWaitForFreshOutput_UniquePeerStillReads(t *testing.T) {
 	setFastFreshOutputConfig(t, 2*time.Second)
 
 	sentAt := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-	resp, err := waitForFreshOutput(a, sentAt, []*session.Instance{a, b})
+	resp, err := waitForFreshOutput(a, sentAt, []*session.Instance{a, b}, 0)
 	if err != nil {
 		t.Fatalf("unique peer must not block: %v", err)
 	}
