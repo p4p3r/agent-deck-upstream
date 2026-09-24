@@ -4365,11 +4365,16 @@ func acceptanceOnlyKnownDelivery(delivery string) bool {
 }
 
 func newAcceptanceOnlyFailureResult(code, outcome, delivery string) acceptanceOnlyResult {
+	return newAcceptanceOnlyFailureResultForInstance(code, outcome, delivery, "")
+}
+
+func newAcceptanceOnlyFailureResultForInstance(code, outcome, delivery, instanceID string) acceptanceOnlyResult {
 	result := acceptanceOnlyResult{
 		SchemaVersion: acceptanceOnlySchemaVersion,
 		Success:       false,
 		Acceptance:    outcome,
 		Code:          code,
+		InstanceID:    strings.TrimSpace(instanceID),
 	}
 	if acceptanceOnlyKnownDelivery(delivery) {
 		result.Delivery = delivery
@@ -4522,7 +4527,10 @@ func validateAcceptanceOnlyResult(result acceptanceOnlyResult) error {
 	default:
 		return fmt.Errorf("invalid acceptance-only failure code")
 	}
-	if result.InstanceID != "" || result.AcceptedTurnKind != "" || result.AcceptedTurn != nil {
+	if result.InstanceID != "" && !acceptanceOnlyOpaqueID(result.InstanceID) {
+		return fmt.Errorf("acceptance-only failure contains invalid instance identity")
+	}
+	if result.AcceptedTurnKind != "" || result.AcceptedTurn != nil {
 		return fmt.Errorf("acceptance-only failure contains receipt fields")
 	}
 	if result.Delivery == "" {

@@ -320,8 +320,11 @@ func inheritedEnviron() []string {
 func acceptanceOnlyCommandRequested(args []string) bool {
 	_, remaining := extractProfileFlag(args)
 	_, remaining = extractAllowRepoScriptsFlag(remaining)
-	return len(remaining) >= 2 && remaining[0] == "session" && remaining[1] == "send" &&
-		acceptanceOnlyFlagRequestsBoundary(remaining[2:])
+	if len(remaining) >= 2 && remaining[0] == "session" && remaining[1] == "send" {
+		return acceptanceOnlyFlagRequestsBoundary(remaining[2:])
+	}
+	return len(remaining) >= 1 && remaining[0] == "launch" &&
+		acceptanceOnlyFlagRequestsBoundary(remaining[1:])
 }
 
 func main() {

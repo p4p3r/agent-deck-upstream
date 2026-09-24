@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,15 @@ func handleLaunch(profile string, args []string) {
 }
 
 func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.FlagSet)) {
-	fs := flag.NewFlagSet("launch", flag.ExitOnError)
+	acceptanceOnlyDiagnostics := acceptanceOnlyFlagRequestsBoundary(args)
+	errorHandling := flag.ExitOnError
+	if acceptanceOnlyDiagnostics {
+		errorHandling = flag.ContinueOnError
+	}
+	fs := flag.NewFlagSet("launch", errorHandling)
+	if acceptanceOnlyDiagnostics {
+		fs.SetOutput(io.Discard)
+	}
 	title := fs.String("title", "", "Session title (defaults to folder name; an explicit title is locked against Claude's session-name sync)")
 	titleShort := fs.String("t", "", "Session title (short)")
 	group := fs.String("group", "", "Group path (defaults to parent folder)")
@@ -71,6 +80,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	messageShort := fs.String("m", "", "Initial message to send (short)")
 	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready before sending message")
+	acceptanceOnly := fs.Bool("acceptance-only", false, "Wait only for exact acceptance of the fresh local Codex session's first turn and emit a bounded body-free JSON receipt")
 	assertDone := fs.Bool("assert-done", false, "Append a completion-sentinel instruction to the message (default on for -c claude)")
 	noAssertDone := fs.Bool("no-assert-done", false, "Disable the completion-sentinel instruction")
 	parent := fs.String("parent", "", "Parent session (creates sub-session; group is cwd-derived by default — auto-inherits the parent's group for git worktree children or with --inherit-group)")
@@ -210,12 +220,21 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		fmt.Println("  agent-deck launch . -g ard --no-parent -c claude -m \"Run review\"")
 		fmt.Println("  agent-deck launch . -c claude -w feature/new -b -m \"Start work\"")
 	}
+	if acceptanceOnlyDiagnostics {
+		fs.Usage = func() {}
+	}
 
 	// Reject an omitted --account value before either reordering pass can bind
 	// the following flag as the account name. Besides swallowing that flag, an
 	// unknown account silently falls through to another credential source, so
 	// this check must happen before any launch or fallback resolution begins.
 	if err := checkFlagValueNotFlag(fs, args); err != nil {
+		if acceptanceOnlyDiagnostics {
+			emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(
+				acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "",
+			))
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -223,22 +242,30 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// Reorder args: move path to end so flags are parsed correctly
 
 	if err := fs.Parse(normalizeCreationArgs(fs, args)); err != nil {
+		if acceptanceOnlyDiagnostics {
+			emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(
+				acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "",
+			))
+		}
 		os.Exit(1)
 	}
+	quietMode := *quiet || *quietShort
+	out := newLaunchCommandOutput(*jsonOutput, quietMode, *acceptanceOnly)
 	if *capabilities {
+		if *acceptanceOnly {
+			out.Error("--acceptance-only is incompatible with --capabilities", ErrCodeInvalidOperation)
+		}
 		writeCreationCatalog(profile, fs, *jsonOutput)
 		return
 	}
 	validatedAdditionalPaths, pathValidationErr := validateCreationPaths(additionalPaths)
 	if pathValidationErr != nil {
-		NewCLIOutput(*jsonOutput, false).Error(pathValidationErr.Error(), ErrCodeInvalidOperation)
+		out.Error(pathValidationErr.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
-
-	ensureTmuxInPathOrExit()
-
-	quietMode := *quiet || *quietShort
-	out := NewCLIOutput(*jsonOutput, quietMode)
+	if !*acceptanceOnly {
+		ensureTmuxInPathOrExit()
+	}
 
 	// Resolve path
 	path, err := resolveLaunchPath(strings.Trim(fs.Arg(0), "'\""), mergeFlags(*group, *groupShort), profile)
@@ -286,6 +313,25 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		assertDoneOn = false
 	}
 	initialMessage = applyAssertDone(initialMessage, assertDoneOn)
+	if *acceptanceOnly {
+		if err := validateLaunchAcceptanceRequest(launchAcceptanceRequest{
+			message:            initialMessage,
+			tool:               firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput)),
+			noWait:             *noWait,
+			quiet:              quietMode,
+			sandbox:            *sandbox,
+			capabilities:       *capabilities,
+			commandPassthrough: sessionCommandIsPassthrough,
+		}); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+		}
+	}
+	if *acceptanceOnly {
+		if err := ensureTmuxInPath(); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
 
 	// Resolve worktree flags
 	wtBranch := *worktreeBranch
@@ -295,7 +341,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	createNewBranch := *newBranch || *newBranchLong
 
 	if err := validateCreationOptions(firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput)), selectedAccount, *modelID, *effort, *yoloMode, claudeFlags, mcpFlags, pluginFlags, channelFlags, extraArgFlags); err != nil {
-		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 	queryMode := "new"
@@ -306,7 +352,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		queryMode = "continue"
 	}
 	if err := validateCreationStartupQuery(*startupQuery, firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput)), queryMode, true, extraArgFlags...); err != nil {
-		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -357,7 +403,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		explicitGroupProvided = true
 	}
 	if err := validateMultiRepoCreation(path, validatedAdditionalPaths, wtBranch, createNewBranch, *worktreeLocation); err != nil {
-		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 	if err := validatePrimaryCreationPath(path, validatedAdditionalPaths); err != nil {
@@ -425,7 +471,9 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 		// Check for an existing worktree for this branch before creating a new one
 		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
-			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+			if !*acceptanceOnly {
+				fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+			}
 			worktreePath = existingPath
 		} else {
 			if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
@@ -440,16 +488,20 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 			// Sparse state is inherited from `path` (the directory the user
 			// launched from), never from backend.RepoDir() — see #1708.
+			setupStdout, setupStderr := io.Writer(os.Stdout), io.Writer(os.Stderr)
+			if *acceptanceOnly {
+				setupStdout, setupStderr = io.Discard, io.Discard
+			}
 			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
 				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
-				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				setupStdout, setupStderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
 			}
 			ownedPath := worktreePath
 			cleanupSingleWorktree = func() error { return backend.RemoveWorktree(ownedPath, true) }
-			if setupErr != nil {
+			if setupErr != nil && !*acceptanceOnly {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 		}
@@ -539,7 +591,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		os.Exit(1)
 	}
 	sessionTitle = launchDecision.Title
-	if warning := launchDecision.RenameWarning(); warning != "" && !*jsonOutput && !quietMode {
+	if warning := launchDecision.RenameWarning(); warning != "" && !*jsonOutput && !quietMode && !*acceptanceOnly {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
@@ -713,7 +765,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		}
 	}
 	if err := applyCreationExtras(newInstance, *startupQuery, validatedAdditionalPaths, wtBranch, createNewBranch, *worktreeLocation); err != nil {
-		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -731,7 +783,9 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// at create time (mirror of handleAdd) — a queued session gets its floor
 	// now, not at its eventual start. Start/Restart re-assert.
 	for _, w := range session.ApplyConfiguredLoadout(newInstance) {
-		fmt.Fprintf(os.Stderr, "Warning: loadout: %s\n", w)
+		if !*acceptanceOnly {
+			fmt.Fprintf(os.Stderr, "Warning: loadout: %s\n", w)
+		}
 	}
 
 	// Add to instances list (in-memory only — used for downstream
@@ -755,11 +809,17 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		out.Error(fmt.Sprintf("failed to save session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	if *acceptanceOnly {
+		out.instanceID = newInstance.ID
+	}
 	// The (title, location) pair is now taken in the state db; the start and
 	// attach below must not hold the lock for other registrations.
 	releaseLaunchRegistration()
 
-	autoHints := map[string]string{hintKeyPurpose: firstLineClipped(initialMessage, derivedPurposeLimit)}
+	autoHints := map[string]string{}
+	if !*acceptanceOnly {
+		autoHints[hintKeyPurpose] = firstLineClipped(initialMessage, derivedPurposeLimit)
+	}
 	if parentInstance != nil {
 		autoHints[hintKeyParent] = parentInstance.ID
 	}
@@ -869,9 +929,17 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// outright. Embed it instead. There is nothing to wait for in that case
 	// either: the process is already answering by the time it exists, so
 	// --no-wait loses nothing.
-	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
+	promptRidesArgv := !*acceptanceOnly && initialMessage != "" && newInstance.PromptRidesCommandLine()
 
-	if initialMessage != "" && (!*noWait || promptRidesArgv) {
+	if *acceptanceOnly {
+		// Start Codex without the prompt. The acceptance protocol below first
+		// binds the exact live rollout, proves it contains no turn, then submits
+		// the message once through the pane. This keeps the prompt out of argv.
+		if err := creationRollback.run("start session", newInstance.Start); err != nil {
+			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	} else if initialMessage != "" && (!*noWait || promptRidesArgv) {
 		if err := creationRollback.run("start session", func() error { return newInstance.StartWithMessage(initialMessage) }); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -902,6 +970,17 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if err := creationRollback.run("save started session", func() error { return storage.InsertSessionAndVerify(newInstance, postStartTree) }); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	if *acceptanceOnly {
+		result := runFreshLaunchAcceptance(&liveFreshLaunchAcceptanceOps{
+			inst: newInstance, peers: instances, storage: storage, message: initialMessage,
+		})
+		emitAcceptanceOnlyResult(result)
+		if !result.Success {
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Send message only for --no-wait mode.
