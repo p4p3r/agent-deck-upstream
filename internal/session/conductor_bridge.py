@@ -973,7 +973,12 @@ def _acceptance_only_outcome(result: subprocess.CompletedProcess) -> tuple[str, 
         return "uncertain", None
     acceptance = payload.get("acceptance")
     code = payload.get("code")
-    if acceptance not in ("not_accepted", "indeterminate") or code not in _ACCEPTANCE_ONLY_CODES:
+    if (
+        not isinstance(acceptance, str)
+        or not isinstance(code, str)
+        or acceptance not in ("not_accepted", "indeterminate")
+        or code not in _ACCEPTANCE_ONLY_CODES
+    ):
         return "uncertain", None
     delivery_present = "delivery" in payload
     submitted_present = "submitted" in payload
@@ -983,8 +988,9 @@ def _acceptance_only_outcome(result: subprocess.CompletedProcess) -> tuple[str, 
         delivery = payload.get("delivery")
         submitted = payload.get("submitted")
         if (
-            delivery not in _ACCEPTANCE_ONLY_DELIVERIES
+            not isinstance(delivery, str)
             or type(submitted) is not bool
+            or delivery not in _ACCEPTANCE_ONLY_DELIVERIES
             or submitted != (delivery == "submitted")
         ):
             return "uncertain", None
@@ -1250,6 +1256,10 @@ async def _fire_callback(cb: ReplyCallback, text: str) -> None:
         log.error("reply_callback error: %s", e)
 
 
+async def _discard_reply(_text: str) -> None:
+    """Own an accepted turn even when its queued sender needs no callback."""
+
+
 def _ensure_drain_task() -> None:
     """Start the background drain task if it's not already running.
 
@@ -1330,56 +1340,88 @@ async def _drain_queue() -> None:
                         ))
                 continue
 
-            # Conductor is ready — deliver the message and wait for the response
-            result = await loop.run_in_executor(
+            # Conductor is ready. Use the same acceptance-first owner as the
+            # idle chat path so a submitted turn is never retried or attributed
+            # through a later, unrelated output snapshot.
+            ok, response, pending = await loop.run_in_executor(
                 None,
                 functools.partial(
-                    run_cli,
-                    "session", "send", session, message,
-                    "--wait", "--timeout", f"{RESPONSE_TIMEOUT}s", "-q",
+                    send_to_conductor,
+                    session,
+                    message,
                     profile=profile,
-                    timeout=max(RESPONSE_TIMEOUT + 30, 60),
+                    wait_for_reply=True,
+                    response_timeout=RESPONSE_TIMEOUT,
+                    claim_late_reply=True,
                 ),
             )
-            if result.returncode == 0:
-                items.popleft()
-                remaining = len(items)
-                if not remaining:
-                    _message_queue.pop(session, None)
+
+            # Another owner won the race after the pre-check. This message was
+            # not sent; leave it at the head for the next drain cycle.
+            if pending == _WAIT_SEND_QUEUE_REQUIRED:
+                continue
+
+            # Every other outcome consumed this queue attempt. Remove the item
+            # exactly once before registering/announcing its terminal owner.
+            items.popleft()
+            remaining = len(items)
+            if not remaining:
+                _message_queue.pop(session, None)
+
+            if ok:
                 log.info(
                     "Conductor %s delivered queued message (%d remaining)",
                     session, remaining,
                 )
                 if reply_callback is not None:
-                    # Re-fetch the clean reply via get_session_output (consistent
-                    # with send_to_conductor's wait path) rather than the raw
-                    # `--wait` stdout. Off-loop to avoid blocking the drain.
-                    output = await loop.run_in_executor(
-                        None,
-                        functools.partial(get_session_output, session, profile=profile),
+                    await _fire_callback(
+                        reply_callback,
+                        response.strip() or "[No output from conductor.]",
                     )
-                    text = output.strip() or "[No output from conductor.]"
-                    loop.create_task(_fire_callback(reply_callback, text))
-            else:
-                stderr = result.stderr.strip()
-                if "timeout" in stderr.lower() or "not ready" in stderr.lower():
+                continue
+
+            if pending is True or isinstance(pending, dict):
+                watcher_callback = reply_callback or _discard_reply
+                if _register_claimed_reply(
+                    session, profile, pending, watcher_callback,
+                ):
                     log.info(
-                        "Conductor %s busy again during drain, will retry",
-                        session,
+                        "Conductor %s accepted queued message; exact reply pending (%d remaining)",
+                        session, remaining,
                     )
                 else:
                     log.error(
-                        "Failed to deliver queued message to %s: %s — dropping",
-                        session, stderr,
+                        "Conductor %s accepted queued message but reply watcher registration failed",
+                        session,
                     )
-                    items.popleft()
-                    if not items:
-                        _message_queue.pop(session, None)
                     if reply_callback is not None:
-                        loop.create_task(_fire_callback(
+                        await _fire_callback(
                             reply_callback,
-                            f"[Queued message could not be delivered — send failed: {stderr[:100]}]",
-                        ))
+                            "[Message was accepted, but its reply watcher could not be started. "
+                            "It was not retried; check the session.]",
+                        )
+                continue
+
+            if pending == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                log.warning(
+                    "Conductor %s queued delivery is uncertain; message was not retried",
+                    session,
+                )
+                if reply_callback is not None:
+                    await _fire_callback(
+                        reply_callback, _delivery_uncertain_notice(),
+                    )
+                continue
+
+            log.error(
+                "Queued message to conductor %s failed before acceptance",
+                session,
+            )
+            if reply_callback is not None:
+                await _fire_callback(
+                    reply_callback,
+                    "[Queued message could not be delivered before acceptance.]",
+                )
 
         # Exit check AFTER the session loop — avoids missing items enqueued during drain
         if not _message_queue:
@@ -1510,6 +1552,22 @@ def _release_late_reply_claim(
     with _reply_owner_lock:
         if _wait_send_reservations.get(key) == claim_id:
             _wait_send_reservations.pop(key, None)
+
+
+def _register_claimed_reply(
+    session: str,
+    profile: str | None,
+    pending: dict | bool | str,
+    reply_callback: ReplyCallback,
+) -> bool:
+    """Move a retained send claim to its watcher, releasing it on failure."""
+    if pending is not True and not isinstance(pending, dict):
+        return False
+    receipt = pending if isinstance(pending, dict) else None
+    if _register_pending_reply(session, profile, receipt, reply_callback):
+        return True
+    _release_late_reply_claim(session, profile, receipt)
+    return False
 
 
 def get_status_summary(profile: str | None = None) -> dict:
@@ -3498,6 +3556,75 @@ def _os_heartbeat_daemon_installed() -> bool:
     return False
 
 
+async def _handle_heartbeat_response(
+    name: str,
+    profile: str,
+    response: str,
+    multiple_conductors: bool,
+    need_state_by_conductor: dict[str, dict],
+    telegram_bot=None,
+    tg_user_id=None,
+    slack_app=None,
+    slack_channel_id=None,
+    discord_bot=None,
+    discord_channel_id=None,
+) -> None:
+    """Run the existing alert and post-hook flow for one owned response."""
+    log.info("Heartbeat [%s] response received", name)
+
+    prev_counts = need_state_by_conductor.get(name, {})
+    need_filtered = filter_need_lines(response, prev_counts)
+    need_state_by_conductor[name] = need_filtered["counts"]
+
+    forwarded_need_lines = need_filtered["alerts"] + need_filtered["retired"]
+    has_alerts = bool(forwarded_need_lines)
+    if need_filtered["retired"]:
+        log.info(
+            "Heartbeat [%s]: retiring %d stale NEED line(s) after >= %d cycles",
+            name,
+            len(need_filtered["retired"]),
+            NEED_RETIRE_THRESHOLD,
+        )
+    if has_alerts:
+        prefix = f"[{name}] " if multiple_conductors else ""
+        alert_body = "\n".join(forwarded_need_lines)
+        alert_msg = f"{prefix}Conductor alert:\n{alert_body}"
+
+        if telegram_bot and tg_user_id:
+            try:
+                alert_html = md_to_tg_html(alert_msg)
+                for chunk in split_message(alert_html):
+                    await telegram_bot.send_message(
+                        tg_user_id,
+                        chunk,
+                        parse_mode="HTML",
+                    )
+            except Exception as e:
+                log.error("Failed to send Telegram notification: %s", e)
+
+        if slack_app and slack_channel_id:
+            try:
+                await slack_app.client.chat_postMessage(
+                    channel=slack_channel_id, text=alert_msg,
+                )
+            except Exception as e:
+                log.error("Failed to send Slack notification: %s", e)
+
+        if discord_bot and discord_channel_id:
+            try:
+                channel = discord_bot.get_channel(discord_channel_id)
+                if channel:
+                    await send_discord_output(channel, alert_msg)
+            except Exception as e:
+                log.error("Failed to send Discord notification: %s", e)
+
+    invoke_hook(profile, "post-heartbeat", {
+        "profile": profile,
+        "response": response,
+        "has_alerts": has_alerts,
+    })
+
+
 async def heartbeat_loop(
     config: dict, telegram_bot=None, slack_app=None, slack_channel_id=None,
     discord_bot=None, discord_channel_id=None,
@@ -3717,9 +3844,30 @@ async def heartbeat_loop(
                 else:
                     skip_count_by_conductor[name] = 0  # pane read clear → reset
 
-                # Send heartbeat to conductor (wrapped in executor — blocks up to
-                # RESPONSE_TIMEOUT seconds and must not freeze the event loop)
-                ok, response, _ = await loop.run_in_executor(
+                async def _heartbeat_reply(
+                    response_text: str,
+                    heartbeat_name: str = name,
+                    heartbeat_profile: str = profile,
+                    multiple_conductors: bool = len(all_conductors) > 1,
+                ) -> None:
+                    await _handle_heartbeat_response(
+                        heartbeat_name,
+                        heartbeat_profile,
+                        response_text,
+                        multiple_conductors,
+                        need_state_by_conductor,
+                        telegram_bot=telegram_bot,
+                        tg_user_id=tg_user_id,
+                        slack_app=slack_app,
+                        slack_channel_id=slack_channel_id,
+                        discord_bot=discord_bot,
+                        discord_channel_id=discord_channel_id,
+                    )
+
+                # The send returns on exact Codex acceptance. Retain that owner
+                # until its generation-bound watcher runs the same response flow
+                # used by an immediate legacy completion.
+                ok, response, pending = await loop.run_in_executor(
                     None,
                     functools.partial(
                         send_to_conductor,
@@ -3728,93 +3876,49 @@ async def heartbeat_loop(
                         profile=profile,
                         wait_for_reply=True,
                         response_timeout=RESPONSE_TIMEOUT,
+                        claim_late_reply=True,
                     ),
                 )
-                if not ok:
-                    log.error(
-                        "Heartbeat [%s]: failed to send to conductor",
+                if ok:
+                    skip_count_by_conductor[name] = 0
+                    await _heartbeat_reply(response)
+                    continue
+
+                if pending is True or isinstance(pending, dict):
+                    if _register_claimed_reply(
+                        session_title, profile, pending, _heartbeat_reply,
+                    ):
+                        skip_count_by_conductor[name] = 0
+                        log.info(
+                            "Heartbeat [%s]: accepted; exact reply pending",
+                            name,
+                        )
+                    else:
+                        log.error(
+                            "Heartbeat [%s]: accepted but reply watcher registration failed",
+                            name,
+                        )
+                    continue
+
+                if pending == _WAIT_SEND_QUEUE_REQUIRED:
+                    log.info(
+                        "Heartbeat [%s]: another reply owner is active, skipping this cycle",
                         name,
                     )
                     continue
 
-                skip_count_by_conductor[name] = 0  # delivered → reset skip counter
-
-                # Response is captured via get_session_output (see send_to_conductor).
-                log.info(
-                    "Heartbeat [%s] response: %s",
-                    name, response[:200],
-                )
-
-                # Dedup repeating NEED: lines (issue #971). Forward only
-                # fresh + escalation lines; drop verbatim repeats past
-                # threshold so the user isn't trained to ignore heartbeats.
-                prev_counts = need_state_by_conductor.get(name, {})
-                need_filtered = filter_need_lines(response, prev_counts)
-                need_state_by_conductor[name] = need_filtered["counts"]
-
-                forwarded_need_lines = (
-                    need_filtered["alerts"] + need_filtered["retired"]
-                )
-                has_alerts = bool(forwarded_need_lines)
-                if need_filtered["retired"]:
-                    log.info(
-                        "Heartbeat [%s]: retiring %d stale NEED line(s) "
-                        "after >= %d cycles: %s",
+                if pending == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                    log.warning(
+                        "Heartbeat [%s]: delivery may have succeeded; not retrying",
                         name,
-                        len(need_filtered["retired"]),
-                        NEED_RETIRE_THRESHOLD,
-                        need_filtered["retired"],
                     )
-                if has_alerts:
-                    prefix = (
-                        f"[{name}] " if len(all_conductors) > 1 else ""
-                    )
-                    alert_body = "\n".join(forwarded_need_lines)
-                    alert_msg = f"{prefix}Conductor alert:\n{alert_body}"
+                    continue
 
-                    # Notify via Telegram (with HTML formatting)
-                    if telegram_bot and tg_user_id:
-                        try:
-                            alert_html = md_to_tg_html(alert_msg)
-                            for chunk in split_message(alert_html):
-                                await telegram_bot.send_message(
-                                    tg_user_id,
-                                    chunk,
-                                    parse_mode="HTML",
-                                )
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Telegram notification: %s", e
-                            )
-
-                    # Notify via Slack
-                    if slack_app and slack_channel_id:
-                        try:
-                            await slack_app.client.chat_postMessage(
-                                channel=slack_channel_id, text=alert_msg,
-                            )
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Slack notification: %s", e
-                            )
-
-                    # Notify via Discord
-                    if discord_bot and discord_channel_id:
-                        try:
-                            channel = discord_bot.get_channel(discord_channel_id)
-                            if channel:
-                                await send_discord_output(channel, alert_msg)
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Discord notification: %s", e
-                            )
-
-                # Run post-heartbeat hook (non-gating)
-                invoke_hook(profile, "post-heartbeat", {
-                    "profile": profile,
-                    "response": response,
-                    "has_alerts": has_alerts,
-                })
+                log.error(
+                    "Heartbeat [%s]: message was not accepted",
+                    name,
+                )
+                continue
 
             except Exception as e:
                 log.error("Heartbeat [%s] error: %s", conductor.get("name", "?"), e)

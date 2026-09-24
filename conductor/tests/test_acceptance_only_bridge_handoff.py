@@ -168,3 +168,48 @@ def test_malformed_or_privacy_violating_result_fails_closed_without_retry():
                 wait_for_reply=True,
             ) == (False, "", bridge._WAIT_SEND_DELIVERY_UNCERTAIN)
         cli.assert_called_once()
+
+
+def _assert_composite_field_is_uncertain(field, value):
+    payload = {
+        "schema_version": 1,
+        "success": False,
+        "acceptance": "indeterminate",
+        "code": "ACCEPTANCE_INDETERMINATE",
+        "delivery": "unverified",
+        "submitted": False,
+    }
+    payload[field] = value
+    key = ("work", "conductor-codex")
+    with mock.patch(
+        "bridge.run_cli", return_value=_completed(1, stdout=json.dumps(payload)),
+    ) as cli:
+        result = bridge.send_to_conductor(
+            "conductor-codex", "question", profile="work",
+            wait_for_reply=True, claim_late_reply=True,
+        )
+    assert result == (False, "", bridge._WAIT_SEND_DELIVERY_UNCERTAIN)
+    cli.assert_called_once()
+    assert key not in bridge._wait_send_reservations
+    notice = bridge._delivery_uncertain_notice("semgrep")
+    assert "may have succeeded" in notice
+    assert "failed" not in notice.lower()
+
+
+def test_array_code_is_uncertain_without_retry_or_reservation_leak():
+    _assert_composite_field_is_uncertain("code", [])
+
+
+def test_array_delivery_is_uncertain_without_retry_or_reservation_leak():
+    _assert_composite_field_is_uncertain("delivery", [])
+
+
+def test_nearby_composite_schema_values_are_uncertain_not_exceptions():
+    for field, value in (
+        ("code", {}),
+        ("code", 7),
+        ("delivery", {}),
+        ("delivery", ["unverified"]),
+        ("acceptance", []),
+    ):
+        _assert_composite_field_is_uncertain(field, value)
