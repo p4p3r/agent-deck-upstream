@@ -4441,7 +4441,8 @@ func acceptedTurnOnlyVerdict(
 	fence codexAcceptanceFence,
 	guard *codexAcceptanceGuard,
 ) acceptanceOnlyResult {
-	receipt := observeAcceptedCodexTurn(true, inst, delivery, acceptedAt, fence)
+	receiptDelivery := acceptanceOnlyReceiptDelivery(inst, delivery, fence, guard)
+	receipt := observeAcceptedCodexTurn(true, inst, receiptDelivery, acceptedAt, fence)
 	if receipt == nil || guard == nil {
 		return newAcceptanceOnlyFailureResult(
 			acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, delivery,
@@ -4459,6 +4460,28 @@ func acceptedTurnOnlyVerdict(
 		)
 	}
 	return result
+}
+
+// acceptanceOnlyReceiptDelivery promotes transport-level uncertainty only
+// for the one outcome that proves the body and Enter reached the pane, and
+// only after that exact attempt was durably marked ambiguous under the same
+// instance/session/generation fence. The existing accepted-turn observer must
+// still prove a strictly newer exact rollout generation before this can
+// produce a receipt. Generic send modes continue to require deliverySubmitted.
+func acceptanceOnlyReceiptDelivery(
+	inst *session.Instance,
+	delivery string,
+	fence codexAcceptanceFence,
+	guard *codexAcceptanceGuard,
+) string {
+	if delivery != deliveryDelivered || inst == nil || guard == nil || guard.marker == nil ||
+		!guard.marker.IsTransportAmbiguous() || guard.fence != fence ||
+		guard.marker.InstanceID != strings.TrimSpace(inst.ID) ||
+		guard.marker.CodexSessionID != fence.codexSessionID ||
+		guard.marker.PriorTurnGeneration != fence.priorTurnGeneration {
+		return delivery
+	}
+	return deliverySubmitted
 }
 
 func marshalAcceptanceOnlyResult(result acceptanceOnlyResult) ([]byte, error) {

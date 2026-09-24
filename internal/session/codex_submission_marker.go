@@ -90,6 +90,13 @@ func (m *CodexSubmissionMarker) MarkTransportAmbiguous(now time.Time) error {
 	return m.updatePhase(codexSubmissionPhaseAmbiguous, now)
 }
 
+// IsTransportAmbiguous reports whether transport was attempted without a
+// transport-level submission signal. Callers still need exact rollout
+// generation proof before resolving the marker as accepted.
+func (m *CodexSubmissionMarker) IsTransportAmbiguous() bool {
+	return m != nil && m.Phase == codexSubmissionPhaseAmbiguous
+}
+
 func (m *CodexSubmissionMarker) updatePhase(phase string, now time.Time) error {
 	if m == nil {
 		return fmt.Errorf("Codex submission marker: nil marker")
