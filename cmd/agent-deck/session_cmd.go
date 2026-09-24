@@ -3003,8 +3003,17 @@ func hookDrivenBusy(inst *session.Instance) (busy, known bool) {
 // handleSessionSend sends a message to a running session
 // Waits for the agent to be ready before sending (Claude, Gemini, etc.)
 func handleSessionSend(profile string, args []string) {
-	fs := flag.NewFlagSet("session send", flag.ExitOnError)
-	fs.SetOutput(os.Stdout)
+	acceptanceOnlyDiagnostics := acceptanceOnlyFlagRequestsBoundary(args)
+	errorHandling := flag.ExitOnError
+	if acceptanceOnlyDiagnostics {
+		errorHandling = flag.ContinueOnError
+	}
+	fs := flag.NewFlagSet("session send", errorHandling)
+	if acceptanceOnlyDiagnostics {
+		fs.SetOutput(io.Discard)
+	} else {
+		fs.SetOutput(os.Stdout)
+	}
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("q", false, "Quiet mode")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
@@ -3058,8 +3067,19 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  Supports only local Codex targets with a uniquely readable exact rollout.")
 		fmt.Println("  Incompatible with --wait, --stream, --no-wait, --draft, and -q; --json is optional.")
 	}
+	if acceptanceOnlyDiagnostics {
+		// flag.Parse invokes Usage for both malformed flags and --help. Neither
+		// free-form parser diagnostics nor help text belong in this mode's
+		// bounded machine-readable channel.
+		fs.Usage = func() {}
+	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		if acceptanceOnlyDiagnostics {
+			emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(
+				acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "",
+			))
+		}
 		os.Exit(1)
 	}
 	remaining := fs.Args()
@@ -3789,6 +3809,39 @@ func handleSessionSend(profile string, args []string) {
 	if finalStatus == "inactive" || finalStatus == "error" {
 		os.Exit(1)
 	}
+}
+
+// acceptanceOnlyFlagRequestsBoundary recognizes the same one- and two-dash
+// boolean flag forms accepted by flag.FlagSet. Invalid explicit boolean values
+// still activate the boundary: they are precisely the parse failures whose raw
+// values must not be echoed. A valid explicit false preserves legacy behavior.
+func acceptanceOnlyFlagRequestsBoundary(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		nameValue := ""
+		switch {
+		case strings.HasPrefix(arg, "--"):
+			nameValue = strings.TrimPrefix(arg, "--")
+		case strings.HasPrefix(arg, "-"):
+			nameValue = strings.TrimPrefix(arg, "-")
+		default:
+			continue
+		}
+		name, value, hasValue := strings.Cut(nameValue, "=")
+		if name != "acceptance-only" {
+			continue
+		}
+		if !hasValue {
+			return true
+		}
+		enabled, err := strconv.ParseBool(value)
+		if err != nil || enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // awaitClaudeWaitReply is the whole Claude --wait reply path after delivery,

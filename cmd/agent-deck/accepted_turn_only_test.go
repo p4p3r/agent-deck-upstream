@@ -273,6 +273,83 @@ func TestAcceptanceOnlyCLIRefusesUnsupportedBeforeDelivery(t *testing.T) {
 	}
 }
 
+func TestAcceptanceOnlyMainDiagnosticsStayInsideSafeResultBoundary(t *testing.T) {
+	t.Run("flag parse error", func(t *testing.T) {
+		home := t.TempDir()
+		stdout, stderr, code := runAgentDeck(t, home,
+			"session", "send", "missing", "SENSITIVE prompt body",
+			"--acceptance-only=PRIVATE_INVALID_VALUE")
+		assertAcceptanceOnlyProcessFailure(
+			t, stdout, stderr, code, acceptanceOnlyCodeInvalidOptions,
+			"PRIVATE_INVALID_VALUE", "SENSITIVE prompt body",
+		)
+	})
+
+	t.Run("store root divergence warning", func(t *testing.T) {
+		home, _, strayDB := strayXDGFixture(t)
+		stdout, stderr, code := runAgentDeck(t, home,
+			"session", "send", "ch_support_test-seed-a", "SENSITIVE prompt body",
+			"--acceptance-only")
+		assertAcceptanceOnlyProcessFailure(
+			t, stdout, stderr, code, acceptanceOnlyCodeUnsupported,
+			filepath.Dir(filepath.Dir(strayDB)), "SENSITIVE prompt body", "legacy-a",
+		)
+	})
+
+	t.Run("inferred profile fallback warning", func(t *testing.T) {
+		home := t.TempDir()
+		seedStoreCLI(t, filepath.Join(home, ".local", "share", "agent-deck"), "default", 1)
+		privateConfigDir := filepath.Join(home, "PRIVATE-profile-root", ".claude-PRIVATE")
+		stdout, stderr, code := runAgentDeckEnv(t, home, "", []string{
+			"AGENTDECK_PROFILE=",
+			"CLAUDE_CONFIG_DIR=" + privateConfigDir,
+		}, "session", "send", "default-seed-a", "SENSITIVE prompt body", "--acceptance-only")
+		assertAcceptanceOnlyProcessFailure(
+			t, stdout, stderr, code, acceptanceOnlyCodeUnsupported,
+			privateConfigDir, "PRIVATE", "SENSITIVE prompt body", "legacy-a",
+		)
+	})
+}
+
+func assertAcceptanceOnlyProcessFailure(
+	t *testing.T,
+	stdout, stderr string,
+	exitCode int,
+	wantCode string,
+	forbidden ...string,
+) {
+	t.Helper()
+	if exitCode != 1 {
+		t.Fatalf("exit = %d, want 1; stdout: %s\nstderr: %s", exitCode, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("acceptance-only stderr must be empty, got: %q", stderr)
+	}
+	if len(stdout) > acceptanceOnlyResultMaxBytes {
+		t.Fatalf("result length = %d, max = %d", len(stdout), acceptanceOnlyResultMaxBytes)
+	}
+	for _, value := range forbidden {
+		if strings.Contains(stdout, value) || strings.Contains(stderr, value) {
+			t.Fatalf("acceptance-only diagnostics leaked %q:\nstdout: %s\nstderr: %s", value, stdout, stderr)
+		}
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(stdout), &fields); err != nil {
+		t.Fatalf("decode acceptance-only failure: %v; stdout: %s", err, stdout)
+	}
+	wantKeys := []string{"acceptance", "code", "schema_version", "success"}
+	if got := sortedMapKeys(fields); !reflect.DeepEqual(got, wantKeys) {
+		t.Fatalf("failure keys = %v, want exact allowlist %v", got, wantKeys)
+	}
+	var result acceptanceOnlyResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode acceptance-only result: %v", err)
+	}
+	if result.Success || result.Acceptance != acceptanceOnlyNotAccepted || result.Code != wantCode {
+		t.Fatalf("failure = %#v, want code %q", result, wantCode)
+	}
+}
+
 func sortedMapKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
