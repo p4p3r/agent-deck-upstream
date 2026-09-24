@@ -1,16 +1,9 @@
-"""Tests for the timeout -> async-reply fallback on the idle send path.
+"""Tests for exact and legacy async replies on the idle send path.
 
-Background: when the conductor is IDLE on arrival, the handler delivers the
-message with a blocking ``session send --wait --timeout {RESPONSE_TIMEOUT}s``.
-If that single turn outruns the timeout, the CLI exits non-zero with stderr
-like ``timeout waiting for completion: agent still running after 5m0s``. The
-message was already delivered and the conductor keeps working — only the
-synchronous reply is lost. Previously this surfaced as a FALSE
-"[Failed to send message to conductor]".
-
-The fix requires a structured accepted-turn receipt. The reply-only watcher
-then waits for a new matching Codex completion and fresh output before calling
-the origin callback, without re-sending the message.
+Codex now hands off through ``session send --acceptance-only``. Receipt-less
+tools can still reach the legacy blocking wait only after an exact pre-send
+UNSUPPORTED_TARGET result. Both paths reuse the reply-only watcher without
+re-sending the message.
 """
 
 from __future__ import annotations
@@ -49,7 +42,7 @@ async def _no_sleep(_seconds: float) -> None:
 
 def _receipt(**overrides):
     receipt = {
-        "receipt_id": "receipt-1",
+        "receipt_id": "6b1e73a6-f908-40a6-8af8-a40ff68b3c20",
         "instance_id": "instance-1",
         "codex_session_id": "thread-1",
         "turn_generation": "thread-1:turn-new",
@@ -57,6 +50,29 @@ def _receipt(**overrides):
     }
     receipt.update(overrides)
     return receipt
+
+
+def _unsupported_result():
+    return _completed(1, stdout=json.dumps({
+        "schema_version": 1,
+        "success": False,
+        "acceptance": "not_accepted",
+        "code": "UNSUPPORTED_TARGET",
+    }))
+
+
+def _acceptance_result():
+    receipt = _receipt()
+    return _completed(stdout=json.dumps({
+        "schema_version": 1,
+        "success": True,
+        "acceptance": "accepted",
+        "instance_id": receipt["instance_id"],
+        "delivery": "submitted",
+        "submitted": True,
+        "accepted_turn_kind": "codex_rollout",
+        "accepted_turn": receipt,
+    }))
 
 
 def _run(coro):
@@ -69,15 +85,18 @@ def _run(coro):
 def test_wait_timeout_preserves_machine_readable_accepted_turn_receipt():
     payload = (Path(__file__).parent / "fixtures" / "issue2278_codex_timeout.json").read_text()
     receipt = json.loads(payload)["accepted_turn"]
-    with mock.patch("bridge.run_cli", return_value=_completed(1, stdout=payload)) as cli:
+    with mock.patch(
+        "bridge.run_cli", side_effect=[_unsupported_result(), _completed(1, stdout=payload)],
+    ) as cli:
         ok, response, pending = send_to_conductor(
             "conductor-ops", "hi", profile="work", wait_for_reply=True,
         )
     assert ok is False
     assert response == ""
     assert pending == receipt
-    assert "--json" in cli.call_args.args
-    assert "-q" not in cli.call_args.args
+    assert "--acceptance-only" in cli.call_args_list[0].args
+    assert "--json" in cli.call_args_list[1].args
+    assert "-q" not in cli.call_args_list[1].args
 
 
 def test_exact_output_delay_preserves_receipt_for_late_watcher():
@@ -87,7 +106,9 @@ def test_exact_output_delay_preserves_receipt_for_late_watcher():
         / "issue2278_codex_output_pending.json"
     ).read_text()
     receipt = json.loads(payload)["accepted_turn"]
-    with mock.patch("bridge.run_cli", return_value=_completed(1, stdout=payload)):
+    with mock.patch(
+        "bridge.run_cli", side_effect=[_unsupported_result(), _completed(1, stdout=payload)],
+    ):
         assert send_to_conductor(
             "conductor-ops", "hi", profile="work", wait_for_reply=True,
         ) == (False, "", receipt)
@@ -95,7 +116,9 @@ def test_exact_output_delay_preserves_receipt_for_late_watcher():
 
 def test_wait_genuine_failure_is_not_still_running():
     with mock.patch(
-        "bridge.run_cli", return_value=_completed(1, stderr="session not found"),
+        "bridge.run_cli", side_effect=[
+            _unsupported_result(), _completed(1, stderr="session not found"),
+        ],
     ):
         ok, response, pending = send_to_conductor(
             "conductor-ops", "hi", profile="work", wait_for_reply=True,
@@ -112,7 +135,9 @@ def test_wait_unverified_timeout_does_not_acquire_reply_ownership():
         "submitted": False,
         "accepted_turn_kind": "codex_rollout",
     })
-    with mock.patch("bridge.run_cli", return_value=_completed(1, stdout=payload)):
+    with mock.patch(
+        "bridge.run_cli", side_effect=[_unsupported_result(), _completed(1, stdout=payload)],
+    ):
         assert send_to_conductor(
             "conductor-ops", "hi", profile="work", wait_for_reply=True,
         ) == (False, "", False)
@@ -125,7 +150,9 @@ def test_non_codex_submitted_timeout_preserves_legacy_async_signal():
         "delivery": "submitted",
         "submitted": True,
     })
-    with mock.patch("bridge.run_cli", return_value=_completed(1, stdout=payload)):
+    with mock.patch(
+        "bridge.run_cli", side_effect=[_unsupported_result(), _completed(1, stdout=payload)],
+    ):
         assert send_to_conductor(
             "conductor-legacy", "hi", profile="work", wait_for_reply=True,
         ) == (False, "", True)
@@ -139,7 +166,9 @@ def test_codex_timeout_without_exact_receipt_fails_closed():
         "submitted": True,
         "accepted_turn_kind": "codex_rollout",
     })
-    with mock.patch("bridge.run_cli", return_value=_completed(1, stdout=payload)):
+    with mock.patch(
+        "bridge.run_cli", side_effect=[_unsupported_result(), _completed(1, stdout=payload)],
+    ):
         assert send_to_conductor(
             "conductor-codex", "hi", profile="work", wait_for_reply=True,
         ) == (False, "", False)
@@ -147,15 +176,18 @@ def test_codex_timeout_without_exact_receipt_fails_closed():
 
 def test_wait_success_returns_output():
     with mock.patch(
-        "bridge.run_cli", return_value=_completed(0, stdout=json.dumps({
-            "success": True, "completion": "complete", "content": "the answer",
-        })),
+        "bridge.run_cli", side_effect=[
+            _unsupported_result(),
+            _completed(0, stdout=json.dumps({
+                "success": True, "completion": "complete", "content": "the answer",
+            })),
+        ],
     ) as cli, mock.patch("bridge.get_session_output") as output:
         ok, response, pending = send_to_conductor(
             "conductor-ops", "hi", profile="work", wait_for_reply=True,
         )
     assert (ok, response, pending) == (True, "the answer", False)
-    cli.assert_called_once()
+    assert cli.call_count == 2
     output.assert_not_called()
 
 
@@ -312,7 +344,6 @@ def test_wait_send_refuses_second_owner_without_submitting():
 
 
 def test_concurrent_wait_sends_reserve_one_owner_and_queue_the_other():
-    payload = (Path(__file__).parent / "fixtures" / "issue2278_codex_timeout.json").read_text()
     entered = threading.Event()
     release = threading.Event()
     calls = 0
@@ -322,7 +353,7 @@ def test_concurrent_wait_sends_reserve_one_owner_and_queue_the_other():
         calls += 1
         entered.set()
         assert release.wait(timeout=2)
-        return _completed(1, stdout=payload)
+        return _acceptance_result()
 
     def send(message):
         return send_to_conductor(

@@ -18,8 +18,9 @@ Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py
 
 from __future__ import annotations
 
-import contextlib
 import asyncio
+import contextlib
+import datetime
 import functools
 import json
 import logging
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -435,7 +437,19 @@ def run_cli(
     if profile:
         cmd += ["-p", profile]
     cmd += list(args)
-    log.debug("CLI: %s", " ".join(cmd))
+    log_cmd = list(cmd)
+    try:
+        send_index = next(
+            i for i in range(len(log_cmd) - 1)
+            if log_cmd[i:i + 2] == ["session", "send"]
+        )
+    except StopIteration:
+        pass
+    else:
+        message_index = send_index + 3
+        if message_index < len(log_cmd):
+            log_cmd[message_index] = "[message redacted]"
+    log.debug("CLI: %s", " ".join(log_cmd))
     try:
         # Use Popen + communicate(timeout=) so we have the proc object available
         # when TimeoutExpired fires — subprocess.run() does NOT set exc.proc.
@@ -444,13 +458,14 @@ def run_cli(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             start_new_session=True,  # own process group -> killpg kills grandchildren too
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
             return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
         except subprocess.TimeoutExpired:
-            log.warning("CLI timeout: %s", " ".join(cmd))
+            log.warning("CLI timeout: %s", " ".join(log_cmd))
             try:
                 # Kill the entire process group so grandchildren (e.g. tmux send-keys)
                 # don't survive as orphans and jam the pane's input queue.
@@ -814,9 +829,51 @@ def _heartbeat_skip_action(consecutive_skips: int, limit: int = HEARTBEAT_SKIP_L
 ReplyCallback = Callable[[str], Coroutine[Any, Any, None]]
 
 _WAIT_SEND_QUEUE_REQUIRED = "queue_required"
+_WAIT_SEND_DELIVERY_UNCERTAIN = "delivery_uncertain"
 _LEGACY_REPLY_CLAIM = "legacy"
 _reply_owner_lock = threading.Lock()
 _wait_send_reservations: dict[tuple[str | None, str], str | None] = {}
+
+_ACCEPTANCE_ONLY_MAX_BYTES = 2048
+_ACCEPTANCE_ONLY_CODES = frozenset({
+    "INVALID_OPTIONS",
+    "INPUT_UNREADABLE",
+    "TARGET_UNAVAILABLE",
+    "UNSUPPORTED_TARGET",
+    "EXACT_ACCEPTANCE_UNAVAILABLE",
+    "NOT_ACCEPTED",
+    "ACCEPTANCE_INDETERMINATE",
+})
+_ACCEPTANCE_ONLY_DELIVERIES = frozenset({
+    "submitted",
+    "unverified",
+    "delivered",
+    "line_too_long",
+    "menu_open",
+    "pane_gone",
+    "typed_not_submitted",
+    "no_evidence",
+    "send_failed",
+    "composer_blocked",
+    "target_busy",
+    "queued",
+    "queued_socket",
+    "socket_write_failed",
+})
+_ACCEPTANCE_ONLY_DEFINITIVE_NON_DELIVERY = frozenset({
+    "line_too_long", "composer_blocked", "target_busy",
+})
+_ACCEPTANCE_ONLY_PRETRANSPORT_CODES = frozenset({
+    "INVALID_OPTIONS",
+    "INPUT_UNREADABLE",
+    "TARGET_UNAVAILABLE",
+    "UNSUPPORTED_TARGET",
+    "EXACT_ACCEPTANCE_UNAVAILABLE",
+})
+_ACCEPTANCE_ONLY_OPAQUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_ACCEPTANCE_ONLY_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def _cli_json(stdout: str) -> dict:
@@ -825,6 +882,141 @@ def _cli_json(stdout: str) -> dict:
     except (json.JSONDecodeError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _acceptance_only_receipt(payload: dict) -> dict | None:
+    receipt = payload.get("accepted_turn")
+    if not isinstance(receipt, _JSONObject) or len(receipt.pairs) != len(receipt):
+        return None
+    if set(receipt) != {
+        "receipt_id", "instance_id", "codex_session_id", "turn_generation", "accepted_at",
+    }:
+        return None
+    if not all(isinstance(receipt.get(key), str) for key in receipt):
+        return None
+    if not _ACCEPTANCE_ONLY_OPAQUE_RE.fullmatch(receipt["instance_id"]):
+        return None
+    if not _ACCEPTANCE_ONLY_OPAQUE_RE.fullmatch(receipt["codex_session_id"]):
+        return None
+    try:
+        if str(uuid.UUID(receipt["receipt_id"])) != receipt["receipt_id"]:
+            return None
+    except (ValueError, AttributeError):
+        return None
+    generation_prefix = receipt["codex_session_id"] + ":"
+    if not receipt["turn_generation"].startswith(generation_prefix):
+        return None
+    if not _ACCEPTANCE_ONLY_OPAQUE_RE.fullmatch(
+        receipt["turn_generation"][len(generation_prefix):]
+    ):
+        return None
+    accepted_at = receipt["accepted_at"]
+    if len(accepted_at) > 64 or not _ACCEPTANCE_ONLY_TIMESTAMP_RE.fullmatch(accepted_at):
+        return None
+    try:
+        parsed_at = datetime.datetime.fromisoformat(
+            accepted_at[:-1] + "+00:00" if accepted_at.endswith("Z") else accepted_at
+        )
+    except ValueError:
+        return None
+    if parsed_at.tzinfo is None:
+        return None
+    return dict(receipt)
+
+
+def _acceptance_only_outcome(result: subprocess.CompletedProcess) -> tuple[str, dict | None]:
+    """Classify the bounded body-free handoff without exposing its contents.
+
+    Only an exact pre-transport UNSUPPORTED_TARGET result authorizes a legacy
+    send. Any malformed, oversized, or possibly post-transport result is
+    uncertain: callers must not retry it or report definite non-delivery.
+    """
+    stdout = result.stdout
+    if not isinstance(stdout, str):
+        return "uncertain", None
+    try:
+        if len(stdout.encode("utf-8")) > _ACCEPTANCE_ONLY_MAX_BYTES:
+            return "uncertain", None
+        payload = json.loads(stdout, object_pairs_hook=_JSONObject)
+    except (json.JSONDecodeError, UnicodeEncodeError):
+        return "uncertain", None
+    if not isinstance(payload, _JSONObject) or len(payload.pairs) != len(payload):
+        return "uncertain", None
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        return "uncertain", None
+    if type(payload.get("success")) is not bool:
+        return "uncertain", None
+
+    if payload["success"]:
+        if result.returncode != 0 or set(payload) != {
+            "schema_version", "success", "acceptance", "instance_id", "delivery",
+            "submitted", "accepted_turn_kind", "accepted_turn",
+        }:
+            return "uncertain", None
+        receipt = _acceptance_only_receipt(payload)
+        if (
+            payload.get("acceptance") != "accepted"
+            or payload.get("delivery") != "submitted"
+            or payload.get("submitted") is not True
+            or payload.get("accepted_turn_kind") != "codex_rollout"
+            or receipt is None
+            or payload.get("instance_id") != receipt["instance_id"]
+        ):
+            return "uncertain", None
+        return "accepted", receipt
+
+    if result.returncode == 0 or not set(payload).issubset({
+        "schema_version", "success", "acceptance", "code", "delivery", "submitted",
+    }):
+        return "uncertain", None
+    if not {"schema_version", "success", "acceptance", "code"}.issubset(payload):
+        return "uncertain", None
+    acceptance = payload.get("acceptance")
+    code = payload.get("code")
+    if (
+        not isinstance(acceptance, str)
+        or not isinstance(code, str)
+        or acceptance not in ("not_accepted", "indeterminate")
+        or code not in _ACCEPTANCE_ONLY_CODES
+    ):
+        return "uncertain", None
+    delivery_present = "delivery" in payload
+    submitted_present = "submitted" in payload
+    if delivery_present != submitted_present:
+        return "uncertain", None
+    if delivery_present:
+        delivery = payload.get("delivery")
+        submitted = payload.get("submitted")
+        if (
+            not isinstance(delivery, str)
+            or type(submitted) is not bool
+            or delivery not in _ACCEPTANCE_ONLY_DELIVERIES
+            or submitted != (delivery == "submitted")
+        ):
+            return "uncertain", None
+    else:
+        delivery = None
+
+    if acceptance == "indeterminate":
+        return "uncertain", None
+    if delivery is None and code in _ACCEPTANCE_ONLY_PRETRANSPORT_CODES:
+        if code == "UNSUPPORTED_TARGET":
+            return "unsupported", None
+        return "not_accepted", None
+    if (
+        delivery in _ACCEPTANCE_ONLY_DEFINITIVE_NON_DELIVERY
+        and code == "NOT_ACCEPTED"
+    ):
+        return "not_accepted", None
+    return "uncertain", None
+
+
+def _delivery_uncertain_notice(target: str | None = None) -> str:
+    destination = f" to conductor {target}" if target else " to the conductor"
+    return (
+        f"[Delivery{destination} may have succeeded, but exact acceptance could not be "
+        "confirmed. The message was not retried; check the session before resending.]"
+    )
 
 
 def _accepted_turn_from_timeout(payload: dict) -> dict | None:
@@ -872,9 +1064,10 @@ def send_to_conductor(
     """Send a message to the conductor session.
 
     Returns (success, response_text, pending). An exact receipt means Codex
-    accepted a turn before completion timed out; True preserves the legacy
-    async signal for receipt-less tools; queue_required prevents concurrent
-    remote sends from creating an unowned turn.
+    accepted a turn whose completion belongs to the reply watcher; True
+    preserves the legacy async signal for receipt-less tools; queue_required
+    prevents concurrent remote sends from creating an unowned turn; and
+    delivery_uncertain means no retry is safe without an exact receipt.
 
     When wait_for_reply=False and the conductor is busy (running/active/starting),
     the message is queued in-memory and delivered automatically once the conductor
@@ -885,8 +1078,8 @@ def send_to_conductor(
     Use this when the caller already knows the conductor is busy to avoid a
     redundant blocking subprocess call.
 
-    claim_late_reply reserves one in-memory owner across the blocking wait and,
-    on an accepted timeout, until the caller registers its reply watcher.
+    claim_late_reply reserves one in-memory owner across the handoff and, on
+    exact acceptance, until the caller registers its reply watcher.
     """
     if not wait_for_reply:
         # force_queue: caller already confirmed conductor is busy — skip status check.
@@ -934,8 +1127,35 @@ def send_to_conductor(
 
     retain_reservation = False
     try:
-        # `--wait --json` returns the accepted turn and its exact correlated
-        # response as one result; never issue a second output read here.
+        # Codex handoff returns as soon as one exact rollout generation is
+        # accepted. The existing watcher owns completion; this path must not
+        # block on that completion or resend after an uncertain result.
+        result = run_cli(
+            "session", "send", session, message,
+            "--acceptance-only",
+            profile=profile,
+            timeout=30,
+        )
+        acceptance, receipt = _acceptance_only_outcome(result)
+        if acceptance == "accepted" and receipt is not None:
+            log.info("Conductor %s accepted an exact turn; reply pending", session)
+            if claim_late_reply:
+                with _reply_owner_lock:
+                    _wait_send_reservations[key] = receipt["receipt_id"]
+                retain_reservation = True
+            return False, "", receipt
+        if acceptance == "not_accepted":
+            log.error("Conductor %s refused the message before transport", session)
+            return False, "", False
+        if acceptance != "unsupported":
+            log.warning(
+                "Conductor %s delivery is uncertain; refusing to retry without an exact receipt",
+                session,
+            )
+            return False, "", _WAIT_SEND_DELIVERY_UNCERTAIN
+
+        # The acceptance-only result proved this target unsupported before
+        # transport. Only that exact refusal permits the legacy wait send.
         result = run_cli(
             "session", "send", session, message,
             "--wait", "--timeout", f"{response_timeout}s", "--json",
@@ -961,8 +1181,7 @@ def send_to_conductor(
                         _wait_send_reservations[key] = _LEGACY_REPLY_CLAIM
                     retain_reservation = True
                 return False, "", True
-            error = payload.get("error") or result.stderr.strip()
-            log.error("Failed to send to conductor: %s", error)
+            log.error("Legacy wait send to conductor %s failed", session)
             return False, "", False
         payload = _cli_json(result.stdout)
         content = payload.get("content")
@@ -1035,6 +1254,10 @@ async def _fire_callback(cb: ReplyCallback, text: str) -> None:
         await cb(text)
     except Exception as e:
         log.error("reply_callback error: %s", e)
+
+
+async def _discard_reply(_text: str) -> None:
+    """Own an accepted turn even when its queued sender needs no callback."""
 
 
 def _ensure_drain_task() -> None:
@@ -1117,56 +1340,88 @@ async def _drain_queue() -> None:
                         ))
                 continue
 
-            # Conductor is ready — deliver the message and wait for the response
-            result = await loop.run_in_executor(
+            # Conductor is ready. Use the same acceptance-first owner as the
+            # idle chat path so a submitted turn is never retried or attributed
+            # through a later, unrelated output snapshot.
+            ok, response, pending = await loop.run_in_executor(
                 None,
                 functools.partial(
-                    run_cli,
-                    "session", "send", session, message,
-                    "--wait", "--timeout", f"{RESPONSE_TIMEOUT}s", "-q",
+                    send_to_conductor,
+                    session,
+                    message,
                     profile=profile,
-                    timeout=max(RESPONSE_TIMEOUT + 30, 60),
+                    wait_for_reply=True,
+                    response_timeout=RESPONSE_TIMEOUT,
+                    claim_late_reply=True,
                 ),
             )
-            if result.returncode == 0:
-                items.popleft()
-                remaining = len(items)
-                if not remaining:
-                    _message_queue.pop(session, None)
+
+            # Another owner won the race after the pre-check. This message was
+            # not sent; leave it at the head for the next drain cycle.
+            if pending == _WAIT_SEND_QUEUE_REQUIRED:
+                continue
+
+            # Every other outcome consumed this queue attempt. Remove the item
+            # exactly once before registering/announcing its terminal owner.
+            items.popleft()
+            remaining = len(items)
+            if not remaining:
+                _message_queue.pop(session, None)
+
+            if ok:
                 log.info(
                     "Conductor %s delivered queued message (%d remaining)",
                     session, remaining,
                 )
                 if reply_callback is not None:
-                    # Re-fetch the clean reply via get_session_output (consistent
-                    # with send_to_conductor's wait path) rather than the raw
-                    # `--wait` stdout. Off-loop to avoid blocking the drain.
-                    output = await loop.run_in_executor(
-                        None,
-                        functools.partial(get_session_output, session, profile=profile),
+                    await _fire_callback(
+                        reply_callback,
+                        response.strip() or "[No output from conductor.]",
                     )
-                    text = output.strip() or "[No output from conductor.]"
-                    loop.create_task(_fire_callback(reply_callback, text))
-            else:
-                stderr = result.stderr.strip()
-                if "timeout" in stderr.lower() or "not ready" in stderr.lower():
+                continue
+
+            if pending is True or isinstance(pending, dict):
+                watcher_callback = reply_callback or _discard_reply
+                if _register_claimed_reply(
+                    session, profile, pending, watcher_callback,
+                ):
                     log.info(
-                        "Conductor %s busy again during drain, will retry",
-                        session,
+                        "Conductor %s accepted queued message; exact reply pending (%d remaining)",
+                        session, remaining,
                     )
                 else:
                     log.error(
-                        "Failed to deliver queued message to %s: %s — dropping",
-                        session, stderr,
+                        "Conductor %s accepted queued message but reply watcher registration failed",
+                        session,
                     )
-                    items.popleft()
-                    if not items:
-                        _message_queue.pop(session, None)
                     if reply_callback is not None:
-                        loop.create_task(_fire_callback(
+                        await _fire_callback(
                             reply_callback,
-                            f"[Queued message could not be delivered — send failed: {stderr[:100]}]",
-                        ))
+                            "[Message was accepted, but its reply watcher could not be started. "
+                            "It was not retried; check the session.]",
+                        )
+                continue
+
+            if pending == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                log.warning(
+                    "Conductor %s queued delivery is uncertain; message was not retried",
+                    session,
+                )
+                if reply_callback is not None:
+                    await _fire_callback(
+                        reply_callback, _delivery_uncertain_notice(),
+                    )
+                continue
+
+            log.error(
+                "Queued message to conductor %s failed before acceptance",
+                session,
+            )
+            if reply_callback is not None:
+                await _fire_callback(
+                    reply_callback,
+                    "[Queued message could not be delivered before acceptance.]",
+                )
 
         # Exit check AFTER the session loop — avoids missing items enqueued during drain
         if not _message_queue:
@@ -1178,11 +1433,10 @@ async def _drain_queue() -> None:
 # Pending reply watchers for in-flight turns
 # ---------------------------------------------------------------------------
 #
-# When the conductor is IDLE on arrival the handler delivers the message with a
-# blocking `session send --wait --timeout {RESPONSE_TIMEOUT}s`. If that single
-# turn outruns the timeout the message is already delivered and the agent keeps
-# working — only the synchronous reply is lost. send_to_conductor returns the
-# CLI's accepted-turn receipt; the handler registers its reply owner here.
+# When the conductor is IDLE on arrival the handler submits with
+# `session send --acceptance-only`. Once the CLI proves the exact accepted turn,
+# send_to_conductor returns its receipt and the handler registers its reply
+# owner here while the agent keeps working.
 #
 # Unlike _drain_queue this NEVER sends a message — the message is already
 # in-flight, so re-sending would double-process it. The watcher only polls
@@ -1298,6 +1552,22 @@ def _release_late_reply_claim(
     with _reply_owner_lock:
         if _wait_send_reservations.get(key) == claim_id:
             _wait_send_reservations.pop(key, None)
+
+
+def _register_claimed_reply(
+    session: str,
+    profile: str | None,
+    pending: dict | bool | str,
+    reply_callback: ReplyCallback,
+) -> bool:
+    """Move a retained send claim to its watcher, releasing it on failure."""
+    if pending is not True and not isinstance(pending, dict):
+        return False
+    receipt = pending if isinstance(pending, dict) else None
+    if _register_pending_reply(session, profile, receipt, reply_callback):
+        return True
+    _release_late_reply_claim(session, profile, receipt)
+    return False
 
 
 def get_status_summary(profile: str | None = None) -> dict:
@@ -2169,7 +2439,7 @@ def create_telegram_bot(config: dict):
         )
         was_busy = conductor_status in ("running", "active", "starting")
 
-        log.info("User message -> [%s]: %s", target_profile, cleaned_msg[:100])
+        log.info("User message -> [%s]", target_profile)
 
         if was_busy:
             tg_bot = message.bot
@@ -2224,9 +2494,8 @@ def create_telegram_bot(config: dict):
         )
         if not ok:
             if still_running:
-                # The message WAS delivered; the single turn just outran the
-                # blocking wait. Don't report a false failure and don't re-send
-                # (that would double-process) — watch for the reply async-ly.
+                # Exact acceptance owns a watcher; a collision owns a queue;
+                # uncertainty owns neither and must never be retried.
                 tg_bot = message.bot
                 tg_chat_id = message.chat.id
                 profile_tag_captured = profile_tag
@@ -2243,7 +2512,9 @@ def create_telegram_bot(config: dict):
                     for chunk in split_message(html):
                         await tg_bot.send_message(tg_chat_id, chunk, parse_mode="HTML")
 
-                if still_running == _WAIT_SEND_QUEUE_REQUIRED:
+                if still_running == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                    await message.answer(_delivery_uncertain_notice(target_profile))
+                elif still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, target_profile, _tg_late_reply,
                     )
@@ -2273,7 +2544,7 @@ def create_telegram_bot(config: dict):
             )
             return
 
-        log.info("Conductor [%s] response: %s", target_profile, response[:100])
+        log.info("Conductor [%s] response received", target_profile)
 
         # Convert to HTML first, then split to respect post-conversion length
         html_response = md_to_tg_html(
@@ -2534,7 +2805,7 @@ def create_slack_app(config: dict):
         )
         was_busy = conductor_status in ("running", "active", "starting")
 
-        log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
+        log.info("Slack message -> [%s]", target["name"])
 
         name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
 
@@ -2587,9 +2858,8 @@ def create_slack_app(config: dict):
         )
         if not ok:
             if still_running:
-                # The message WAS delivered; the single turn just outran the
-                # blocking wait. Don't report a false failure and don't re-send
-                # (that would double-process) \u2014 watch for the reply async-ly.
+                # Exact acceptance owns a watcher; a collision owns a queue;
+                # uncertainty owns neither and must never be retried.
                 name_tag_captured = name_tag
 
                 async def _slack_late_reply(response_text: str):
@@ -2605,7 +2875,9 @@ def create_slack_app(config: dict):
                         text = f"{header}{chunk}" if i == 0 else chunk
                         await _safe_say(say, text=text, thread_ts=thread_ts)
 
-                if still_running == _WAIT_SEND_QUEUE_REQUIRED:
+                if still_running == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                    notice = _delivery_uncertain_notice(target["name"])
+                elif still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, profile, _slack_late_reply,
                     )
@@ -2632,7 +2904,7 @@ def create_slack_app(config: dict):
             )
             return
 
-        log.info("Conductor [%s] response: %s", target["name"], response[:100])
+        log.info("Conductor [%s] response received", target["name"])
 
         for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
             prefixed = f"{name_tag}{chunk}" if name_tag else chunk
@@ -3175,10 +3447,7 @@ def create_discord_bot(config: dict):
             )
             return
 
-        log.info(
-            "Discord message -> [%s]: %s",
-            target["name"], cleaned_msg[:100],
-        )
+        log.info("Discord message -> [%s]", target["name"])
         async def _best_effort_typing():
             try:
                 async with message.channel.typing():
@@ -3207,10 +3476,9 @@ def create_discord_bot(config: dict):
                 await typing_task
         if not ok:
             if still_running:
-                # The message WAS delivered; the single turn just outran the
-                # blocking wait. Don't report a false failure and don't re-send
-                # (that would double-process) — watch for the reply async-ly.
-                # Mirrors the Telegram/Slack idle paths (#1404).
+                # Exact acceptance owns a watcher; a collision owns a queue;
+                # uncertainty owns neither and must never be retried. Mirrors
+                # the Telegram/Slack idle paths.
                 dc_channel = message.channel
                 dc_name_tag = (
                     f"[{target['name']}] " if len(conductors) > 1 else ""
@@ -3221,7 +3489,9 @@ def create_discord_bot(config: dict):
                         dc_channel, response_text, name_tag=dc_name_tag,
                     )
 
-                if still_running == _WAIT_SEND_QUEUE_REQUIRED:
+                if still_running == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                    notice = _delivery_uncertain_notice(target["name"])
+                elif still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, profile, _dc_late_reply,
                     )
@@ -3246,10 +3516,7 @@ def create_discord_bot(config: dict):
             )
             return
 
-        log.info(
-            "Conductor [%s] response: %s",
-            target["name"], response[:100],
-        )
+        log.info("Conductor [%s] response received", target["name"])
 
         name_tag = (
             f"[{target['name']}] " if len(conductors) > 1 else ""
@@ -3287,6 +3554,75 @@ def _os_heartbeat_daemon_installed() -> bool:
                 if f.startswith("agent-deck-conductor-heartbeat-") and f.endswith(".timer"):
                     return True
     return False
+
+
+async def _handle_heartbeat_response(
+    name: str,
+    profile: str,
+    response: str,
+    multiple_conductors: bool,
+    need_state_by_conductor: dict[str, dict],
+    telegram_bot=None,
+    tg_user_id=None,
+    slack_app=None,
+    slack_channel_id=None,
+    discord_bot=None,
+    discord_channel_id=None,
+) -> None:
+    """Run the existing alert and post-hook flow for one owned response."""
+    log.info("Heartbeat [%s] response received", name)
+
+    prev_counts = need_state_by_conductor.get(name, {})
+    need_filtered = filter_need_lines(response, prev_counts)
+    need_state_by_conductor[name] = need_filtered["counts"]
+
+    forwarded_need_lines = need_filtered["alerts"] + need_filtered["retired"]
+    has_alerts = bool(forwarded_need_lines)
+    if need_filtered["retired"]:
+        log.info(
+            "Heartbeat [%s]: retiring %d stale NEED line(s) after >= %d cycles",
+            name,
+            len(need_filtered["retired"]),
+            NEED_RETIRE_THRESHOLD,
+        )
+    if has_alerts:
+        prefix = f"[{name}] " if multiple_conductors else ""
+        alert_body = "\n".join(forwarded_need_lines)
+        alert_msg = f"{prefix}Conductor alert:\n{alert_body}"
+
+        if telegram_bot and tg_user_id:
+            try:
+                alert_html = md_to_tg_html(alert_msg)
+                for chunk in split_message(alert_html):
+                    await telegram_bot.send_message(
+                        tg_user_id,
+                        chunk,
+                        parse_mode="HTML",
+                    )
+            except Exception as e:
+                log.error("Failed to send Telegram notification: %s", e)
+
+        if slack_app and slack_channel_id:
+            try:
+                await slack_app.client.chat_postMessage(
+                    channel=slack_channel_id, text=alert_msg,
+                )
+            except Exception as e:
+                log.error("Failed to send Slack notification: %s", e)
+
+        if discord_bot and discord_channel_id:
+            try:
+                channel = discord_bot.get_channel(discord_channel_id)
+                if channel:
+                    await send_discord_output(channel, alert_msg)
+            except Exception as e:
+                log.error("Failed to send Discord notification: %s", e)
+
+    invoke_hook(profile, "post-heartbeat", {
+        "profile": profile,
+        "response": response,
+        "has_alerts": has_alerts,
+    })
 
 
 async def heartbeat_loop(
@@ -3508,9 +3844,30 @@ async def heartbeat_loop(
                 else:
                     skip_count_by_conductor[name] = 0  # pane read clear → reset
 
-                # Send heartbeat to conductor (wrapped in executor — blocks up to
-                # RESPONSE_TIMEOUT seconds and must not freeze the event loop)
-                ok, response, _ = await loop.run_in_executor(
+                async def _heartbeat_reply(
+                    response_text: str,
+                    heartbeat_name: str = name,
+                    heartbeat_profile: str = profile,
+                    multiple_conductors: bool = len(all_conductors) > 1,
+                ) -> None:
+                    await _handle_heartbeat_response(
+                        heartbeat_name,
+                        heartbeat_profile,
+                        response_text,
+                        multiple_conductors,
+                        need_state_by_conductor,
+                        telegram_bot=telegram_bot,
+                        tg_user_id=tg_user_id,
+                        slack_app=slack_app,
+                        slack_channel_id=slack_channel_id,
+                        discord_bot=discord_bot,
+                        discord_channel_id=discord_channel_id,
+                    )
+
+                # The send returns on exact Codex acceptance. Retain that owner
+                # until its generation-bound watcher runs the same response flow
+                # used by an immediate legacy completion.
+                ok, response, pending = await loop.run_in_executor(
                     None,
                     functools.partial(
                         send_to_conductor,
@@ -3519,93 +3876,49 @@ async def heartbeat_loop(
                         profile=profile,
                         wait_for_reply=True,
                         response_timeout=RESPONSE_TIMEOUT,
+                        claim_late_reply=True,
                     ),
                 )
-                if not ok:
-                    log.error(
-                        "Heartbeat [%s]: failed to send to conductor",
+                if ok:
+                    skip_count_by_conductor[name] = 0
+                    await _heartbeat_reply(response)
+                    continue
+
+                if pending is True or isinstance(pending, dict):
+                    if _register_claimed_reply(
+                        session_title, profile, pending, _heartbeat_reply,
+                    ):
+                        skip_count_by_conductor[name] = 0
+                        log.info(
+                            "Heartbeat [%s]: accepted; exact reply pending",
+                            name,
+                        )
+                    else:
+                        log.error(
+                            "Heartbeat [%s]: accepted but reply watcher registration failed",
+                            name,
+                        )
+                    continue
+
+                if pending == _WAIT_SEND_QUEUE_REQUIRED:
+                    log.info(
+                        "Heartbeat [%s]: another reply owner is active, skipping this cycle",
                         name,
                     )
                     continue
 
-                skip_count_by_conductor[name] = 0  # delivered → reset skip counter
-
-                # Response is captured via get_session_output (see send_to_conductor).
-                log.info(
-                    "Heartbeat [%s] response: %s",
-                    name, response[:200],
-                )
-
-                # Dedup repeating NEED: lines (issue #971). Forward only
-                # fresh + escalation lines; drop verbatim repeats past
-                # threshold so the user isn't trained to ignore heartbeats.
-                prev_counts = need_state_by_conductor.get(name, {})
-                need_filtered = filter_need_lines(response, prev_counts)
-                need_state_by_conductor[name] = need_filtered["counts"]
-
-                forwarded_need_lines = (
-                    need_filtered["alerts"] + need_filtered["retired"]
-                )
-                has_alerts = bool(forwarded_need_lines)
-                if need_filtered["retired"]:
-                    log.info(
-                        "Heartbeat [%s]: retiring %d stale NEED line(s) "
-                        "after >= %d cycles: %s",
+                if pending == _WAIT_SEND_DELIVERY_UNCERTAIN:
+                    log.warning(
+                        "Heartbeat [%s]: delivery may have succeeded; not retrying",
                         name,
-                        len(need_filtered["retired"]),
-                        NEED_RETIRE_THRESHOLD,
-                        need_filtered["retired"],
                     )
-                if has_alerts:
-                    prefix = (
-                        f"[{name}] " if len(all_conductors) > 1 else ""
-                    )
-                    alert_body = "\n".join(forwarded_need_lines)
-                    alert_msg = f"{prefix}Conductor alert:\n{alert_body}"
+                    continue
 
-                    # Notify via Telegram (with HTML formatting)
-                    if telegram_bot and tg_user_id:
-                        try:
-                            alert_html = md_to_tg_html(alert_msg)
-                            for chunk in split_message(alert_html):
-                                await telegram_bot.send_message(
-                                    tg_user_id,
-                                    chunk,
-                                    parse_mode="HTML",
-                                )
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Telegram notification: %s", e
-                            )
-
-                    # Notify via Slack
-                    if slack_app and slack_channel_id:
-                        try:
-                            await slack_app.client.chat_postMessage(
-                                channel=slack_channel_id, text=alert_msg,
-                            )
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Slack notification: %s", e
-                            )
-
-                    # Notify via Discord
-                    if discord_bot and discord_channel_id:
-                        try:
-                            channel = discord_bot.get_channel(discord_channel_id)
-                            if channel:
-                                await send_discord_output(channel, alert_msg)
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Discord notification: %s", e
-                            )
-
-                # Run post-heartbeat hook (non-gating)
-                invoke_hook(profile, "post-heartbeat", {
-                    "profile": profile,
-                    "response": response,
-                    "has_alerts": has_alerts,
-                })
+                log.error(
+                    "Heartbeat [%s]: message was not accepted",
+                    name,
+                )
+                continue
 
             except Exception as e:
                 log.error("Heartbeat [%s] error: %s", conductor.get("name", "?"), e)
