@@ -317,7 +317,19 @@ func inheritedEnviron() []string {
 	return env
 }
 
+func acceptanceOnlyCommandRequested(args []string) bool {
+	_, remaining := extractProfileFlag(args)
+	_, remaining = extractAllowRepoScriptsFlag(remaining)
+	return len(remaining) >= 2 && remaining[0] == "session" && remaining[1] == "send" &&
+		acceptanceOnlyFlagRequestsBoundary(remaining[2:])
+}
+
 func main() {
+	// Establish the body-free diagnostic boundary before any startup probe can
+	// write a warning. The send parser repeats the same narrow raw-argv check so
+	// even malformed values for this opt-in flag receive only the safe result.
+	acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])
+
 	// Make bare `tmux` invocations resolve even when launched from a minimal
 	// environment (notably a `terminal-notifier -execute` notification click,
 	// whose launchd PATH omits Homebrew's /opt/homebrew/bin). Must run before any
@@ -332,6 +344,14 @@ func main() {
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
 	applyProfileFlag(profile)
+	if acceptanceOnlyDiagnostics && profile == "" {
+		// Pass the resolved profile explicitly below. This retains the guarded
+		// inferred-profile fallback without allowing its path-bearing warning to
+		// cross the acceptance-only result boundary.
+		if resolved, err := session.ResolveProfileForStorageQuiet(""); err == nil {
+			profile = resolved
+		}
+	}
 	// Extract global --allow-repo-scripts before subcommand dispatch (mirrors
 	// -p/--profile above). One-shot, non-persisted bypass of the worktree
 	// script consent gate for non-interactive callers (CI) that can't answer
@@ -373,7 +393,9 @@ func main() {
 	// Nudge macOS users whose tmux predates the upstream fix for the
 	// control-mode NULL-deref (tmux #4980, issue #737). Once per process,
 	// no-op on non-macOS, suppressible via AGENTDECK_SUPPRESS_TMUX_WARNING.
-	tmux.WarnIfVulnerableTmux()
+	if !acceptanceOnlyDiagnostics {
+		tmux.WarnIfVulnerableTmux()
+	}
 
 	// One stderr WARNING per CLI process when the profile store layout needs
 	// the user's hand (stray or unpinned second store). CLI processes never
@@ -381,7 +403,7 @@ func main() {
 	// TUI and the notify daemon log `store_selected` after logging.Init.
 	// Hook and completion handlers must stay silent, doctor/health/migrate-
 	// paths print the same information themselves.
-	if len(args) > 0 && !storeRootQuietCommands[args[0]] {
+	if len(args) > 0 && !acceptanceOnlyDiagnostics && !storeRootQuietCommands[args[0]] {
 		session.WarnStoreRootDivergence(os.Stderr)
 	}
 

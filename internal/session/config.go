@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -437,6 +438,18 @@ func configuredDefaultProfile() string {
 // (permission, transient filesystem); it never fails open on such an error
 // (fail open would silently restore the pre-#1790 auto-create hole).
 func ResolveProfileForStorage(explicit string) (string, error) {
+	return resolveProfileForStorage(explicit, os.Stderr)
+}
+
+// ResolveProfileForStorageQuiet applies the same guarded resolution as
+// ResolveProfileForStorage without writing the inferred-profile fallback
+// diagnostic. Machine-readable command modes use it before opening storage so
+// path-bearing diagnostics cannot corrupt their output contract.
+func ResolveProfileForStorageQuiet(explicit string) (string, error) {
+	return resolveProfileForStorage(explicit, io.Discard)
+}
+
+func resolveProfileForStorage(explicit string, diagnostic io.Writer) (string, error) {
 	effectiveProfile, source := getEffectiveProfileWithSource(explicit)
 	if source != ProfileSourceInferred {
 		return effectiveProfile, nil
@@ -456,7 +469,7 @@ func ResolveProfileForStorage(explicit string) (string, error) {
 	if listErr == nil && len(known) > 0 {
 		knownDesc = strings.Join(known, ", ")
 	}
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(diagnostic,
 		"agent-deck: CLAUDE_CONFIG_DIR=%q would select profile %q, which does not exist; "+
 			"falling back to profile %q instead of creating it. Known profiles: %s. "+
 			"Pass -p/--profile or set AGENTDECK_PROFILE explicitly to pick a different profile, "+
