@@ -192,6 +192,20 @@ func TestFreshLaunchAcceptanceNeverRetriesIndeterminateTransport(t *testing.T) {
 	}
 }
 
+func TestFreshLaunchAcceptanceOverwritesNonAuthoritativeVerdictInstance(t *testing.T) {
+	ops := &fakeFreshLaunchAcceptanceOps{
+		instanceID: "instance-created",
+		sendResult: deliveryDelivered,
+		verdict: newAcceptanceOnlyFailureResultForInstance(
+			acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, deliveryDelivered, "instance-stale",
+		),
+	}
+	got := runFreshLaunchAcceptance(ops)
+	if got.Success || got.Acceptance != acceptanceOnlyIndeterminate || got.InstanceID != ops.instanceID {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
 func TestFreshLaunchAcceptanceTimeoutAndProcessDeathFailClosed(t *testing.T) {
 	t.Run("process death before transport", func(t *testing.T) {
 		ops := &fakeFreshLaunchAcceptanceOps{instanceID: "instance-dead", readyErr: errors.New("process exited")}
@@ -211,6 +225,140 @@ func TestFreshLaunchAcceptanceTimeoutAndProcessDeathFailClosed(t *testing.T) {
 		got := runFreshLaunchAcceptance(ops)
 		if got.Success || got.Acceptance != acceptanceOnlyIndeterminate || got.InstanceID != "instance-timeout" || ops.sends != 1 {
 			t.Fatalf("result=%#v sends=%d", got, ops.sends)
+		}
+	})
+}
+
+func TestLiveFreshLaunchAcceptanceTimeoutRetainsExactInstance(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	codexDir := t.TempDir()
+	t.Setenv("CODEX_HOME", codexDir)
+	path := filepath.Join(codexDir, "sessions", "2026", "09", "24", "rollout-test-live-timeout.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"live-timeout"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := &session.Instance{ID: "instance-live-timeout", Tool: "codex", CodexSessionID: "live-timeout"}
+	guard, err := acquireFreshCodexAcceptanceGuard(inst, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Release()
+	if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.RecordTransportOutcome(deliverySubmitted, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout, oldInterval := codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval
+	codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval = 20*time.Millisecond, time.Millisecond
+	t.Cleanup(func() {
+		codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval = oldTimeout, oldInterval
+	})
+
+	ops := &liveFreshLaunchAcceptanceOps{inst: inst, guard: guard, fence: guard.fence}
+	result := ops.AcceptedVerdict(deliverySubmitted)
+	if result.Success || result.Acceptance != acceptanceOnlyIndeterminate {
+		t.Fatalf("unexpected verdict: %#v", result)
+	}
+	if result.InstanceID != inst.ID {
+		t.Fatalf("post-creation timeout lost instance_id: got %q, want %q", result.InstanceID, inst.ID)
+	}
+	raw, err := marshalAcceptanceOnlyResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw)+1 > acceptanceOnlyResultMaxBytes {
+		t.Fatalf("timeout result length = %d", len(raw)+1)
+	}
+}
+
+func TestLiveFreshLaunchAcceptanceVerdictsRetainExactInstance(t *testing.T) {
+	newGuard := func(t *testing.T, instanceID, sessionID string) (*session.Instance, *codexAcceptanceGuard, string) {
+		t.Helper()
+		t.Setenv("XDG_DATA_HOME", t.TempDir())
+		codexDir := t.TempDir()
+		t.Setenv("CODEX_HOME", codexDir)
+		path := filepath.Join(codexDir, "sessions", "2026", "09", "24", "rollout-test-"+sessionID+".jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"`+sessionID+`"}}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		inst := &session.Instance{ID: instanceID, Tool: "codex", CodexSessionID: sessionID}
+		guard, err := acquireFreshCodexAcceptanceGuard(inst, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(guard.Release)
+		if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		return inst, guard, path
+	}
+
+	t.Run("transport uncertainty", func(t *testing.T) {
+		inst, guard, _ := newGuard(t, "instance-live-uncertain", "live-uncertain")
+		if err := guard.RecordTransportOutcome(deliveryDelivered, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		oldTimeout, oldInterval := codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval
+		codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval = 20*time.Millisecond, time.Millisecond
+		t.Cleanup(func() {
+			codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval = oldTimeout, oldInterval
+		})
+
+		result := (&liveFreshLaunchAcceptanceOps{inst: inst, guard: guard, fence: guard.fence}).AcceptedVerdict(deliveryDelivered)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate || result.InstanceID != inst.ID {
+			t.Fatalf("result = %#v", result)
+		}
+	})
+
+	t.Run("marker finalization failure", func(t *testing.T) {
+		inst, guard, path := newGuard(t, "instance-live-finalize", "live-finalize")
+		if err := guard.RecordTransportOutcome(deliverySubmitted, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendCodexTurnStart(path, "first-generation"); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.ClearCodexSubmissionMarker(guard.marker); err != nil {
+			t.Fatal(err)
+		}
+
+		result := (&liveFreshLaunchAcceptanceOps{inst: inst, guard: guard, fence: guard.fence}).AcceptedVerdict(deliverySubmitted)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate || result.InstanceID != inst.ID {
+			t.Fatalf("result = %#v", result)
+		}
+	})
+
+	t.Run("exact accepted generation", func(t *testing.T) {
+		inst, guard, path := newGuard(t, "instance-live-accepted", "live-accepted")
+		if err := guard.RecordTransportOutcome(deliveryDelivered, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendCodexTurnStart(path, "first-generation"); err != nil {
+			t.Fatal(err)
+		}
+
+		result := (&liveFreshLaunchAcceptanceOps{inst: inst, guard: guard, fence: guard.fence}).AcceptedVerdict(deliveryDelivered)
+		if !result.Success || result.InstanceID != inst.ID || result.AcceptedTurn == nil ||
+			result.AcceptedTurn.InstanceID != inst.ID ||
+			result.AcceptedTurn.TurnGeneration != "live-accepted:first-generation" {
+			t.Fatalf("result = %#v", result)
+		}
+	})
+
+	t.Run("missing exact identity", func(t *testing.T) {
+		inst := &session.Instance{ID: "instance-live-missing", Tool: "codex"}
+		result := (&liveFreshLaunchAcceptanceOps{inst: inst}).AcceptedVerdict(deliveryDelivered)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate || result.InstanceID != inst.ID {
+			t.Fatalf("result = %#v", result)
 		}
 	})
 }

@@ -6000,6 +6000,49 @@ func (s *Session) SendKeysAndEnter(keys string) error {
 	return s.sendKeysAndEnterCheckedToTarget(s.Name, keys, nil, nil)
 }
 
+// SendKeysAndEnterPrivate sends the first prompt for an acceptance-aware
+// launch without putting any prompt bytes in a child process's argv. Unlike
+// the ordinary send path, it always stages the body with load-buffer stdin and
+// never falls back to body-bearing send-keys. A failed paste is returned to
+// the caller as indeterminate and is never retried here.
+func (s *Session) SendKeysAndEnterPrivate(keys string) error {
+	s.invalidateCache()
+	target := s.primaryWindowTarget()
+
+	// Match the ordinary transport's line-break semantics before checking the
+	// pane's line discipline and staging the private buffer.
+	if strings.Contains(keys, "\r") {
+		keys = strings.ReplaceAll(keys, "\r\n", "\n")
+		keys = strings.ReplaceAll(keys, "\r", "\n")
+	}
+
+	// Pin larger sends to the pane selected before the capacity probe. The
+	// immutable pane ID keeps the probe, paste and Enter on one target.
+	if len(keys) > canonicalSafeBytes {
+		if paneID, err := s.resolvePaneID(target); err == nil && paneID != "" {
+			target = paneID
+		}
+		if ld, err := s.paneLineDiscipline(target); err == nil && ld.Canonical && ld.MaxLine > 0 {
+			if longest := longestLineBytes(keys); longest > ld.MaxLine-1 {
+				return &CanonicalOverflowError{
+					LineBytes:  longest,
+					LimitBytes: ld.MaxLine,
+					TTY:        ld.TTY,
+				}
+			}
+		}
+	}
+
+	// These control commands contain only fixed tokens. The prompt itself is
+	// written only to load-buffer's stdin inside pasteToTarget.
+	s.ensureInsertModeOnTarget(target)
+	if err := s.pasteToTarget(target, keys); err != nil {
+		return err
+	}
+	time.Sleep(100 * time.Millisecond)
+	return s.sendEnterRawToTarget(target)
+}
+
 // SendKeysAndEnterToWindow is SendKeysAndEnter aimed at a specific tmux window
 // index rather than the session's active window. Quick-approve (#1369) uses it
 // to deliver "1"+Enter to the exact window showing a Claude prompt, which is

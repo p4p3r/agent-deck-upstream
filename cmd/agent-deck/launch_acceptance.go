@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -154,7 +155,14 @@ func runFreshLaunchAcceptance(ops freshLaunchAcceptanceOps) acceptanceOnlyResult
 		}
 		return freshLaunchIndeterminate(instanceID, delivery)
 	}
-	return ops.AcceptedVerdict(delivery)
+	return retainFreshLaunchInstance(ops.AcceptedVerdict(delivery), instanceID)
+}
+
+func retainFreshLaunchInstance(result acceptanceOnlyResult, instanceID string) acceptanceOnlyResult {
+	if instanceID = strings.TrimSpace(instanceID); instanceID != "" {
+		result.InstanceID = instanceID
+	}
+	return result
 }
 
 type liveFreshLaunchAcceptanceOps struct {
@@ -213,11 +221,21 @@ func (o *liveFreshLaunchAcceptanceOps) SendOnce() (string, error) {
 	if target == nil {
 		return deliveryPaneGone, fmt.Errorf("Codex pane is unavailable")
 	}
-	result, err := performSend(
-		o.inst, target, o.message, false, defaultSendTuning(), "tmux", false,
-		nil, nil, nil,
-	)
-	return result.delivery, err
+	lock, err := session.AcquireSendLock(o.inst.ID, sendTargetLockWait)
+	if err != nil {
+		if errors.Is(err, session.ErrConfigLockBusy) {
+			return deliveryTargetBusy, fmt.Errorf("target busy with another send (waited %s): %w", sendTargetLockWait, err)
+		}
+		return deliveryTargetBusy, fmt.Errorf("send lock: %w", err)
+	}
+	defer lock.Release()
+
+	if err := target.SendKeysAndEnterPrivate(o.message); err != nil {
+		return deliverySendFailed, err
+	}
+	// Body staging plus Enter is transport evidence, not turn acceptance.
+	// Only AcceptedVerdict may promote it after the exact first generation.
+	return deliveryDelivered, nil
 }
 
 func (o *liveFreshLaunchAcceptanceOps) RecordTransportOutcome(delivery string) error {
@@ -228,7 +246,10 @@ func (o *liveFreshLaunchAcceptanceOps) RecordTransportOutcome(delivery string) e
 }
 
 func (o *liveFreshLaunchAcceptanceOps) AcceptedVerdict(delivery string) acceptanceOnlyResult {
-	return acceptedTurnOnlyVerdict(o.inst, delivery, time.Now(), o.fence, o.guard)
+	return retainFreshLaunchInstance(
+		acceptedTurnOnlyVerdict(o.inst, delivery, time.Now(), o.fence, o.guard),
+		o.InstanceID(),
+	)
 }
 
 func (o *liveFreshLaunchAcceptanceOps) Release() {
