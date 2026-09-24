@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
@@ -393,6 +394,7 @@ type ConductorMeta struct {
 }
 
 // GetAgent returns the normalized conductor agent, defaulting to Claude.
+// LoadConductorMeta validates durable values; this remains a zero-value fallback.
 func (m *ConductorMeta) GetAgent() string {
 	if m == nil {
 		return ConductorAgentClaude
@@ -654,16 +656,26 @@ func LoadConductorMeta(name string) (*ConductorMeta, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read meta.json for conductor %q: %w", name, err)
 	}
-	var meta ConductorMeta
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: invalid UTF-8", name)
+	}
+	var meta *ConductorMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: %w", name, err)
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: expected an object", name)
 	}
 	if meta.Name == "" {
 		meta.Name = name
 	}
-	meta.Agent = meta.GetAgent()
+	spec, err := GetConductorAgentSpec(meta.Agent)
+	if err != nil {
+		return nil, fmt.Errorf("invalid agent in meta.json for conductor %q: %w", name, err)
+	}
+	meta.Agent = spec.Agent
 	meta.Profile = normalizeConductorProfile(meta.Profile)
-	return &meta, nil
+	return meta, nil
 }
 
 // SaveConductorMeta writes meta.json for a conductor. It takes the conductor
