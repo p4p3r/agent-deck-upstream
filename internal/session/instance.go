@@ -4062,6 +4062,58 @@ func (i *Instance) queryCodexSessionFromProcessFiles() (string, string, error) {
 	return "", missingDep, errors.Join(candidateErr, lsofErr)
 }
 
+// LiveCodexSessionIdentity returns only the exact rollout identity held open by
+// a Codex process in this instance's live pane tree. It deliberately has no
+// directory-scan fallback: callers use it when same-directory historical
+// rollouts must not be eligible identity evidence.
+func (i *Instance) LiveCodexSessionIdentity() (string, error) {
+	if i == nil || !IsCodexCompatible(i.Tool) || !i.CodexRolloutIsResolvableLocally() {
+		return "", fmt.Errorf("live local Codex identity is unavailable")
+	}
+	sessionID, err := i.liveCodexSessionIdentityFromProcessFiles()
+	if err != nil {
+		return "", err
+	}
+	sessionID = i.filterCodexProcessProbeCandidate(sessionID)
+	if sessionID == "" {
+		return "", nil
+	}
+	paths, err := exactCodexRolloutMatches(sessionID, i.getCodexHomeDir())
+	if err != nil {
+		return "", err
+	}
+	if _, err := uniqueRegularArtifact(paths, "rollout for "+sessionID); err != nil {
+		return "", err
+	}
+	return sessionID, nil
+}
+
+func (i *Instance) liveCodexSessionIdentityFromProcessFiles() (string, error) {
+	if runtime.GOOS != "linux" {
+		sessionID, _, err := i.queryCodexSessionFromProcessFiles()
+		return sessionID, err
+	}
+	candidates, probeErr := i.collectCodexProcessCandidates()
+	identities := make(map[string]bool)
+	for _, pid := range candidates {
+		sessionID, err := i.extractCodexSessionIDFromProcFD(pid)
+		probeErr = errors.Join(probeErr, err)
+		if sessionID != "" {
+			identities[sessionID] = true
+		}
+	}
+	if len(identities) > 1 {
+		return "", fmt.Errorf("live Codex process identity is ambiguous")
+	}
+	if probeErr != nil {
+		return "", probeErr
+	}
+	for sessionID := range identities {
+		return sessionID, nil
+	}
+	return "", nil
+}
+
 // ConsumeCodexRestartWarning returns and clears any pending Codex restart warning.
 func (i *Instance) ConsumeCodexRestartWarning() string {
 	i.mu.Lock()
