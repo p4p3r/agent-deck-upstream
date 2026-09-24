@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,6 +74,213 @@ func TestAcceptanceOnlyReturnsAtTaskStartedBeforeCompletion(t *testing.T) {
 	if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, result.AcceptedTurn.TurnGeneration); err != nil {
 		t.Fatalf("accepted verdict did not durably resolve its marker: %v", err)
 	}
+}
+
+func TestAcceptanceOnlyPromotesDeliveredOnlyAfterExactTurnStart(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+	path := filepath.Join(home, "codex", "sessions", "2026", "09", "24", "rollout-test-thread-delivered.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inst := &session.Instance{ID: "instance-delivered", Tool: "codex", CodexSessionID: "thread-delivered"}
+	guard, err := acquireCodexAcceptanceGuard(inst, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Release()
+	if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	const message = "DELIVERED_WITHOUT_TRANSPORT_SUBMISSION_SIGNAL"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting", "waiting", "waiting"},
+		panes:    []string{"codex> ", "codex> " + message, "codex> " + message, "codex> " + message},
+	}
+	tuning := testGuardTuning(sendRetryOptions{maxRetries: 2, checkDelay: 0, verifyDelivery: true})
+	sendResult, err := performSend(inst, mock, message, false, tuning, "tmux", false, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("performSend: %v", err)
+	}
+	if sendResult.delivery != deliveryDelivered {
+		t.Fatalf("performSend delivery = %q, want %q", sendResult.delivery, deliveryDelivered)
+	}
+	if err := guard.RecordTransportOutcome(sendResult.delivery, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendCodexTurnStart(path, "turn-new"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := acceptedTurnOnlyVerdict(inst, sendResult.delivery, time.Now(), guard.fence, guard)
+	if !result.Success || result.Acceptance != acceptanceOnlyAccepted || result.AcceptedTurn == nil {
+		t.Fatalf("acceptance-only verdict = %#v", result)
+	}
+	if result.Delivery != deliverySubmitted || result.Submitted == nil || !*result.Submitted {
+		t.Fatalf("promoted result is not canonical submitted acceptance: %#v", result)
+	}
+	if result.AcceptedTurn.TurnGeneration != "thread-delivered:turn-new" {
+		t.Fatalf("turn generation = %q", result.AcceptedTurn.TurnGeneration)
+	}
+	if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, result.AcceptedTurn.TurnGeneration); err != nil {
+		t.Fatalf("accepted delivered verdict did not clear uncertainty marker: %v", err)
+	}
+}
+
+func TestAcceptanceOnlyDoesNotPromoteOtherTransportOutcomes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+
+	tests := []struct {
+		name     string
+		delivery string
+		retained bool
+	}{
+		{name: "no evidence", delivery: deliveryNoEvidence, retained: true},
+		{name: "typed not submitted", delivery: deliveryTypedNotSubmitted, retained: true},
+		{name: "menu open", delivery: deliveryMenuOpen, retained: true},
+		{name: "pane gone", delivery: deliveryPaneGone, retained: true},
+		{name: "line too long", delivery: deliveryLineTooLong, retained: false},
+		{name: "queued", delivery: deliveryQueued, retained: true},
+		{name: "queued socket", delivery: deliveryQueuedSocket, retained: true},
+		{name: "socket write failed", delivery: deliverySocketWriteFailed, retained: true},
+	}
+	for n, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := fmt.Sprintf("thread-negative-%d", n)
+			path := filepath.Join(home, "codex", "sessions", "2026", "09", "24", "rollout-test-"+sessionID+".jsonl")
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}`+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inst := &session.Instance{ID: "instance-" + sessionID, Tool: "codex", CodexSessionID: sessionID}
+			guard, err := acquireCodexAcceptanceGuard(inst, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+				guard.Release()
+				t.Fatal(err)
+			}
+			if err := guard.RecordTransportOutcome(tt.delivery, time.Now()); err != nil {
+				guard.Release()
+				t.Fatal(err)
+			}
+			if err := appendCodexTurnStart(path, "turn-new"); err != nil {
+				guard.Release()
+				t.Fatal(err)
+			}
+
+			result := acceptedTurnOnlyVerdict(inst, tt.delivery, time.Now(), guard.fence, guard)
+			guard.Release()
+			if result.Success || result.Acceptance != acceptanceOnlyIndeterminate || result.Delivery != tt.delivery {
+				t.Fatalf("acceptance-only verdict = %#v", result)
+			}
+			_, reconcileErr := session.ReconcileCodexSubmissionMarker(inst.ID, sessionID, guard.fence.priorTurnGeneration)
+			if tt.retained && reconcileErr == nil {
+				t.Fatal("ambiguous transport outcome lost its uncertainty marker")
+			}
+			if !tt.retained && reconcileErr != nil {
+				t.Fatalf("definitive non-delivery retained a marker: %v", reconcileErr)
+			}
+			if tt.retained {
+				if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, sessionID, sessionID+":turn-new"); err != nil {
+					t.Fatalf("cleanup retained marker: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestAcceptanceOnlyDeliveredRequiresRecordedExactProof(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+
+	oldTimeout, oldInterval := codexAcceptedTurnPollTimeout, codexAcceptedTurnPollInterval
+	codexAcceptedTurnPollTimeout = 5 * time.Millisecond
+	codexAcceptedTurnPollInterval = time.Millisecond
+	defer func() {
+		codexAcceptedTurnPollTimeout = oldTimeout
+		codexAcceptedTurnPollInterval = oldInterval
+	}()
+
+	t.Run("unchanged generation", func(t *testing.T) {
+		inst, guard, _ := acceptanceOnlyTestGuard(t, home, "thread-delivered-unchanged")
+		defer guard.Release()
+		if err := guard.RecordTransportOutcome(deliveryDelivered, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		result := acceptedTurnOnlyVerdict(inst, deliveryDelivered, time.Now(), guard.fence, guard)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate {
+			t.Fatalf("unchanged generation verdict = %#v", result)
+		}
+		if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, guard.fence.priorTurnGeneration); err == nil {
+			t.Fatal("unchanged generation cleared the uncertainty marker")
+		}
+	})
+
+	t.Run("transport outcome not recorded", func(t *testing.T) {
+		inst, guard, path := acceptanceOnlyTestGuard(t, home, "thread-delivered-prepared")
+		defer guard.Release()
+		if err := appendCodexTurnStart(path, "turn-new"); err != nil {
+			t.Fatal(err)
+		}
+		result := acceptedTurnOnlyVerdict(inst, deliveryDelivered, time.Now(), guard.fence, guard)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate {
+			t.Fatalf("prepared-only verdict = %#v", result)
+		}
+	})
+
+	t.Run("changed session identity", func(t *testing.T) {
+		inst, guard, _ := acceptanceOnlyTestGuard(t, home, "thread-delivered-original")
+		defer guard.Release()
+		if err := guard.RecordTransportOutcome(deliveryDelivered, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		otherSessionID := "thread-delivered-unrelated"
+		otherPath := filepath.Join(home, "codex", "sessions", "2026", "09", "24", "rollout-test-"+otherSessionID+".jsonl")
+		if err := os.WriteFile(otherPath, []byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-new"}}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		inst.CodexSessionID = otherSessionID
+		result := acceptedTurnOnlyVerdict(inst, deliveryDelivered, time.Now(), guard.fence, guard)
+		if result.Success || result.Acceptance != acceptanceOnlyIndeterminate {
+			t.Fatalf("unrelated session verdict = %#v", result)
+		}
+	})
+}
+
+func acceptanceOnlyTestGuard(t *testing.T, home, sessionID string) (*session.Instance, *codexAcceptanceGuard, string) {
+	t.Helper()
+	path := filepath.Join(home, "codex", "sessions", "2026", "09", "24", "rollout-test-"+sessionID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inst := &session.Instance{ID: "instance-" + sessionID, Tool: "codex", CodexSessionID: sessionID}
+	guard, err := acquireCodexAcceptanceGuard(inst, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+		guard.Release()
+		t.Fatal(err)
+	}
+	return inst, guard, path
 }
 
 func TestAcceptanceOnlyResultIsBoundedAndBodyFree(t *testing.T) {
