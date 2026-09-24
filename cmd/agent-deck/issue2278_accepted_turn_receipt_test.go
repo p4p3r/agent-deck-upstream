@@ -214,6 +214,9 @@ func TestSessionSendHelpDocumentsStructuredCodexContract(t *testing.T) {
 		t.Fatalf("session send --help failed: %v\n%s", err, out)
 	}
 	for _, want := range []string{
+		"--acceptance-only",
+		"bounded, body-free JSON result",
+		"Returns before completion and never retries",
 		"Codex --json --wait:",
 		"one structured result correlated to the accepted Codex turn",
 		"locally readable exact accepted-turn receipt",
