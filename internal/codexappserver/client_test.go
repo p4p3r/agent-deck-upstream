@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +24,10 @@ func TestMain(m *testing.M) {
 }
 
 func fakeServer(mode string) {
+	if mode == "descendant_hold" {
+		time.Sleep(15 * time.Second)
+		return
+	}
 	args := os.Args[len(os.Args)-3:]
 	if strings.Join(args, " ") != "app-server --listen stdio://" {
 		os.Exit(2)
@@ -70,6 +77,20 @@ func fakeServer(mode string) {
 	turn := expect("turn/start")
 	if !strings.Contains(string(turn["params"]), `"threadId":"thr_123"`) {
 		os.Exit(8)
+	}
+	if mode == "descendant" {
+		child := exec.Command(os.Args[0], "app-server", "--listen", "stdio://")
+		child.Env = append(os.Environ(), "AGENT_DECK_APP_SERVER_MODE=descendant_hold")
+		child.Stdout = os.Stdout // Hold the app-server stdout pipe open after its exit.
+		if child.Start() != nil {
+			os.Exit(10)
+		}
+		path := os.Getenv("AGENT_DECK_APP_SERVER_DESCENDANT_PID_PATH")
+		if os.WriteFile(path, []byte(strconv.Itoa(child.Process.Pid)), 0600) != nil {
+			os.Exit(11)
+		}
+		_ = w.Encode(map[string]any{"id": json.RawMessage(turn["id"]), "result": map[string]any{"turn": map[string]string{"id": "turn_456", "status": "inProgress"}}})
+		return
 	}
 	if mode == "exit" {
 		os.Exit(9)
@@ -226,5 +247,58 @@ func TestOutgoingFrameBound(t *testing.T) {
 	checkKind(t, err, FrameTooLarge)
 	if strings.Contains(err.Error(), "pppp") {
 		t.Fatal("error exposed prompt")
+	}
+}
+
+func TestCloseDoesNotWaitForDescendantStdout(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv("AGENT_DECK_APP_SERVER_DESCENDANT_PID_PATH", pidPath)
+	c := startFake(t, "descendant")
+	if _, err := c.StartThread(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan string, 1)
+	turnDone := make(chan struct{})
+	go func() {
+		defer close(turnDone)
+		_, _ = c.RunTurn(context.Background(), "prompt", func(_, turn string) { accepted <- turn })
+	}()
+	select {
+	case id := <-accepted:
+		if id != "turn_456" {
+			t.Fatalf("turn ID = %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn was not accepted")
+	}
+	pidBytes, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(pidBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Kill() })
+	closeDone := make(chan struct{})
+	go func() { _ = c.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited for descendant-held stdout")
+	}
+	select {
+	case <-c.done:
+	default:
+		t.Fatal("direct child was not reaped")
+	}
+	select {
+	case <-turnDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn reader did not stop")
 	}
 }

@@ -66,6 +66,7 @@ type Client struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
+	stdout   io.ReadCloser
 	frames   chan []byte
 	closed   chan struct{}
 	done     chan struct{}
@@ -120,7 +121,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, &Error{ProcessExited, "start"}
 	}
-	c := &Client{cmd: cmd, stdin: stdin, frames: make(chan []byte, 32), closed: make(chan struct{}), done: make(chan struct{}), cfg: cfg}
+	c := &Client{cmd: cmd, stdin: stdin, stdout: stdout, frames: make(chan []byte, 32), closed: make(chan struct{}), done: make(chan struct{}), cfg: cfg}
 	cmd.Stderr = &c.stderr
 	if err := cmd.Start(); err != nil {
 		return nil, &Error{ProcessExited, "start"}
@@ -188,6 +189,7 @@ func (c *Client) Close() error {
 	c.closeOne.Do(func() {
 		close(c.closed)
 		_ = c.stdin.Close()
+		_ = c.stdout.Close()
 		_ = c.cmd.Process.Kill()
 	})
 	<-c.done
