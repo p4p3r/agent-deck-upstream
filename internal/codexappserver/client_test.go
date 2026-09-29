@@ -159,7 +159,7 @@ func TestNewThreadTurnAndFinalMessage(t *testing.T) {
 		t.Fatalf("StartThread = %q, %v", id, err)
 	}
 	var acceptedThread, acceptedTurn string
-	r, err := c.RunTurn(context.Background(), "private prompt", func(thread, turn string) { acceptedThread, acceptedTurn = thread, turn })
+	r, err := c.RunTurn(context.Background(), "private prompt", func(thread, turn string) error { acceptedThread, acceptedTurn = thread, turn; return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestCancellationReapsChild(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	var accepted string
-	r, err := c.RunTurn(ctx, "private prompt", func(_, turn string) { accepted = turn })
+	r, err := c.RunTurn(ctx, "private prompt", func(_, turn string) error { accepted = turn; return nil })
 	checkKind(t, err, Canceled)
 	if r.TurnID != "turn_456" || accepted != r.TurnID {
 		t.Fatalf("accepted ID lost on cancellation: %+v, %q", r, accepted)
@@ -274,7 +274,7 @@ func testCloseWithDescendant(t *testing.T, mode string) {
 	turnDone := make(chan struct{})
 	go func() {
 		defer close(turnDone)
-		_, _ = c.RunTurn(context.Background(), "prompt", func(_, turn string) { accepted <- turn })
+		_, _ = c.RunTurn(context.Background(), "prompt", func(_, turn string) error { accepted <- turn; return nil })
 	}()
 	select {
 	case id := <-accepted:
@@ -313,5 +313,29 @@ func testCloseWithDescendant(t *testing.T, mode string) {
 	case <-turnDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("turn reader did not stop")
+	}
+}
+
+func TestAcceptanceFailureStopsChild(t *testing.T) {
+	c := startFake(t, "cancel") // Server accepts, then waits without completing.
+	if _, err := c.StartThread(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r, err := c.RunTurn(ctx, "private-prompt", func(_, id string) error {
+		if id != "turn_456" {
+			t.Fatalf("accepted ID = %q", id)
+		}
+		return errors.New("private-persistence-error")
+	})
+	checkKind(t, err, AcceptanceFailed)
+	if r.TurnID != "turn_456" || strings.Contains(err.Error(), "private") {
+		t.Fatalf("result = %+v, error = %v", r, err)
+	}
+	select {
+	case <-c.done:
+	default:
+		t.Fatal("child still running after callback failure")
 	}
 }

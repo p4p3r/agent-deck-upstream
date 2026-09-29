@@ -30,14 +30,15 @@ type Config struct {
 type Kind string
 
 const (
-	Invalid       Kind = "invalid"
-	Canceled      Kind = "canceled"
-	ProcessExited Kind = "process_exited"
-	Protocol      Kind = "protocol"
-	FrameTooLarge Kind = "frame_too_large"
-	ServerError   Kind = "server_error"
-	TurnFailed    Kind = "turn_failed"
-	Interrupted   Kind = "interrupted"
+	Invalid          Kind = "invalid"
+	Canceled         Kind = "canceled"
+	ProcessExited    Kind = "process_exited"
+	Protocol         Kind = "protocol"
+	FrameTooLarge    Kind = "frame_too_large"
+	ServerError      Kind = "server_error"
+	AcceptanceFailed Kind = "acceptance_failed"
+	TurnFailed       Kind = "turn_failed"
+	Interrupted      Kind = "interrupted"
 )
 
 type Error struct {
@@ -357,8 +358,9 @@ func (c *Client) openThread(ctx context.Context, method string, params any) (str
 }
 
 // RunTurn calls accepted once the turn/start response supplies the authoritative
-// ID, before waiting for completion. A failed turn still returns its IDs/status.
-func (c *Client) RunTurn(ctx context.Context, prompt string, accepted func(threadID, turnID string)) (Result, error) {
+// ID, before waiting for completion. A rejected acceptance stops the child and
+// returns a body-free error. A failed turn still returns its IDs/status.
+func (c *Client) RunTurn(ctx context.Context, prompt string, accepted func(threadID, turnID string) error) (Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
@@ -395,7 +397,14 @@ func (c *Client) RunTurn(ctx context.Context, prompt string, accepted func(threa
 	}
 	r.TurnID = response.Turn.ID
 	if accepted != nil {
-		accepted(r.ThreadID, r.TurnID)
+		if accepted(r.ThreadID, r.TurnID) != nil {
+			_ = c.Close()
+			return r, &Error{AcceptanceFailed, "turn/start"}
+		}
+	}
+	if ctx.Err() != nil {
+		_ = c.Close()
+		return r, &Error{Canceled, "turn/start"}
 	}
 	for _, e := range early {
 		if done, err := applyEvent(&r, e); done || err != nil {
@@ -468,19 +477,25 @@ func applyEvent(r *Result, e envelope) (bool, error) {
 		if p.Item.Type == "agentMessage" {
 			m := Message{p.Item.ID, p.Item.Text, p.Item.Phase}
 			r.Messages = append(r.Messages, m)
-			if m.Phase == "final_answer" {
-				r.Text = m.Text
-			}
-			if m.Phase == "" {
-				hasFinal := false
-				for _, prior := range r.Messages {
-					hasFinal = hasFinal || prior.Phase == "final_answer"
-				}
-				if !hasFinal {
-					r.Text = m.Text
-				}
-			}
+			r.Text = finalText(r.Messages)
 		}
 	}
 	return false, nil // Unknown notifications are forward-compatible.
+}
+
+func finalText(messages []Message) string {
+	var fallback, final string
+	hasFinal := false
+	for _, m := range messages {
+		if m.Phase == "" {
+			fallback = m.Text
+		}
+		if m.Phase == "final_answer" {
+			final, hasFinal = m.Text, true
+		}
+	}
+	if hasFinal {
+		return final
+	}
+	return fallback
 }

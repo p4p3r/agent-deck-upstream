@@ -120,6 +120,9 @@ One client serializes turns on one connection. A completed `agentMessage` item i
 the source of final reply text; `turn/completed` supplies the terminal status.
 Protocol and process errors contain classifications only, not prompt text,
 server error messages, stderr, or raw events. Canceling an operation kills and
-reaps the child. `internal/channelreconcile` defines the provider-neutral
-driver and recovery worker; it does not wire this app-server client, which still
-has a non-fallible callback, or enqueue Slack replies itself.
+reaps the child. `internal/channelreconcile/codexdriver` implements the
+provider-neutral driver with a separate, owned app-server subprocess for each
+operation. It reads complete history with `thread/read includeTurns`, rejects
+partial item views or ambiguous IDs, and closes the subprocess if acceptance
+persistence fails. The recovery worker still owns ledger transitions; this
+source adapter does not enqueue or deliver Slack replies itself.
