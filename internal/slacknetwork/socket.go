@@ -1,6 +1,7 @@
 package slacknetwork
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,13 +71,53 @@ func (c *SocketClient) ticket(ctx context.Context) (string, error) {
 	if endpoint == "" {
 		endpoint = connectionsOpenURL
 	}
-	obj, err := postJSON(ctx, c.httpClient, endpoint, c.appToken, []byte("{}"))
-	if err != nil || !boolField(obj, "ok") {
-		return "", ErrOpen
+	status, obj, err := requestLimitedJSON(ctx, c.httpClient, endpoint, c.appToken)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrCanceled):
+			return "", ErrCanceled
+		case errors.Is(err, errAPITransport):
+			return "", ErrOpenTransient
+		default:
+			return "", ErrOpenProtocol
+		}
+	}
+	if status == http.StatusTooManyRequests || status >= 500 && status <= 599 {
+		return "", ErrOpenTransient
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return "", ErrOpenAuth
+	}
+	if status != http.StatusOK {
+		if status >= 400 && status < 500 {
+			return "", ErrOpenConfig
+		}
+		return "", ErrOpenProtocol
+	}
+	if bytes.Equal(bytes.TrimSpace(obj["ok"]), []byte("false")) {
+		switch stringField(obj, "error") {
+		case "ratelimited", "internal_error", "service_unavailable", "team_added_to_org":
+			return "", ErrOpenTransient
+		case "invalid_auth", "not_authed", "token_expired", "token_revoked", "account_inactive":
+			return "", ErrOpenAuth
+		case "missing_scope", "not_allowed_token_type", "forbidden_team", "team_access_not_granted",
+			"no_permission", "access_denied", "accesslimited", "ekm_access_denied", "enterprise_is_restricted":
+			return "", ErrOpenConfig
+		case "":
+			return "", ErrOpenProtocol
+		default:
+			return "", ErrOpenUnknown
+		}
+	}
+	if !boolField(obj, "ok") {
+		return "", ErrOpenProtocol
+	}
+	if _, present := obj["error"]; present {
+		return "", ErrOpenProtocol
 	}
 	url := stringField(obj, "url")
 	if !safeSocketURL(url) {
-		return "", ErrOpen
+		return "", ErrOpenProtocol
 	}
 	return url, nil
 }

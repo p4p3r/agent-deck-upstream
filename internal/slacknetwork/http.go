@@ -19,22 +19,38 @@ import (
 
 const (
 	connectionsOpenURL = "https://slack.com/api/apps.connections.open"
+	authTestURL        = "https://slack.com/api/auth.test"
 	postMessageURL     = "https://slack.com/api/chat.postMessage"
 	maxResponseBytes   = 64 << 10
 	httpTimeout        = 10 * time.Second
 )
 
 var (
-	ErrConfig       = errors.New("slacknetwork: invalid configuration")
-	ErrOpen         = errors.New("slacknetwork: connection open failed")
-	ErrPost         = errors.New("slacknetwork: post outcome uncertain")
-	ErrProtocol     = errors.New("slacknetwork: invalid socket protocol")
-	ErrDisconnected = errors.New("slacknetwork: socket disconnected")
-	ErrReconnect    = errors.New("slacknetwork: new socket connection required")
-	ErrCanceled     = errors.New("slacknetwork: operation canceled")
-	ErrCallback     = errors.New("slacknetwork: envelope callback failed")
-	ErrAck          = errors.New("slacknetwork: acknowledgment failed")
+	ErrConfig        = errors.New("slacknetwork: invalid configuration")
+	ErrOpen          = errors.New("slacknetwork: connection open failed")
+	ErrPost          = errors.New("slacknetwork: post outcome uncertain")
+	ErrProtocol      = errors.New("slacknetwork: invalid socket protocol")
+	ErrDisconnected  = errors.New("slacknetwork: socket disconnected")
+	ErrReconnect     = errors.New("slacknetwork: new socket connection required")
+	ErrCanceled      = errors.New("slacknetwork: operation canceled")
+	ErrCallback      = errors.New("slacknetwork: envelope callback failed")
+	ErrAck           = errors.New("slacknetwork: acknowledgment failed")
+	ErrIdentity      = errors.New("slacknetwork: bot identity verification failed")
+	ErrOpenTransient = openFailure("transient")
+	ErrOpenAuth      = openFailure("authentication denied")
+	ErrOpenConfig    = openFailure("configuration denied")
+	ErrOpenProtocol  = openFailure("invalid response")
+	ErrOpenUnknown   = openFailure("unknown provider denial")
 )
+
+// Open failures carry only a fixed classification. Every specific class also
+// matches ErrOpen for callers that have not yet adopted reconnect policy.
+type openFailure string
+
+func (e openFailure) Error() string { return "slacknetwork: connection open " + string(e) }
+func (e openFailure) Is(target error) bool {
+	return target == ErrOpen || target == e
+}
 
 // Sender implements slackgateway.Sender. Only a bot token is held here; it
 // cannot open a Socket Mode connection.
@@ -42,12 +58,20 @@ type Sender struct {
 	botToken   string
 	httpClient *http.Client // same-package local-fake test seam
 	postURL    string       // same-package local-fake test seam
+	authURL    string       // same-package local-fake test seam
 }
 
 var _ slackgateway.Sender = (*Sender)(nil)
 
 func NewSender(botToken string) *Sender {
-	return &Sender{botToken: botToken, postURL: postMessageURL}
+	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL}
+}
+
+// Identity is the minimal bot identity needed to bind an offline gateway.
+// It intentionally omits Slack's workspace/user display names and bot ID.
+type Identity struct {
+	TeamID    string
+	BotUserID string
 }
 
 func validSecret(token string) bool {
@@ -108,6 +132,95 @@ func postJSON(ctx context.Context, client *http.Client, endpoint, token string, 
 		return nil, ErrProtocol
 	}
 	return decodeObject(data)
+}
+
+var errAPITransport = errors.New("slacknetwork: api transport failed")
+
+// requestLimitedJSON is for idempotent identity and connection-open calls.
+// It preserves HTTP status for their classification while never exposing an
+// HTTP client error, response body, URL, token, or provider error code.
+func requestLimitedJSON(ctx context.Context, client *http.Client, endpoint, token string) (int, map[string]json.RawMessage, error) {
+	if !validSecret(token) {
+		return 0, nil, ErrConfig
+	}
+	if ctx == nil || ctx.Err() != nil {
+		return 0, nil, ErrCanceled
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+	copyClient := *client
+	copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if copyClient.Timeout == 0 || copyClient.Timeout > httpTimeout {
+		copyClient.Timeout = httpTimeout
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return 0, nil, ErrProtocol
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := copyClient.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return 0, nil, ErrCanceled
+		}
+		return 0, nil, errAPITransport
+	}
+	if resp == nil || resp.Body == nil {
+		return 0, nil, ErrProtocol
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, nil, nil // only HTTP 200 carries the success schema
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil, ErrCanceled
+		}
+		return 0, nil, errAPITransport
+	}
+	if len(data) == 0 || len(data) > maxResponseBytes || !utf8.Valid(data) {
+		return 0, nil, ErrProtocol
+	}
+	obj, err := decodeObject(data)
+	if err != nil {
+		return 0, nil, ErrProtocol
+	}
+	return resp.StatusCode, obj, nil
+}
+
+// VerifyBotIdentity calls only auth.test with the sender's bot token. A
+// successful bot_id is required as evidence this was a bot-user token, but is
+// not returned or used as a guess about the opaque user ID format.
+func (s *Sender) VerifyBotIdentity(ctx context.Context) (Identity, error) {
+	var zero Identity
+	if s == nil || !validSecret(s.botToken) {
+		return zero, ErrConfig
+	}
+	endpoint := s.authURL
+	if endpoint == "" {
+		endpoint = authTestURL
+	}
+	status, obj, err := requestLimitedJSON(ctx, s.httpClient, endpoint, s.botToken)
+	if errors.Is(err, ErrCanceled) {
+		return zero, ErrCanceled
+	}
+	if err != nil || status != http.StatusOK || !boolField(obj, "ok") {
+		return zero, ErrIdentity
+	}
+	if _, present := obj["error"]; present {
+		return zero, ErrIdentity
+	}
+	teamID, userID, botID := stringField(obj, "team_id"), stringField(obj, "user_id"), stringField(obj, "bot_id")
+	if !validOpaqueID(teamID) || !validOpaqueID(userID) || !validOpaqueID(botID) {
+		return zero, ErrIdentity
+	}
+	return Identity{TeamID: teamID, BotUserID: userID}, nil
 }
 
 // decodeObject rejects duplicate top-level keys and trailing JSON. This keeps

@@ -121,7 +121,7 @@ Replies over 40,000 Unicode characters are marked uncertain without posting,
 because Slack may truncate longer `text` values; they need explicit handling.
 `internal/slacknetwork` owns a one-connection Socket Mode client and a sender
 with separate app-level and bot tokens. It calls only the fixed
-`apps.connections.open` and `chat.postMessage` methods, never follows HTTP
+`apps.connections.open`, `auth.test`, and `chat.postMessage` methods, never follows HTTP
 redirects, and never returns provider bodies, token-bearing ticket URLs, or
 raw network errors. A connection ticket must use `wss` on `wss.slack.com` or
 a single `wss-*` label under `slack.com`, with the documented `/link/` path,
@@ -131,14 +131,23 @@ gateway's commit-before-ack callback, and writes its exact acknowledgment at
 most once. It exits with a typed disconnect/reconnect result; it does not
 automatically retry or make a second connection. The sender posts only JSON
 `channel` and `text` and requires an exact-channel, nonempty-`ts` success.
+With its bot token, the sender can verify identity through fixed `auth.test`:
+it requires valid opaque `team_id`, `user_id`, and `bot_id`, then returns only
+the team and bot-user IDs for an explicit later binding check. A user-token
+response without `bot_id` is rejected; ID prefixes and display names are not
+authorization evidence. Identity and connection-open success require exact HTTP
+200, `ok:true`, and no `error` field, even an empty one.
 Configuration plumbing, `thread_segments` transport, deployment, and legacy
 bridge migration remain out of scope. The agent driver preserves turn ordering
 and uses a fallible acceptance callback; on callback failure it stops with an
 uncertain result.
 
 Slack wire-field behavior follows the official [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
-[Events API](https://docs.slack.dev/apis/events-api/), and
-[`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/) documentation.
+[Events API](https://docs.slack.dev/apis/events-api/),
+[`apps.connections.open`](https://docs.slack.dev/reference/methods/apps.connections.open/),
+[`auth.test`](https://docs.slack.dev/reference/methods/auth.test/), and
+[`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/) documentation,
+including the [Web API rate-limit response](https://docs.slack.dev/apis/web-api/rate-limits/).
 
 ## Single-conversation source runner
 
@@ -167,18 +176,21 @@ transient compare-and-swap outcome. Transient callback, ack, storage, driver,
 and socket disconnects are retried with bounded polling or capped reconnect
 backoff. Reconnect backoff resets only after an accepted-and-acked socket event,
 including acknowledged redelivery; unrelated backlog work or posts cannot mask
-a failing connection.
+a failing connection. A caller-supplied nonzero reconnect minimum below 100 ms
+is invalid, and the first terminal cause remains the reported status.
 A repeated no-progress refresh cannot spin. A disabled Socket Mode link is
 terminal. Cancellation stops the socket and pump without replaying a
 callback or external effect. Normal status exposes categories only, no message
 bodies, credentials, ticket URLs, or provider errors.
 
-The current network client groups HTTP transport failures and Slack auth
-denials from `apps.connections.open` under one `ErrOpen` classification. The
-runner fails closed on that unknown class rather than retrying a possible bad
-credential indefinitely. Before live wiring, the network boundary must split
-explicitly transient open failures from auth/config denial; this source runner
-does not broaden the credential-bearing network package.
+Connection-open failures retain the `ErrOpen` umbrella but have fixed, private
+subclasses. Transport/timeout, HTTP 429/5xx, and a narrow documented
+`ok:false` transient-code allowlist (`ratelimited`, `internal_error`,
+`service_unavailable`, `team_added_to_org`) are `ErrOpenTransient`; the runner alone
+backs those off. Auth/config denial, malformed responses, unsafe ticket URLs,
+and unknown provider codes are terminal. Cancellation is distinct. No provider
+error code or `Retry-After` value is echoed or slept on by the network client;
+the runner owns its capped delay. This does not authorize live wiring.
 
 ## Codex app-server client boundary
 

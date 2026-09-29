@@ -112,12 +112,13 @@ func (c *manualClock) next(t *testing.T) *manualTimer {
 }
 
 type fakeSocket struct {
-	mu      sync.Mutex
-	handler slacknetwork.EnvelopeHandler
-	runs    int
-	steps   []error // nil means hold the session until canceled
-	entered chan int
-	onRun   func(int, slacknetwork.EnvelopeHandler) error
+	mu       sync.Mutex
+	handler  slacknetwork.EnvelopeHandler
+	runs     int
+	steps    []error // nil means hold the session until canceled
+	entered  chan int
+	onRun    func(int, slacknetwork.EnvelopeHandler) error
+	onRunCtx func(context.Context, int, slacknetwork.EnvelopeHandler) error
 }
 
 func newFakeSocket(steps ...error) *fakeSocket {
@@ -136,6 +137,11 @@ func (s *fakeSocket) Run(ctx context.Context, handler slacknetwork.EnvelopeHandl
 	s.entered <- n
 	if s.onRun != nil {
 		if err := s.onRun(n, handler); err != nil {
+			return err
+		}
+	}
+	if s.onRunCtx != nil {
+		if err := s.onRunCtx(ctx, n, handler); err != nil {
 			return err
 		}
 	}
@@ -176,12 +182,22 @@ type fakeDriver struct {
 	bodies     []string
 	started    chan int
 	startWait  <-chan struct{}
+	openWait   <-chan struct{}
 }
 
 func newFakeDriver() *fakeDriver {
 	return &fakeDriver{status: "completed", started: make(chan int, 64)}
 }
-func (d *fakeDriver) OpenThread(context.Context) (string, error) { return "agent-thread", nil }
+func (d *fakeDriver) OpenThread(ctx context.Context) (string, error) {
+	if d.openWait != nil {
+		select {
+		case <-d.openWait:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return "agent-thread", nil
+}
 func (d *fakeDriver) ResumeThread(context.Context, string) error { return nil }
 func (d *fakeDriver) InspectThread(context.Context, string) ([]channelreconcile.ExternalTurn, error) {
 	d.mu.Lock()
@@ -495,6 +511,117 @@ func TestRunnerReconnectBackoffIsCappedAndCancellationInterruptsIt(t *testing.T)
 			return
 		}
 		timer.fire()
+	}
+}
+
+func TestRunnerTransientOpenBackoffCapsResetsAndCancels(t *testing.T) {
+	f := newRunnerFixture(t,
+		slacknetwork.ErrOpenTransient, slacknetwork.ErrOpenTransient,
+		slacknetwork.ErrOpenTransient, slacknetwork.ErrOpenTransient)
+	raw := eventFrame(t, "open-progress-envelope", "open-progress-event", runPrivate)
+	f.socket.onRun = func(n int, h slacknetwork.EnvelopeHandler) error {
+		if n != 4 {
+			return nil
+		}
+		return h(context.Background(), raw, func(context.Context, []byte) error { return nil })
+	}
+	cancel, done := f.start(t)
+	for i, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, time.Second} {
+		f.socket.waitRun(t, i+1)
+		timer := f.clock.nextNonPoll(t)
+		require.Equal(t, want, timer.duration)
+		require.Equal(t, ErrorSocket, f.runner.Status().LastError)
+		if i == 3 {
+			stopRunner(t, cancel, done)
+			require.False(t, timer.active())
+			return
+		}
+		timer.fire()
+	}
+}
+
+func TestRunnerRejectsNanosecondBackoffBeforeSocket(t *testing.T) {
+	f := newRunnerFixture(t, slacknetwork.ErrOpenTransient)
+	f.runner.BackoffMin = time.Nanosecond
+	err := f.runner.Run(context.Background())
+	require.ErrorIs(t, err, ErrConfig)
+	require.Equal(t, ErrorConfig, f.runner.Status().LastError)
+	require.Zero(t, f.socket.count(), "invalid retry delay must not create a connection")
+}
+
+func TestRunnerZeroBackoffUsesDefault(t *testing.T) {
+	f := newRunnerFixture(t, slacknetwork.ErrOpenTransient)
+	f.runner.BackoffMin = 0
+	f.runner.BackoffMax = 0
+	cancel, done := f.start(t)
+	f.socket.waitRun(t, 1)
+	timer := f.clock.nextNonPoll(t)
+	require.Equal(t, time.Second, timer.duration)
+	stopRunner(t, cancel, done)
+}
+
+func TestRunnerPumpFatalOutranksConcurrentTransientOpen(t *testing.T) {
+	f := newRunnerFixture(t, slacknetwork.ErrOpenTransient)
+	ctx := context.Background()
+	require.NoError(t, f.store.CreateConversation(ctx, channelgateway.Conversation{
+		ID: "other-owner", ChannelID: "C-other", ConductorID: "other", Mode: channelgateway.ChannelStream, AllowedSenders: []string{runUser},
+	}))
+	require.NoError(t, f.store.BindAgentThread(ctx, "other-owner", "agent-thread"))
+	_, err := f.store.Ingest(ctx, channelgateway.Inbound{
+		ConversationID: runConversation, EventID: "fatal-event", MessageID: "fatal-message", ChannelID: runChannel, SenderID: runUser, Body: runPrivate,
+	})
+	require.NoError(t, err)
+	openWait := make(chan struct{})
+	f.driver.openWait = openWait // hold the pump before its fatal binding conflict
+	f.socket.onRunCtx = func(ctx context.Context, _ int, _ slacknetwork.EnvelopeHandler) error {
+		<-ctx.Done() // the fake transient open returns only after pump fatal cancels it
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.runner.Run(context.Background()) }()
+	f.socket.waitRun(t, 1)
+	close(openWait)
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrFatal)
+		require.Equal(t, ErrorConfig, f.runner.Status().LastError,
+			"transient socket class must not overwrite fatal pump class")
+		require.Equal(t, 1, f.socket.count())
+	case <-time.After(4 * time.Second):
+		t.Fatal("fatal pump did not terminate socket")
+	}
+}
+
+func TestRunnerTerminalStatusIsStickyAgainstTransientSocketClass(t *testing.T) {
+	for _, class := range []ErrorClass{ErrorConfig, ErrorProtocol} {
+		t.Run(string(class), func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.runner.setError(class, true)
+			f.runner.setError(ErrorSocket, false)
+			require.Equal(t, class, f.runner.Status().LastError)
+		})
+	}
+}
+
+func TestRunnerTerminalOpenClassStopsOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		class ErrorClass
+	}{
+		{"auth", slacknetwork.ErrOpenAuth, ErrorConfig},
+		{"config", slacknetwork.ErrOpenConfig, ErrorConfig},
+		{"protocol", slacknetwork.ErrOpenProtocol, ErrorProtocol},
+		{"unknown", slacknetwork.ErrOpenUnknown, ErrorProtocol},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t, tc.err)
+			err := f.runner.Run(context.Background())
+			require.ErrorIs(t, err, ErrFatal)
+			require.Equal(t, tc.class, f.runner.Status().LastError)
+			require.Equal(t, 1, f.socket.count(), "terminal open class must not reconnect")
+			require.NotContains(t, err.Error(), runPrivate)
+		})
 	}
 }
 

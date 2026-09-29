@@ -125,22 +125,22 @@ func (r *Runner) update(fn func(*Status)) {
 	r.mu.Unlock()
 }
 
-// A terminal socket diagnosis wins over status updates from a pump that was
-// already in flight when Run began shutting down.
+// Preserve the first terminal cause, whether it came from the socket or pump.
 func (r *Runner) setError(class ErrorClass, terminal bool) {
 	r.mu.Lock()
-	if !r.terminal || terminal {
+	if !r.terminal {
 		r.status.LastError = class
-	}
-	if terminal {
-		r.terminal = true
+		if terminal {
+			r.terminal = true
+		}
 	}
 	r.mu.Unlock()
 }
 
 func (r *Runner) timings() (poll, min, max time.Duration, clock Clock, ok bool) {
 	poll, min, max, clock = r.PollInterval, r.BackoffMin, r.BackoffMax, r.Clock
-	if poll < 0 || min < 0 || max < 0 {
+	if poll < 0 || min < 0 || max < 0 || min > 0 && min < 100*time.Millisecond {
+		// A caller-configured near-zero reconnect delay can busy-loop.
 		return 0, 0, 0, nil, false
 	}
 	if poll == 0 {
@@ -218,7 +218,7 @@ func (r *Runner) drain(ctx context.Context, wake chan<- struct{}) error {
 		results, err := r.Delivery.DrainPending(ctx, drainBatch)
 		if err != nil {
 			if fatalDependency(err) {
-				r.setError(ErrorConfig, false)
+				r.setError(ErrorConfig, true)
 				return ErrFatal
 			}
 			r.setError(ErrorDelivery, false)
@@ -243,7 +243,7 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
 		result, err := r.Worker.RunOne(ctx, r.Handler.Config.ConversationID)
 		if err != nil {
 			if fatalDependency(err) {
-				r.setError(ErrorConfig, false)
+				r.setError(ErrorConfig, true)
 				return ErrFatal
 			}
 			r.setError(ErrorWork, false)
@@ -261,7 +261,7 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
 			r.update(func(s *Status) { s.Degraded = true })
 			return nil
 		default:
-			r.setError(ErrorProtocol, false)
+			r.setError(ErrorProtocol, true)
 			return ErrFatal
 		}
 	}
@@ -330,9 +330,15 @@ func (r *Runner) socketFailure(err, callbackErr error) (terminal bool, result er
 		}
 		return false, nil, ErrorSocket, false
 	}
-	if errors.Is(err, slacknetwork.ErrConfig) || errors.Is(err, slacknetwork.ErrOpen) {
-		// ErrOpen conflates auth denial and transient transport faults. Fail
-		// closed until the network layer can classify them separately.
+	if errors.Is(err, slacknetwork.ErrOpenTransient) {
+		return false, nil, ErrorSocket, false
+	}
+	if errors.Is(err, slacknetwork.ErrOpenProtocol) || errors.Is(err, slacknetwork.ErrOpenUnknown) {
+		return true, ErrFatal, ErrorProtocol, false
+	}
+	if errors.Is(err, slacknetwork.ErrConfig) || errors.Is(err, slacknetwork.ErrOpenAuth) ||
+		errors.Is(err, slacknetwork.ErrOpenConfig) || errors.Is(err, slacknetwork.ErrOpen) {
+		// A legacy, unclassified ErrOpen still fails closed.
 		return true, ErrFatal, ErrorConfig, false
 	}
 	if errors.Is(err, slacknetwork.ErrProtocol) || errors.Is(err, slacknetwork.ErrDisconnected) {
