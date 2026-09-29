@@ -82,6 +82,10 @@ type Turn struct {
 	ThreadID       string
 	Body           string
 	AcceptanceID   string
+	AttemptID      string
+	AttemptState   AttemptState
+	BaselineTurnID string
+	ExternalTurnID string
 }
 
 type OutboxItem struct {
@@ -96,7 +100,7 @@ type OutboxItem struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Open creates a private SQLite file or opens an existing compatible ledger.
 // Existing files with an unknown schema are never deleted or migrated.
@@ -213,8 +217,11 @@ var schemaDDL = []string{
 	`CREATE TABLE conversations (
 		id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, conductor_id TEXT NOT NULL,
 		mode TEXT NOT NULL CHECK (mode IN ('channel_stream','thread_segments')),
-		next_turn INTEGER NOT NULL DEFAULT 0, active_segment_id TEXT, pending_segment_id TEXT
+		next_turn INTEGER NOT NULL DEFAULT 0, active_segment_id TEXT, pending_segment_id TEXT,
+		agent_thread_id TEXT NOT NULL DEFAULT '', last_external_turn_id TEXT NOT NULL DEFAULT ''
 	)`,
+	`CREATE UNIQUE INDEX one_conversation_per_agent_thread ON conversations(agent_thread_id)
+		WHERE agent_thread_id != ''`,
 	`CREATE TABLE allowed_senders (
 		conversation_id TEXT NOT NULL REFERENCES conversations(id), sender_id TEXT NOT NULL,
 		PRIMARY KEY (conversation_id, sender_id)
@@ -240,9 +247,15 @@ var schemaDDL = []string{
 		number INTEGER NOT NULL, event_ordinal INTEGER NOT NULL UNIQUE REFERENCES inbound_events(ordinal),
 		segment_id TEXT NOT NULL REFERENCES segments(id), status TEXT NOT NULL CHECK (status IN ('active','completed')),
 		acceptance_id TEXT NOT NULL DEFAULT '',
+		attempt_id TEXT NOT NULL DEFAULT '', baseline_turn_id TEXT NOT NULL DEFAULT '',
+		external_turn_id TEXT NOT NULL DEFAULT '',
+		attempt_state TEXT NOT NULL DEFAULT 'unprepared'
+			CHECK (attempt_state IN ('unprepared','prepared','accepted','needs_reconciliation','completed')),
 		UNIQUE (conversation_id, number)
 	)`,
 	`CREATE UNIQUE INDEX one_active_turn ON turns(conversation_id) WHERE status='active'`,
+	`CREATE UNIQUE INDEX one_ledger_turn_per_external_turn ON turns(conversation_id,external_turn_id)
+		WHERE external_turn_id != ''`,
 	`CREATE TABLE outbox (
 		ordinal INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
 		conversation_id TEXT NOT NULL REFERENCES conversations(id),

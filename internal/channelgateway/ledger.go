@@ -204,10 +204,12 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 
 func loadActiveTurn(tx *writeTx, conversationID string) (*Turn, error) {
 	var t Turn
-	err := tx.row(`SELECT t.id,t.conversation_id,t.number,t.segment_id,e.event_id,e.message_id,e.thread_id,e.body,t.acceptance_id
+	err := tx.row(`SELECT t.id,t.conversation_id,t.number,t.segment_id,e.event_id,e.message_id,e.thread_id,e.body,
+		t.acceptance_id,t.attempt_id,t.attempt_state,t.baseline_turn_id,t.external_turn_id
 		FROM turns t JOIN inbound_events e ON e.ordinal=t.event_ordinal
 		WHERE t.conversation_id=? AND t.status='active'`, conversationID).
-		Scan(&t.ID, &t.ConversationID, &t.Number, &t.SegmentID, &t.EventID, &t.MessageID, &t.ThreadID, &t.Body, &t.AcceptanceID)
+		Scan(&t.ID, &t.ConversationID, &t.Number, &t.SegmentID, &t.EventID, &t.MessageID, &t.ThreadID,
+			&t.Body, &t.AcceptanceID, &t.AttemptID, &t.AttemptState, &t.BaselineTurnID, &t.ExternalTurnID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -253,7 +255,7 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 		if err != nil {
 			return ErrStorage
 		}
-		t.ID, t.ConversationID, t.SegmentID = uuid.NewString(), conversationID, c.active
+		t.ID, t.ConversationID, t.SegmentID, t.AttemptState = uuid.NewString(), conversationID, c.active, Unprepared
 		if err := tx.row(`SELECT next_turn FROM conversations WHERE id=?`, conversationID).Scan(&t.Number); err != nil {
 			return ErrStorage
 		}
@@ -282,12 +284,17 @@ func (s *Store) AcceptTurn(ctx context.Context, turnID, acceptanceID string) err
 	}
 	return s.write(ctx, func(tx *writeTx) error {
 		var status, existing string
-		err := tx.row(`SELECT status,acceptance_id FROM turns WHERE id=?`, turnID).Scan(&status, &existing)
+		var attemptState AttemptState
+		err := tx.row(`SELECT status,acceptance_id,attempt_state FROM turns WHERE id=?`, turnID).
+			Scan(&status, &existing, &attemptState)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return ErrStorage
+		}
+		if attemptState != Unprepared {
+			return ErrConflict
 		}
 		if existing != "" {
 			if existing == acceptanceID {
@@ -326,15 +333,19 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 	var out *OutboxItem
 	err := s.write(ctx, func(tx *writeTx) error {
 		var conversationID, status, existing, mode, root string
-		err := tx.row(`SELECT t.conversation_id,t.status,t.acceptance_id,c.mode,s.root_thread_id
+		var attemptState AttemptState
+		err := tx.row(`SELECT t.conversation_id,t.status,t.acceptance_id,c.mode,s.root_thread_id,t.attempt_state
 			FROM turns t JOIN conversations c ON c.id=t.conversation_id JOIN segments s ON s.id=t.segment_id
 			WHERE t.id=?`, turnID).
-			Scan(&conversationID, &status, &existing, &mode, &root)
+			Scan(&conversationID, &status, &existing, &mode, &root, &attemptState)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return ErrStorage
+		}
+		if attemptState != Unprepared {
+			return ErrConflict
 		}
 		if existing != acceptanceID {
 			return ErrConflict

@@ -32,10 +32,10 @@ thread ID, not a copy of a message body.
 The ledger owns monotonically increasing turn numbers per conversation. At most
 one turn is active per conversation. Intake records eligible inbound events once
 by external event ID and makes them available for that conversation's next turn.
-The agent driver must explicitly accept a turn using a stable acceptance ID.
-Repeating the same acceptance or completion operation must be safe after an
-adapter retry or process restart; a different acceptance cannot take over an
-active turn.
+The reconciliation worker persists a stable local attempt ID before submitting
+to the agent. The agent's authoritative turn ID is stored at the acceptance
+callback. Repeating acceptance or completion with the same IDs is safe after a
+restart; different IDs cannot take over an active turn.
 
 For `thread_segments`, the first mention establishes an open segment and its
 owned reply thread. A later mention while a turn is active establishes a pending
@@ -69,11 +69,28 @@ send an item again, so the future transport needs an idempotency or reconciliati
 strategy for the external API. This slice promises durable, deduplicated enqueue,
 not exactly-once network delivery.
 
-On restart, the ledger retains unfinished turns and pending outbound work. It
-must not assume an unfinished turn failed merely because a process died. A
-driver must inspect its acceptance ID and reconcile the prior attempt before
-starting another turn. Schema mismatch must fail closed rather than discard a
-database containing unrecoverable conversation state.
+On restart, the ledger retains unfinished turns and pending outbound work. The
+conversation binds one immutable, private agent thread and a last completed
+external turn cursor. A bound agent thread cannot be reused by another
+conversation, and an external turn ID cannot be reused by another ledger turn
+in the same conversation. Before an external start, the worker stores an attempt ID
+and that cursor in the same transaction that claims the ledger turn. Only the
+worker that created the attempt may submit it. A crash after opening a thread
+but before binding it can leave an unused external thread; the bound winner is
+the only thread used for subsequent turns.
+
+For recovery, the driver reads the complete stored turn history for that bound
+thread. An accepted attempt matches its exact external turn ID. A prepared
+attempt with no recorded external ID may match exactly one turn after its saved
+baseline cursor. This inference requires exclusive ownership of the private
+agent thread; a driver unable to guarantee complete, authoritative history and
+exclusive ownership must report uncertainty. Zero or multiple post-baseline
+turns, a missing accepted ID, and failed or interrupted terminal status require
+reconciliation. A prepared attempt is never submitted again just because no
+external turn is visible. An in-progress accepted turn remains active for a
+later inspection. Completion, outbound enqueue, and cursor advance commit in
+one transaction. Schema version 2 fails closed on older gateway files; migration
+of deployed data is outside this unreleased source slice.
 
 ## Adapter obligations and limits
 
@@ -81,8 +98,9 @@ The later Slack adapter will post `channel_stream` output with no thread ID and
 route `thread_segments` output to its segment's root thread. It will filter
 bot/self events, bind sender allowlists, and render superseded thread pointers.
 It must deduplicate Slack retry deliveries by Slack event ID before invoking a
-conductor. The later agent driver will supply stable acceptance IDs, preserve
-turn ordering, and write outbound replies through the ledger. This contract
+conductor. The later agent driver will preserve turn ordering and provide an
+acceptance callback that returns persistence errors; on callback failure it
+must stop and return an uncertain result. This contract
 leaves network connection, tokens, the Codex driver, configuration,
 migration from the existing bridge, and live deployment for separate work.
 
@@ -92,14 +110,16 @@ migration from the existing bridge, and live deployment for separate work.
 launches `codex app-server --listen stdio://` using discrete argv entries and
 performs `initialize`/`initialized` before a thread request. A new thread uses
 `thread/start`; an existing one uses `thread/resume`. The returned `thread.id`
-and `turn/start` response's `turn.id` are authoritative. The driver must record
-these IDs at the acceptance callback before relying on `turn/completed`; it must
+and `turn/start` response's `turn.id` are authoritative. A future adapter must
+use `thread/read` with `includeTurns` to inspect stored turns without resuming;
+it must record the turn ID at a fallible acceptance callback before relying on
+`turn/completed`. It must
 not derive them from Slack IDs, local counters, or the process ID.
 
 One client serializes turns on one connection. A completed `agentMessage` item is
 the source of final reply text; `turn/completed` supplies the terminal status.
 Protocol and process errors contain classifications only, not prompt text,
 server error messages, stderr, or raw events. Canceling an operation kills and
-reaps the child, so a later driver must reconcile any accepted turn using its
-durable ledger state before starting another attempt. The client itself does not
-perform that reconciliation or enqueue Slack replies.
+reaps the child. `internal/channelreconcile` defines the provider-neutral
+driver and recovery worker; it does not wire this app-server client, which still
+has a non-fallible callback, or enqueue Slack replies itself.
