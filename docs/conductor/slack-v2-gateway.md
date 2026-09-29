@@ -1,10 +1,10 @@
 # Slack v2 channel gateway: source contract
 
-This document defines the durable gateway and an offline Slack Socket Mode /
+This document defines the durable gateway and its source-only Slack Socket Mode /
 `chat.postMessage` boundary for a future conductor channel. It does not replace
-the current bridge or connect to Slack. A future network adapter supplies
-authenticated Socket Mode frames and top-level posts; the agent driver separately
-claims turns and commits results.
+the current bridge or configure a live Slack connection. `internal/slacknetwork`
+can supply authenticated Socket Mode frames and top-level posts; the agent
+driver separately claims turns and commits results.
 
 ## Two routing modes
 
@@ -119,10 +119,22 @@ the future `chat.postMessage` implementation must omit `thread_ts`. It accepts
 success only with `ok`, the exact bound channel, and a nonempty opaque `ts`.
 Replies over 40,000 Unicode characters are marked uncertain without posting,
 because Slack may truncate longer `text` values; they need explicit handling.
-Websocket/HTTP implementations, tokens, configuration plumbing,
-`thread_segments` transport, deployment, and legacy bridge migration remain
-out of scope. The agent driver preserves turn ordering and uses a fallible
-acceptance callback; on callback failure it stops with an uncertain result.
+`internal/slacknetwork` owns a one-connection Socket Mode client and a sender
+with separate app-level and bot tokens. It calls only the fixed
+`apps.connections.open` and `chat.postMessage` methods, never follows HTTP
+redirects, and never returns provider bodies, token-bearing ticket URLs, or
+raw network errors. A connection ticket must use `wss` on `wss.slack.com` or
+a single `wss-*` label under `slack.com`, with the documented `/link/` path,
+nonempty `ticket`, and no unsafe port, userinfo, or fragment. The session
+requires Slack's `hello`, bounds text frames, hands event envelopes to the
+gateway's commit-before-ack callback, and writes its exact acknowledgment at
+most once. It exits with a typed disconnect/reconnect result; it does not
+automatically retry or make a second connection. The sender posts only JSON
+`channel` and `text` and requires an exact-channel, nonempty-`ts` success.
+Configuration plumbing, `thread_segments` transport, deployment, and legacy
+bridge migration remain out of scope. The agent driver preserves turn ordering
+and uses a fallible acceptance callback; on callback failure it stops with an
+uncertain result.
 
 Slack wire-field behavior follows the official [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
 [Events API](https://docs.slack.dev/apis/events-api/), and
