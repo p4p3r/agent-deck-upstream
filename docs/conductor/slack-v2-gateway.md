@@ -17,7 +17,7 @@ message content.
 
 | Mode | Eligible inbound event | Destination |
 | --- | --- | --- |
-| `channel_stream` | A top-level message in the dedicated channel | The conversation's single stream |
+| `channel_stream` | A top-level message in the dedicated channel | The conversation's single stream; assistant output is top-level with no thread ID |
 | `thread_segments` | A mention in the shared channel outside an owned thread | A new segment, opened at a turn boundary |
 | `thread_segments` | A message in the active segment's owned thread | That segment, even without a mention |
 
@@ -77,10 +77,11 @@ database containing unrecoverable conversation state.
 
 ## Adapter obligations and limits
 
-The later Slack adapter will map a top-level message's ID to the owned reply
-thread, filter bot/self events, bind sender allowlists, and render superseded
-thread pointers. It must deduplicate Slack retry deliveries by Slack event ID
-before invoking a conductor. The later agent driver will supply stable acceptance
-IDs, preserve turn ordering, and write outbound replies through the ledger. This
-contract leaves network connection, tokens, the Codex driver, configuration,
+The later Slack adapter will post `channel_stream` output with no thread ID and
+route `thread_segments` output to its segment's root thread. It will filter
+bot/self events, bind sender allowlists, and render superseded thread pointers.
+It must deduplicate Slack retry deliveries by Slack event ID before invoking a
+conductor. The later agent driver will supply stable acceptance IDs, preserve
+turn ordering, and write outbound replies through the ledger. This contract
+leaves network connection, tokens, the Codex driver, configuration,
 migration from the existing bridge, and live deployment for separate work.

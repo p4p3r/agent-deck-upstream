@@ -112,7 +112,11 @@ func TestChannelStreamTopLevelAndSerializedTurns(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first.ID, again.ID)
 	item := complete(t, s, first, "response-1")
-	require.Equal(t, "top-1", item.ThreadID)
+	require.Empty(t, item.ThreadID)
+	items, err := s.PendingOutbox(ctx, "conversation", 1)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Empty(t, items[0].ThreadID)
 
 	second, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)

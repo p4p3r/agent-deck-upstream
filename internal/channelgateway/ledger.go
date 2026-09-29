@@ -325,12 +325,11 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 	}
 	var out *OutboxItem
 	err := s.write(ctx, func(tx *writeTx) error {
-		var conversationID, status, existing, messageID, mode, root string
-		err := tx.row(`SELECT t.conversation_id,t.status,t.acceptance_id,e.message_id,c.mode,s.root_thread_id
-			FROM turns t JOIN inbound_events e ON e.ordinal=t.event_ordinal
-			JOIN conversations c ON c.id=t.conversation_id JOIN segments s ON s.id=t.segment_id
+		var conversationID, status, existing, mode, root string
+		err := tx.row(`SELECT t.conversation_id,t.status,t.acceptance_id,c.mode,s.root_thread_id
+			FROM turns t JOIN conversations c ON c.id=t.conversation_id JOIN segments s ON s.id=t.segment_id
 			WHERE t.id=?`, turnID).
-			Scan(&conversationID, &status, &existing, &messageID, &mode, &root)
+			Scan(&conversationID, &status, &existing, &mode, &root)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -359,7 +358,7 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 		if replyBody != "" {
 			threadID := root
 			if Mode(mode) == ChannelStream {
-				threadID = messageID
+				threadID = ""
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: "reply", ThreadID: threadID, Body: replyBody}
