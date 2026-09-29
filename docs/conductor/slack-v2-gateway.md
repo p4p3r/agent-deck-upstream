@@ -85,3 +85,21 @@ conductor. The later agent driver will supply stable acceptance IDs, preserve
 turn ordering, and write outbound replies through the ledger. This contract
 leaves network connection, tokens, the Codex driver, configuration,
 migration from the existing bridge, and live deployment for separate work.
+
+## Codex app-server client boundary
+
+`internal/codexappserver` provides a stdio client for a future agent driver. It
+launches `codex app-server --listen stdio://` using discrete argv entries and
+performs `initialize`/`initialized` before a thread request. A new thread uses
+`thread/start`; an existing one uses `thread/resume`. The returned `thread.id`
+and `turn/start` response's `turn.id` are authoritative. The driver must record
+these IDs at the acceptance callback before relying on `turn/completed`; it must
+not derive them from Slack IDs, local counters, or the process ID.
+
+One client serializes turns on one connection. A completed `agentMessage` item is
+the source of final reply text; `turn/completed` supplies the terminal status.
+Protocol and process errors contain classifications only, not prompt text,
+server error messages, stderr, or raw events. Canceling an operation kills and
+reaps the child, so a later driver must reconcile any accepted turn using its
+durable ledger state before starting another attempt. The client itself does not
+perform that reconciliation or enqueue Slack replies.
