@@ -32,8 +32,11 @@ type ExternalTurn struct {
 }
 
 // Driver owns a private agent thread per conversation. InspectThread must
-// return the complete, chronological, authoritative stored history; it returns
-// an error if history is incomplete, ambiguous, or thread ownership is unsure.
+// return the complete, chronological, authoritative stored IDs/statuses without
+// requiring item pagination. ReplyForTurn must return the authoritative reply
+// only for a uniquely matched completed recovery candidate. Reconciliation
+// accepts exactly one turn after its baseline; normal submission requires no
+// turn after its cursor. Ambiguous or incomplete history fails closed.
 // StartTurn must call accepted with the authoritative ID before returning a
 // result, and stop/return if accepted fails. A prepared submission is never
 // replayed, even when InspectThread sees no new turn.
@@ -41,6 +44,7 @@ type Driver interface {
 	OpenThread(context.Context) (string, error)
 	ResumeThread(context.Context, string) error
 	InspectThread(context.Context, string) ([]ExternalTurn, error)
+	ReplyForTurn(context.Context, string, string) (string, error)
 	StartTurn(context.Context, string, string, func(string) error) (ExternalTurn, error)
 }
 
@@ -111,6 +115,12 @@ func (w *Worker) reconcile(ctx context.Context, t *channelgateway.Turn, a channe
 		return w.unresolved(ctx, t, a)
 	}
 	ext := after[0]
+	if ext.Status == "completed" {
+		ext.Reply, err = w.Driver.ReplyForTurn(ctx, threadID, ext.ID)
+		if err != nil {
+			return r, ErrDriver
+		}
+	}
 	if err := w.Store.AcceptAttempt(ctx, t.ID, a.ID, ext.ID); err != nil {
 		return r, err
 	}

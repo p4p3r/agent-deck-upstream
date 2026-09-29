@@ -137,8 +137,8 @@ the team and bot-user IDs for an explicit later binding check. A user-token
 response without `bot_id` is rejected; ID prefixes and display names are not
 authorization evidence. Identity and connection-open success require exact HTTP
 200, `ok:true`, and no `error` field, even an empty one.
-Configuration plumbing, `thread_segments` transport, deployment, and legacy
-bridge migration remain out of scope. The agent driver preserves turn ordering
+`thread_segments` transport, deployment, and legacy bridge migration remain out
+of scope. The agent driver preserves turn ordering
 and uses a fallible acceptance callback; on callback failure it stops with an
 uncertain result.
 
@@ -214,3 +214,61 @@ operation. It reads complete history with `thread/read includeTurns`, rejects
 partial item views or ambiguous IDs, and closes the subprocess if acceptance
 persistence fails. The recovery worker still owns ledger transitions; this
 source adapter does not enqueue or deliver Slack replies itself.
+
+## Source-only conductor runtime and operational boundary
+
+A named conductor can opt into the `slack-v2` backend in its per-conductor
+configuration. The empty/default backend remains legacy. While `slack-v2` is
+selected, Agent Deck refuses its normal named-conductor start and restart
+paths before starting or respawning a pane. The v2 command refuses unless that
+same backend is selected. This is an Agent Deck configuration fence, not a
+kernel-enforced process-tree fence: a trusted same-UID operator and dedicated
+supervisor are assumed. Direct same-UID processes that deliberately bypass
+Agent Deck and the supervisor are outside this contract.
+
+The scoped TOML fields are `[conductors.<name>] backend = "slack-v2"` and
+`[conductors.<name>.slack_v2]` `app_token`, `bot_token`, `channel_id`,
+`allowed_user_ids`, and optional `codex_executable` and `codex_model`.
+The allowlist must be explicit and nonempty; tokens are read from the existing
+private configuration, never CLI flags. Slack `auth.test` supplies the exact
+team and bot-user IDs. The runtime durably binds them to the configured channel
+and allowlist; the gateway compares inbound event IDs with that binding.
+
+The v2 runtime holds a private per-conductor process lock to prevent ordinary
+duplicate v2 instances. The lock is not evidence that an escaped descendant
+has stopped if the runtime crashes. Production **requires a dedicated
+supervisor with whole-control-group termination**, such as a systemd user
+service on Linux. No service unit or live cutover is installed by this source
+slice. Codex app-server writer locking is not used as an ownership fence.
+The runtime keeps one app-server process and one owned thread for its lifetime;
+normal cancellation closes and reaps that process.
+
+Bootstrap is an explicit choice: `--create` deliberately starts a new Codex
+thread, whereas `--resume <exact-thread-id>` must use that thread or fail.
+The private credential-free manifest keeps the original bootstrap turn as an
+immutable anchor. On restart, a single SQLite snapshot must prove every cursor
+advance forms a contiguous completed-attempt chain from that anchor. Before
+ingress, paginated Codex turn metadata must agree with the chain; at most one extra
+turn is permitted when a recorded unfinished attempt explains it. A fork,
+unrecorded turn, broken chain, or ambiguous initial create fails closed.
+Item pagination is requested only to recover the reply of a uniquely matched
+completed turn. If that method is unavailable, recovery remains unresolved;
+the turn is neither completed nor submitted again.
+An empty `--create` thread may be replaced on restart only when the ledger
+transactionally proves an empty cursor and no attempt or submission evidence;
+pending inbound events without an attempt remain queued. Replacement intent is
+persisted before `thread/start`, the new ID before SQLite rebinding, and READY
+last. Crashes in that sequence may retry only under renewed empty-ledger proof.
+`--resume` never replaces its explicit ID.
+Normal runtime status and errors must omit message bodies, credentials,
+Socket Mode tickets, and raw provider errors.
+
+For a later separately approved cutover, first disable the old bridge ingress
+and restart source, stop the legacy writer, and verify the *exact* old process
+tree is quiescent. Only then switch the conductor backend to `slack-v2` and
+start v2 in explicit resume mode under the dedicated supervisor. Verify one
+authorized-user canary before restoring ingress. Rollback reverses that order:
+stop and verify the whole v2 control group is gone, switch the backend back to
+legacy, then restore its bridge and restart source. The handoff record should
+retain protected exact thread/process identities, quiescence and supervisor
+evidence, and opaque canary outcome IDs, but no tokens or conversation bodies.

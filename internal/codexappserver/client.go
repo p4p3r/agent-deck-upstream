@@ -14,6 +14,8 @@ import (
 	"sync"
 )
 
+// History is paged, so this bounds each protocol frame rather than the total
+// stored thread. An individual oversized item fails closed during inspection.
 const maxFrame = 1 << 20
 const maxStderr = 16 << 10
 
@@ -154,7 +156,8 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
 	if _, err := c.request(ctx, "initialize", map[string]any{
-		"clientInfo": map[string]string{"name": "agent_deck", "title": "Agent Deck", "version": "0.1.0"},
+		"clientInfo":   map[string]string{"name": "agent_deck", "title": "Agent Deck", "version": "0.1.0"},
+		"capabilities": map[string]any{"experimentalApi": true, "requestAttestation": false},
 	}, nil); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -313,7 +316,7 @@ func (c *Client) StartThread(ctx context.Context) (string, error) {
 	if c.cfg.CWD != "" {
 		params["cwd"] = c.cfg.CWD
 	}
-	return c.openThread(ctx, "thread/start", params)
+	return c.openThread(ctx, "thread/start", params, "")
 }
 
 // ResumeThread reopens a stored thread and returns the ID from the response.
@@ -321,17 +324,17 @@ func (c *Client) ResumeThread(ctx context.Context, id string) (string, error) {
 	if id == "" {
 		return "", &Error{Invalid, "thread/resume"}
 	}
-	params := map[string]string{"threadId": id}
+	params := map[string]any{"threadId": id, "excludeTurns": true}
 	if c.cfg.CWD != "" {
 		params["cwd"] = c.cfg.CWD
 	}
 	if c.cfg.Model != "" {
 		params["model"] = c.cfg.Model
 	}
-	return c.openThread(ctx, "thread/resume", params)
+	return c.openThread(ctx, "thread/resume", params, id)
 }
 
-func (c *Client) openThread(ctx context.Context, method string, params any) (string, error) {
+func (c *Client) openThread(ctx context.Context, method string, params any, expectedID string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
@@ -349,7 +352,7 @@ func (c *Client) openThread(ctx context.Context, method string, params any) (str
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
-	if json.Unmarshal(raw, &response) != nil || response.Thread.ID == "" || (method == "thread/resume" && response.Thread.ID != params.(map[string]string)["threadId"]) {
+	if json.Unmarshal(raw, &response) != nil || response.Thread.ID == "" || expectedID != "" && response.Thread.ID != expectedID {
 		_ = c.Close()
 		return "", &Error{Protocol, method}
 	}

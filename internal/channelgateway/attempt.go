@@ -31,6 +31,74 @@ type Attempt struct {
 	ExternalTurnID string
 }
 
+// EmptyCreateReplacementSafe proves that this conductor has never reserved or
+// submitted a turn on the currently bound thread. Accepted inbound messages
+// which have not become turns are deliberately allowed to survive rotation.
+func (s *Store) EmptyCreateReplacementSafe(ctx context.Context, conversationID, currentThreadID string) (bool, error) {
+	if conversationID == "" || currentThreadID == "" {
+		return false, ErrInvalid
+	}
+	state, err := readEmptyCreateState(s.db.QueryRowContext(ctx, emptyCreateStateSQL, conversationID, conversationID, conversationID, conversationID))
+	if err != nil {
+		return false, err
+	}
+	return state.threadID == currentThreadID && state.empty(), nil
+}
+
+// ReplaceEmptyCreateThread atomically rotates an unused create binding. A
+// concurrent or corrupted ledger with any turn/attempt/submission evidence is
+// rejected, even if an earlier read considered replacement safe.
+func (s *Store) ReplaceEmptyCreateThread(ctx context.Context, conversationID, oldThreadID, newThreadID string) error {
+	if conversationID == "" || oldThreadID == "" || newThreadID == "" || oldThreadID == newThreadID {
+		return ErrInvalid
+	}
+	return s.write(ctx, func(tx *writeTx) error {
+		state, err := readEmptyCreateState(tx.row(emptyCreateStateSQL, conversationID, conversationID, conversationID, conversationID))
+		if err != nil {
+			return err
+		}
+		if state.threadID != oldThreadID || !state.empty() {
+			return ErrConflict
+		}
+		var owners int
+		if err := tx.row(`SELECT count(*) FROM conversations WHERE agent_thread_id=? AND id<>?`, newThreadID, conversationID).Scan(&owners); err != nil {
+			return ErrStorage
+		}
+		if owners != 0 {
+			return ErrConflict
+		}
+		_, err = tx.exec(`UPDATE conversations SET agent_thread_id=? WHERE id=? AND agent_thread_id=?`, newThreadID, conversationID, oldThreadID)
+		return err
+	})
+}
+
+const emptyCreateStateSQL = `SELECT c.agent_thread_id,c.last_external_turn_id,c.next_turn,
+	(SELECT count(*) FROM turns WHERE conversation_id=?),
+	(SELECT count(*) FROM inbound_events WHERE conversation_id=? AND turn_id IS NOT NULL),
+	(SELECT count(*) FROM outbox WHERE conversation_id=?)
+	FROM conversations c WHERE c.id=?`
+
+type emptyCreateState struct {
+	threadID, cursor             string
+	nextTurn, turns, linked, out int64
+}
+
+func (s emptyCreateState) empty() bool {
+	return s.cursor == "" && s.nextTurn == 0 && s.turns == 0 && s.linked == 0 && s.out == 0
+}
+
+func readEmptyCreateState(row interface{ Scan(...any) error }) (emptyCreateState, error) {
+	var s emptyCreateState
+	err := row.Scan(&s.threadID, &s.cursor, &s.nextTurn, &s.turns, &s.linked, &s.out)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, ErrNotFound
+	}
+	if err != nil {
+		return s, ErrStorage
+	}
+	return s, nil
+}
+
 func (s *Store) AgentBinding(ctx context.Context, conversationID string) (Binding, error) {
 	var b Binding
 	if conversationID == "" {
@@ -97,6 +165,53 @@ func (s *Store) BindAgentThread(ctx context.Context, conversationID, threadID st
 			return ErrConflict
 		}
 		_, err = tx.exec(`UPDATE conversations SET agent_thread_id=? WHERE id=?`, threadID, conversationID)
+		return err
+	})
+}
+
+// BindAgentThreadAtCursor adopts a private thread whose prior completed turns
+// were verified by the caller. The thread and historical cursor commit in one
+// transaction, before any gateway turn can be submitted. It only initializes
+// an unbound conversation without ledger turns. An exact retry is idempotent.
+func (s *Store) BindAgentThreadAtCursor(ctx context.Context, conversationID, threadID, cursor string) error {
+	if conversationID == "" || threadID == "" {
+		return ErrInvalid
+	}
+	return s.write(ctx, func(tx *writeTx) error {
+		var existing, currentCursor string
+		err := tx.row(`SELECT agent_thread_id,last_external_turn_id FROM conversations WHERE id=?`, conversationID).
+			Scan(&existing, &currentCursor)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return ErrStorage
+		}
+		var turns, owners int
+		if err := tx.row(`SELECT count(*) FROM turns WHERE conversation_id=?`, conversationID).Scan(&turns); err != nil {
+			return ErrStorage
+		}
+		if turns != 0 {
+			return ErrConflict
+		}
+		if existing != "" {
+			if existing == threadID && currentCursor == cursor {
+				return nil
+			}
+			return ErrConflict
+		}
+		if currentCursor != "" {
+			return ErrConflict
+		}
+		if err := tx.row(`SELECT count(*) FROM conversations WHERE agent_thread_id=? AND id<>?`,
+			threadID, conversationID).Scan(&owners); err != nil {
+			return ErrStorage
+		}
+		if owners != 0 {
+			return ErrConflict
+		}
+		_, err = tx.exec(`UPDATE conversations SET agent_thread_id=?,last_external_turn_id=? WHERE id=?`,
+			threadID, cursor, conversationID)
 		return err
 	})
 }

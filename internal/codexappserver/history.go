@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 )
 
-// History is the complete stored thread history returned by thread/read.
-// Turns retain the server's chronological order and authoritative IDs.
+const historyTurnPageSize = 32
+const historyItemPageSize = 8
+
+// History is the complete stored thread history. Turns retain the server's
+// chronological order and authoritative IDs/statuses. Reply is deliberately
+// not loaded; recovery requests it only for a matched completed candidate.
 type History struct {
 	ThreadID string
 	Turns    []HistoryTurn
@@ -19,112 +23,209 @@ type HistoryTurn struct {
 	Reply  string
 }
 
-// ReadThread inspects stored turns without resuming or subscribing to a thread.
-// Partial item views and structurally ambiguous responses fail closed.
+// ReadThread pages turn metadata without loading items. A server without turn
+// pagination fails closed; full-history thread/read is not a fallback.
 func (c *Client) ReadThread(ctx context.Context, id string) (History, error) {
 	if id == "" {
-		return History{}, &Error{Invalid, "thread/read"}
+		return History{}, &Error{Invalid, "thread/turns/list"}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
-	raw, err := c.request(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": true}, nil)
-	if err != nil {
-		_ = c.Close()
-		return History{}, err
-	}
-	h, err := decodeHistory(raw, id)
+	h, err := c.readThread(ctx, id)
 	if err != nil {
 		_ = c.Close()
 	}
 	return h, err
 }
 
-func decodeHistory(raw json.RawMessage, requestedID string) (History, error) {
-	bad := &Error{Protocol, "thread/read"}
-	var response struct {
-		Thread struct {
-			ID     string `json:"id"`
-			Status struct {
-				Type string `json:"type"`
-			} `json:"status"`
-			Turns json.RawMessage `json:"turns"`
-		} `json:"thread"`
-	}
-	if json.Unmarshal(raw, &response) != nil || response.Thread.ID != requestedID || !isArray(response.Thread.Turns) {
-		return History{}, bad
-	}
-	switch response.Thread.Status.Type {
-	case "notLoaded", "idle", "active", "systemError":
-	default:
-		return History{}, bad
-	}
-	var turns []json.RawMessage
-	if json.Unmarshal(response.Thread.Turns, &turns) != nil {
-		return History{}, bad
-	}
-	h := History{ThreadID: response.Thread.ID, Turns: make([]HistoryTurn, 0, len(turns))}
-	seen := make(map[string]bool, len(turns))
-	for i, rawTurn := range turns {
-		var turn struct {
-			ID        string          `json:"id"`
-			Status    string          `json:"status"`
-			ItemsView json.RawMessage `json:"itemsView"`
-			Items     json.RawMessage `json:"items"`
+func (c *Client) readThread(ctx context.Context, id string) (History, error) {
+	const op = "thread/turns/list"
+	bad := &Error{Protocol, op}
+	h := History{ThreadID: id}
+	seenCursors := make(map[string]bool)
+	seenTurns := make(map[string]bool)
+	cursor := ""
+	seenInProgress := false
+	for {
+		params := map[string]any{"threadId": id, "limit": historyTurnPageSize, "sortDirection": "asc", "itemsView": "notLoaded"}
+		if cursor != "" {
+			params["cursor"] = cursor
 		}
-		if json.Unmarshal(rawTurn, &turn) != nil || turn.ID == "" || seen[turn.ID] || !isArray(turn.Items) || len(turn.ItemsView) != 0 && string(bytes.TrimSpace(turn.ItemsView)) != `"full"` {
+		raw, err := c.request(ctx, op, params, nil)
+		if err != nil {
+			return History{}, err
+		}
+		data, next, err := decodeHistoryPage(raw, op)
+		if err != nil || len(data) > historyTurnPageSize || next != "" && len(data) == 0 {
 			return History{}, bad
 		}
-		seen[turn.ID] = true
-		switch turn.Status {
-		case "completed", "failed", "interrupted":
-		case "inProgress":
-			if i != len(turns)-1 {
+		for _, entry := range data {
+			var turn struct {
+				ID        string          `json:"id"`
+				Status    string          `json:"status"`
+				ItemsView string          `json:"itemsView"`
+				Items     json.RawMessage `json:"items"`
+			}
+			if json.Unmarshal(entry, &turn) != nil || turn.ID == "" || seenTurns[turn.ID] || seenInProgress || turn.ItemsView != "notLoaded" || !isEmptyArray(turn.Items) {
 				return History{}, bad
 			}
-		default:
-			return History{}, bad
-		}
-		var items []json.RawMessage
-		if json.Unmarshal(turn.Items, &items) != nil {
-			return History{}, bad
-		}
-		messages := make([]Message, 0)
-		itemIDs := make(map[string]bool, len(items))
-		for _, rawItem := range items {
-			var item struct {
-				Type  string  `json:"type"`
-				ID    string  `json:"id"`
-				Text  *string `json:"text"`
-				Phase string  `json:"phase"`
-			}
-			if json.Unmarshal(rawItem, &item) != nil || item.Type == "" || item.ID == "" || itemIDs[item.ID] {
+			switch turn.Status {
+			case "completed", "failed", "interrupted":
+			case "inProgress":
+				seenInProgress = true
+			default:
 				return History{}, bad
 			}
-			itemIDs[item.ID] = true
-			if item.Type == "agentMessage" {
-				if item.Text == nil {
-					return History{}, bad
-				}
-				switch item.Phase {
-				case "", "commentary", "final_answer":
-				default:
-					return History{}, bad
-				}
-				messages = append(messages, Message{ID: item.ID, Text: *item.Text, Phase: item.Phase})
-			}
+			seenTurns[turn.ID] = true
+			h.Turns = append(h.Turns, HistoryTurn{ID: turn.ID, Status: turn.Status})
 		}
-		h.Turns = append(h.Turns, HistoryTurn{ID: turn.ID, Status: turn.Status, Reply: finalText(messages)})
-	}
-	lastInProgress := len(h.Turns) > 0 && h.Turns[len(h.Turns)-1].Status == "inProgress"
-	if (response.Thread.Status.Type == "active") != lastInProgress {
-		return History{}, bad
+		if next == "" {
+			break
+		}
+		if seenInProgress || seenCursors[next] {
+			return History{}, bad
+		}
+		seenCursors[next] = true
+		cursor = next
 	}
 	return h, nil
+}
+
+// ReadTurnReply hydrates only one known turn. A legacy thread store that cannot
+// page items is still usable for metadata checks, but a completed recovery
+// candidate cannot be confirmed without this authoritative reply read.
+func (c *Client) ReadTurnReply(ctx context.Context, threadID, turnID string) (string, error) {
+	if threadID == "" || turnID == "" {
+		return "", &Error{Invalid, "thread/items/list"}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
+	reply, err := c.readTurnReply(ctx, threadID, turnID)
+	if err != nil {
+		_ = c.Close()
+	}
+	return reply, err
+}
+
+func (c *Client) readTurnReply(ctx context.Context, threadID, turnID string) (string, error) {
+	const op = "thread/items/list"
+	bad := &Error{Protocol, op}
+	seenCursors := make(map[string]bool)
+	seenItems := make(map[string]bool)
+	cursor, reply := "", ""
+	hasFinal := false
+	for {
+		params := map[string]any{"threadId": threadID, "turnId": turnID, "limit": historyItemPageSize, "sortDirection": "asc"}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		raw, err := c.request(ctx, op, params, nil)
+		if err != nil {
+			return "", err
+		}
+		data, next, err := decodeHistoryPage(raw, op)
+		if err != nil || len(data) > historyItemPageSize || next != "" && len(data) == 0 {
+			return "", bad
+		}
+		for _, entry := range data {
+			var record struct {
+				TurnID string          `json:"turnId"`
+				Item   json.RawMessage `json:"item"`
+			}
+			var item struct {
+				Type  string          `json:"type"`
+				ID    string          `json:"id"`
+				Text  *string         `json:"text"`
+				Phase json.RawMessage `json:"phase"`
+			}
+			if json.Unmarshal(entry, &record) != nil || record.TurnID != turnID || json.Unmarshal(record.Item, &item) != nil || item.Type == "" || item.ID == "" || seenItems[item.ID] {
+				return "", bad
+			}
+			seenItems[item.ID] = true
+			if item.Type != "agentMessage" {
+				continue
+			}
+			if item.Text == nil {
+				return "", bad
+			}
+			phase := ""
+			if len(item.Phase) != 0 && !bytes.Equal(bytes.TrimSpace(item.Phase), []byte("null")) && json.Unmarshal(item.Phase, &phase) != nil {
+				return "", bad
+			}
+			switch phase {
+			case "":
+				if !hasFinal {
+					reply = *item.Text
+				}
+			case "commentary":
+			case "final_answer":
+				reply, hasFinal = *item.Text, true
+			default:
+				return "", bad
+			}
+		}
+		if next == "" {
+			return reply, nil
+		}
+		if seenCursors[next] {
+			return "", bad
+		}
+		seenCursors[next] = true
+		cursor = next
+	}
+}
+
+// decodeHistoryPage requires the complete pagination envelope. Missing fields,
+// null data, invalid cursors, and partial pages are not equivalent to an empty
+// history, because treating them as such could replay an uncertain submission.
+func decodeHistoryPage(raw json.RawMessage, op string) ([]json.RawMessage, string, error) {
+	bad := &Error{Protocol, op}
+	var page struct {
+		Data            json.RawMessage `json:"data"`
+		NextCursor      json.RawMessage `json:"nextCursor"`
+		BackwardsCursor json.RawMessage `json:"backwardsCursor"`
+	}
+	if json.Unmarshal(raw, &page) != nil || !isArray(page.Data) || len(page.NextCursor) == 0 || len(page.BackwardsCursor) == 0 {
+		return nil, "", bad
+	}
+	var data []json.RawMessage
+	if json.Unmarshal(page.Data, &data) != nil {
+		return nil, "", bad
+	}
+	next, ok := nullableCursor(page.NextCursor)
+	if !ok {
+		return nil, "", bad
+	}
+	if _, ok := nullableCursor(page.BackwardsCursor); !ok {
+		return nil, "", bad
+	}
+	return data, next, nil
+}
+
+func nullableCursor(raw json.RawMessage) (string, bool) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", true
+	}
+	var cursor string
+	if json.Unmarshal(raw, &cursor) != nil || cursor == "" {
+		return "", false
+	}
+	return cursor, true
 }
 
 func isArray(raw json.RawMessage) bool {
 	b := bytes.TrimSpace(raw)
 	return len(b) != 0 && b[0] == '['
+}
+
+func isEmptyArray(raw json.RawMessage) bool {
+	if !isArray(raw) {
+		return false
+	}
+	var values []json.RawMessage
+	return json.Unmarshal(raw, &values) == nil && len(values) == 0
 }

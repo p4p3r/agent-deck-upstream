@@ -4,6 +4,7 @@ Manage named conductor sessions for meta-agent orchestration.
 Multiple conductors can exist per profile.
 
 Commands:
+  slack-v2 run <name> --create|--resume <thread-id>  Run the selected Slack-v2 backend
   setup <name>     Set up a named conductor
   teardown <name>  Stop and optionally remove a conductor (or --all)
   status [name]    Show conductor health (all or specific)

@@ -65,6 +65,107 @@ func TestAgentThreadCannotBindTwoConversations(t *testing.T) {
 	require.NoError(t, s.BindAgentThread(ctx, "second", "other-thread"))
 }
 
+func TestBindAgentThreadAtCursorIsAtomicAndImmutable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "adopt.db")
+	s, err := Open(path)
+	require.NoError(t, err)
+	defer s.Close()
+	require.NoError(t, s.CreateConversation(ctx, Conversation{
+		ID: "conversation", ChannelID: "channel", ConductorID: "conductor",
+		Mode: ChannelStream, AllowedSenders: []string{"alice"},
+	}))
+	require.NoError(t, s.BindAgentThreadAtCursor(ctx, "conversation", "legacy-thread", "historical-turn"))
+	require.NoError(t, s.BindAgentThreadAtCursor(ctx, "conversation", "legacy-thread", "historical-turn"))
+	require.ErrorIs(t, s.BindAgentThreadAtCursor(ctx, "conversation", "legacy-thread", "different-turn"), ErrConflict)
+	require.ErrorIs(t, s.BindAgentThreadAtCursor(ctx, "conversation", "different-thread", "historical-turn"), ErrConflict)
+	require.NoError(t, s.Close())
+	s, err = Open(path)
+	require.NoError(t, err)
+	b, err := s.AgentBinding(ctx, "conversation")
+	require.NoError(t, err)
+	require.Equal(t, Binding{AgentThreadID: "legacy-thread", LastExternalTurnID: "historical-turn"}, b)
+}
+
+func TestEmptyCreateReplacementAllowsQueuedInboundButNoTurnEvidence(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "replace.db")
+	s, err := Open(path)
+	require.NoError(t, err)
+	defer s.Close()
+	require.NoError(t, s.CreateConversation(ctx, Conversation{
+		ID: "conversation", ChannelID: "channel", ConductorID: "conductor", Mode: ChannelStream,
+		AllowedSenders: []string{"alice"},
+	}))
+	require.NoError(t, s.BindAgentThreadAtCursor(ctx, "conversation", "old-thread", ""))
+	_, err = s.Ingest(ctx, Inbound{ConversationID: "conversation", EventID: "queued", MessageID: "message",
+		ChannelID: "channel", SenderID: "alice", Body: "private prompt"})
+	require.NoError(t, err)
+	safe, err := s.EmptyCreateReplacementSafe(ctx, "conversation", "old-thread")
+	require.NoError(t, err)
+	require.True(t, safe)
+	require.NoError(t, s.ReplaceEmptyCreateThread(ctx, "conversation", "old-thread", "new-thread"))
+	binding, err := s.AgentBinding(ctx, "conversation")
+	require.NoError(t, err)
+	require.Equal(t, Binding{AgentThreadID: "new-thread"}, binding)
+	turn, err := s.NextTurn(ctx, "conversation")
+	require.NoError(t, err)
+	require.NotNil(t, turn)
+	safe, err = s.EmptyCreateReplacementSafe(ctx, "conversation", "new-thread")
+	require.NoError(t, err)
+	require.False(t, safe)
+	require.ErrorIs(t, s.ReplaceEmptyCreateThread(ctx, "conversation", "new-thread", "third-thread"), ErrConflict)
+}
+
+func TestEmptyCreateReplacementRejectsAllAttemptStates(t *testing.T) {
+	for _, state := range []AttemptState{Unprepared, Prepared, AttemptAccepted, NeedsReconciliation, AttemptCompleted} {
+		t.Run(string(state), func(t *testing.T) {
+			s, _, turn := attemptFixture(t)
+			ctx := context.Background()
+			require.NoError(t, s.BindAgentThread(ctx, "conversation", "old-thread"))
+			if state != Unprepared {
+				a, created, err := s.PrepareAttempt(ctx, turn.ID, "")
+				require.NoError(t, err)
+				require.True(t, created)
+				switch state {
+				case AttemptAccepted:
+					require.NoError(t, s.AcceptAttempt(ctx, turn.ID, a.ID, "external"))
+				case NeedsReconciliation:
+					require.NoError(t, s.MarkNeedsReconciliation(ctx, turn.ID, a.ID, Prepared))
+				case AttemptCompleted:
+					require.NoError(t, s.AcceptAttempt(ctx, turn.ID, a.ID, "external"))
+					_, err = s.CompleteAttempt(ctx, turn.ID, a.ID, "external", "reply")
+					require.NoError(t, err)
+				}
+			}
+			safe, err := s.EmptyCreateReplacementSafe(ctx, "conversation", "old-thread")
+			require.NoError(t, err)
+			require.False(t, safe)
+			require.ErrorIs(t, s.ReplaceEmptyCreateThread(ctx, "conversation", "old-thread", "new-thread"), ErrConflict)
+		})
+	}
+}
+
+func TestValidateCursorChainDetectsCompletedLinkCorruption(t *testing.T) {
+	s, _, turn := attemptFixture(t)
+	ctx := context.Background()
+	require.NoError(t, s.BindAgentThread(ctx, "conversation", "thread-1"))
+	a, created, err := s.PrepareAttempt(ctx, turn.ID, "")
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, s.AcceptAttempt(ctx, turn.ID, a.ID, "external-1"))
+	_, err = s.CompleteAttempt(ctx, turn.ID, a.ID, "external-1", "reply")
+	require.NoError(t, err)
+	chain, err := s.ValidateCursorChain(ctx, "conversation", "thread-1", "")
+	require.NoError(t, err)
+	require.Equal(t, []string{"external-1"}, chain.Completed)
+	require.Nil(t, chain.Active)
+	_, err = s.db.ExecContext(ctx, `UPDATE turns SET baseline_turn_id='fork' WHERE id=?`, turn.ID)
+	require.NoError(t, err)
+	_, err = s.ValidateCursorChain(ctx, "conversation", "thread-1", "")
+	require.ErrorIs(t, err, ErrConflict)
+}
+
 func TestAttemptTransitionsRecoverAndDeduplicateOutbox(t *testing.T) {
 	s, path, turn := attemptFixture(t)
 	ctx := context.Background()

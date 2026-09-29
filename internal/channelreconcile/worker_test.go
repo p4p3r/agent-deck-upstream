@@ -21,9 +21,11 @@ type fakeDriver struct {
 	resumeCount      int
 	startCount       int
 	inspectCount     int
+	replyCount       int
 	openErr          error
 	onOpen           func()
 	inspectErr       error
+	replyErr         error
 	onInspect        func()
 	startErr         error
 	afterAcceptedErr error
@@ -61,6 +63,21 @@ func (f *fakeDriver) InspectThread(context.Context, string) ([]ExternalTurn, err
 		hook()
 	}
 	return turns, err
+}
+
+func (f *fakeDriver) ReplyForTurn(_ context.Context, _, turnID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replyCount++
+	if f.replyErr != nil {
+		return "", f.replyErr
+	}
+	for _, turn := range f.turns {
+		if turn.ID == turnID {
+			return turn.Reply, nil
+		}
+	}
+	return "", errors.New("missing fake reply")
 }
 
 func (f *fakeDriver) StartTurn(_ context.Context, _ string, _ string, accepted func(string) error) (ExternalTurn, error) {
@@ -264,6 +281,52 @@ func TestPreparedInspectErrorNeverResubmits(t *testing.T) {
 	require.Zero(t, starts)
 }
 
+func TestPreSubmitDoesNotNeedReplyPagination(t *testing.T) {
+	s, _ := workerFixture(t)
+	ctx := context.Background()
+	require.NoError(t, s.BindAgentThread(ctx, "conversation", "thread-1"))
+	f := &fakeDriver{callback: true, replyErr: errors.New("unsupported item pagination")}
+	r, err := (&Worker{Store: s, Driver: f}).RunOne(ctx, "conversation")
+	require.NoError(t, err)
+	require.Equal(t, Completed, r.State)
+	require.Zero(t, f.replyCount)
+	_, _, starts := f.counts()
+	require.Equal(t, 1, starts)
+}
+
+func TestCompletedRecoveryFailsClosedWithoutReplyPagination(t *testing.T) {
+	s, _ := workerFixture(t)
+	ctx := context.Background()
+	turn := activeTurn(t, s)
+	require.NoError(t, s.BindAgentThread(ctx, "conversation", "thread-1"))
+	a, created, err := s.PrepareAttempt(ctx, turn.ID, "")
+	require.NoError(t, err)
+	require.True(t, created)
+	f := &fakeDriver{callback: true, turns: []ExternalTurn{{ID: "external-1", Status: "completed", Reply: "private reply"}},
+		replyErr: errors.New("unsupported item pagination: private provider detail")}
+	r, err := (&Worker{Store: s, Driver: f}).RunOne(ctx, "conversation")
+	require.ErrorIs(t, err, ErrDriver)
+	require.Equal(t, NeedsReconciliation, r.State)
+	require.NotContains(t, err.Error(), "private provider detail")
+	require.Equal(t, 1, f.replyCount)
+	_, _, starts := f.counts()
+	require.Zero(t, starts)
+	current, complete, err := s.AttemptStatus(ctx, turn.ID)
+	require.NoError(t, err)
+	require.Equal(t, a.ID, current.ID)
+	require.Equal(t, channelgateway.Prepared, current.State)
+	require.False(t, complete)
+	items, err := s.PendingOutbox(ctx, "conversation", 10)
+	require.NoError(t, err)
+	require.Empty(t, items)
+	f.replyErr = nil
+	r, err = (&Worker{Store: s, Driver: f}).RunOne(ctx, "conversation")
+	require.NoError(t, err)
+	require.Equal(t, Completed, r.State)
+	_, _, starts = f.counts()
+	require.Zero(t, starts)
+}
+
 func TestStaleInspectionReportsPersistedCallbackOrCompletion(t *testing.T) {
 	for _, tc := range []struct {
 		name, want string
@@ -366,6 +429,7 @@ func TestUncertainOrFailedExternalResultRemainsUnresolved(t *testing.T) {
 			}
 			_, _, starts := f.counts()
 			require.Zero(t, starts)
+			require.Zero(t, f.replyCount)
 			items, err := s.PendingOutbox(ctx, "conversation", 10)
 			require.NoError(t, err)
 			require.Empty(t, items)

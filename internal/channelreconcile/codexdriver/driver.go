@@ -83,6 +83,19 @@ func (d *Driver) InspectThread(ctx context.Context, id string) ([]channelreconci
 	return turns, err
 }
 
+func (d *Driver) ReplyForTurn(ctx context.Context, threadID, turnID string) (string, error) {
+	if threadID == "" || turnID == "" {
+		return "", &codexappserver.Error{Kind: codexappserver.Invalid, Op: "thread/items/list"}
+	}
+	var reply string
+	err := d.withClient(ctx, func(c *codexappserver.Client) error {
+		var err error
+		reply, err = c.ReadTurnReply(ctx, threadID, turnID)
+		return err
+	})
+	return reply, err
+}
+
 func (d *Driver) StartTurn(ctx context.Context, id, prompt string, accepted func(string) error) (channelreconcile.ExternalTurn, error) {
 	if accepted == nil {
 		return channelreconcile.ExternalTurn{}, &codexappserver.Error{Kind: codexappserver.Invalid, Op: "turn/start"}

@@ -62,11 +62,27 @@ func fakeServer(mode string) {
 	if !ok || method(ack) != "initialized" {
 		os.Exit(6)
 	}
+	if mode == "persistent" {
+		persistentFakeServer(r, w)
+		return
+	}
 	req, ok := next()
 	if !ok {
 		os.Exit(7)
 	}
 	name := method(req)
+	if name == "thread/items/list" {
+		if !strings.Contains(string(req["params"]), `"threadId":"thr_123"`) || !strings.Contains(string(req["params"]), `"turnId":"turn_2"`) {
+			os.Exit(20)
+		}
+		if mode == "item_unsupported" {
+			_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "error": map[string]any{"code": -32601, "message": "private item-store error"}})
+			return
+		}
+		_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "result": fakeItemsResponse(mode)})
+		_, _ = r.ReadBytes('\n')
+		return
+	}
 	if name == "thread/start" || name == "thread/resume" {
 		if name == "thread/start" && mode != "open" {
 			os.Exit(8)
@@ -120,14 +136,16 @@ func fakeServer(mode string) {
 		_, _ = r.ReadBytes('\n')
 		return
 	}
-	if name != "thread/read" {
+	if name != "thread/turns/list" {
 		os.Exit(15)
 	}
 	var read struct {
-		ThreadID     string `json:"threadId"`
-		IncludeTurns bool   `json:"includeTurns"`
+		ThreadID      string `json:"threadId"`
+		Limit         int    `json:"limit"`
+		SortDirection string `json:"sortDirection"`
+		ItemsView     string `json:"itemsView"`
 	}
-	if json.Unmarshal(req["params"], &read) != nil || read.ThreadID != "thr_123" || !read.IncludeTurns {
+	if json.Unmarshal(req["params"], &read) != nil || read.ThreadID != "thr_123" || read.Limit != 32 || read.SortDirection != "asc" || read.ItemsView != "notLoaded" {
 		os.Exit(16)
 	}
 	if mode == "inspect_block" {
@@ -143,32 +161,34 @@ func fakeServer(mode string) {
 		_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "error": map[string]any{"code": -1, "message": "private-server-error"}})
 		return
 	}
-	_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "result": fakeReadResponse(mode)})
+	_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "result": fakeTurnsResponse(mode)})
+	req, ok = next()
+	if !ok { // Invalid turn pages close the connection before item hydration.
+		return
+	}
+	if method(req) != "thread/items/list" || !strings.Contains(string(req["params"]), `"threadId":"thr_123"`) {
+		os.Exit(19)
+	}
+	_ = w.Encode(map[string]any{"id": json.RawMessage(req["id"]), "result": fakeItemsResponse(mode)})
 	_, _ = r.ReadBytes('\n')
 }
 
-func fakeReadResponse(mode string) map[string]any {
-	message := func(id, text, phase string) map[string]string {
-		return map[string]string{"type": "agentMessage", "id": id, "text": text, "phase": phase}
+func fakeTurnsResponse(mode string) map[string]any {
+	turn := func(id, status string) map[string]any {
+		return map[string]any{"id": id, "status": status, "itemsView": "notLoaded", "items": []any{}}
 	}
-	turn := func(id, status string, items []any) map[string]any {
-		return map[string]any{"id": id, "status": status, "items": items}
-	}
-	first := turn("turn_1", "completed", []any{message("m1", "working", "commentary"), message("m2", "fallback", ""), message("m3", "final one", "final_answer"), message("m4", "later commentary", "commentary")})
-	second := turn("turn_2", "completed", []any{message("m5", "fallback two", "")})
-	thread := map[string]any{"id": "thr_123", "status": map[string]string{"type": "idle"}, "turns": []any{first, second}}
+	first := turn("turn_1", "completed")
+	second := turn("turn_2", "completed")
+	result := map[string]any{"data": []any{first, second}, "nextCursor": nil, "backwardsCursor": "back"}
 	switch mode {
 	case "statuses":
-		thread["status"] = map[string]string{"type": "active"}
-		thread["turns"] = []any{turn("turn_1", "failed", []any{}), turn("turn_2", "interrupted", []any{}), turn("turn_3", "inProgress", []any{})}
+		result["data"] = []any{turn("turn_1", "failed"), turn("turn_2", "interrupted"), turn("turn_3", "inProgress")}
 	case "missing_turns":
-		delete(thread, "turns")
+		delete(result, "data")
 	case "null_turns":
-		thread["turns"] = nil
+		result["data"] = nil
 	case "duplicate_turn":
-		thread["turns"] = []any{first, first}
-	case "mismatched_thread":
-		thread["id"] = "other_thread"
+		result["data"] = []any{first, first}
 	case "summary_items":
 		first["itemsView"] = "summary"
 	case "null_items_view":
@@ -177,25 +197,36 @@ func fakeReadResponse(mode string) map[string]any {
 		first["itemsView"] = "full"
 	case "missing_items":
 		delete(first, "items")
-	case "duplicate_item":
-		first["items"] = []any{message("m1", "one", ""), message("m1", "two", "final_answer")}
-	case "missing_text":
-		first["items"] = []any{map[string]string{"type": "agentMessage", "id": "m1"}}
 	case "bad_status":
 		first["status"] = "unknown"
 	case "out_of_order_active":
 		first["status"] = "inProgress"
-	case "active_missing":
-		thread["status"] = map[string]string{"type": "active"}
-		thread["turns"] = []any{}
-	case "idle_in_progress", "not_loaded_in_progress", "system_error_in_progress":
-		status := map[string]string{
-			"idle_in_progress": "idle", "not_loaded_in_progress": "notLoaded", "system_error_in_progress": "systemError",
-		}[mode]
-		thread["status"] = map[string]string{"type": status}
-		thread["turns"] = []any{turn("turn_1", "inProgress", []any{})}
+	case "nonchronological":
+		result["data"] = []any{second, first}
+	case "missing_cursor":
+		delete(result, "nextCursor")
 	}
-	return map[string]any{"thread": thread}
+	return result
+}
+
+func fakeItemsResponse(mode string) map[string]any {
+	turnID := "turn_2"
+	if mode == "statuses" {
+		turnID = "turn_3"
+	}
+	item := func(id, text, phase string) map[string]any {
+		return map[string]any{"turnId": turnID, "item": map[string]any{"type": "agentMessage", "id": id, "text": text, "phase": phase}}
+	}
+	data := []any{item("m1", "working", "commentary"), item("m2", "fallback two", "")}
+	switch mode {
+	case "duplicate_item":
+		data = []any{item("m1", "one", ""), item("m1", "two", "final_answer")}
+	case "missing_text":
+		data = []any{map[string]any{"turnId": turnID, "item": map[string]any{"type": "agentMessage", "id": "m1", "phase": "final_answer"}}}
+	case "mismatched_item_turn":
+		data[0].(map[string]any)["turnId"] = "other_turn"
+	}
+	return map[string]any{"data": data, "nextCursor": nil, "backwardsCursor": "back"}
 }
 
 func fakeDriver(t *testing.T, mode string, cfg Config) *Driver {
@@ -252,8 +283,13 @@ func TestNewReadResumeAndStart(t *testing.T) {
 	assertReaped(t, pidPath)
 	t.Setenv("AGENT_DECK_CODEXDRIVER_MODE", "read")
 	turns, err := d.InspectThread(context.Background(), id)
-	if err != nil || len(turns) != 2 || turns[0].ID != "turn_1" || turns[0].Status != "completed" || turns[0].Reply != "final one" || turns[1].ID != "turn_2" || turns[1].Reply != "fallback two" {
+	if err != nil || len(turns) != 2 || turns[0].ID != "turn_1" || turns[0].Status != "completed" || turns[0].Reply != "" || turns[1].ID != "turn_2" || turns[1].Reply != "" {
 		t.Fatalf("InspectThread = %+v, %v", turns, err)
+	}
+	assertReaped(t, pidPath)
+	reply, err := d.ReplyForTurn(context.Background(), id, "turn_2")
+	if err != nil || reply != "fallback two" {
+		t.Fatalf("ReplyForTurn = %q, %v", reply, err)
 	}
 	assertReaped(t, pidPath)
 	t.Setenv("AGENT_DECK_CODEXDRIVER_MODE", "resume")
@@ -283,15 +319,11 @@ func TestHistoryStatuses(t *testing.T) {
 	}
 }
 
-func TestHistoryItemsViewFullControls(t *testing.T) {
-	for _, mode := range []string{"read", "full_items_view"} {
-		t.Run(mode, func(t *testing.T) {
-			d := fakeDriver(t, mode, Config{})
-			turns, err := d.InspectThread(context.Background(), "thr_123")
-			if err != nil || len(turns) != 2 || turns[0].Reply != "final one" {
-				t.Fatalf("turns = %+v, %v", turns, err)
-			}
-		})
+func TestHistoryUsesNotLoadedTurnMetadata(t *testing.T) {
+	d := fakeDriver(t, "read", Config{})
+	turns, err := d.InspectThread(context.Background(), "thr_123")
+	if err != nil || len(turns) != 2 || turns[0].Reply != "" || turns[1].Reply != "" {
+		t.Fatalf("turns = %+v, %v", turns, err)
 	}
 }
 
@@ -309,19 +341,44 @@ func TestStartTurnTerminalStatuses(t *testing.T) {
 }
 
 func TestRejectIncompleteOrMismatchedHistory(t *testing.T) {
-	for _, mode := range []string{"missing_turns", "null_turns", "duplicate_turn", "mismatched_thread", "summary_items", "null_items_view", "missing_items", "duplicate_item", "missing_text", "bad_status", "out_of_order_active", "active_missing", "idle_in_progress", "not_loaded_in_progress", "system_error_in_progress"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		mode  string
+		items bool
+	}{
+		{"missing_turns", false}, {"null_turns", false}, {"duplicate_turn", false},
+		{"nonchronological", false}, {"summary_items", false}, {"null_items_view", false},
+		{"full_items_view", false}, {"missing_items", false}, {"bad_status", false},
+		{"out_of_order_active", false}, {"missing_cursor", false},
+		{"duplicate_item", true}, {"missing_text", true}, {"mismatched_item_turn", true},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
 			pidPath := filepath.Join(t.TempDir(), "pid")
 			t.Setenv("AGENT_DECK_CODEXDRIVER_PID_PATH", pidPath)
-			d := fakeDriver(t, mode, Config{})
+			d := fakeDriver(t, tc.mode, Config{})
 			turns, err := d.InspectThread(context.Background(), "thr_123")
+			if tc.items {
+				if err != nil || len(turns) != 2 {
+					t.Fatalf("metadata history = %+v, %v", turns, err)
+				}
+				_, err = d.ReplyForTurn(context.Background(), "thr_123", "turn_2")
+			}
 			checkKind(t, err, codexappserver.Protocol)
-			if len(turns) != 0 || strings.Contains(err.Error(), "working") {
+			if !tc.items && len(turns) != 0 || strings.Contains(err.Error(), "working") {
 				t.Fatalf("unsafe history result = %+v, %v", turns, err)
 			}
 			assertReaped(t, pidPath)
 		})
 	}
+}
+
+func TestMetadataInspectionWithoutItemPagination(t *testing.T) {
+	d := fakeDriver(t, "item_unsupported", Config{})
+	turns, err := d.InspectThread(context.Background(), "thr_123")
+	if err != nil || len(turns) != 2 || turns[1].ID != "turn_2" || turns[1].Reply != "" {
+		t.Fatalf("metadata history = %+v, %v", turns, err)
+	}
+	_, err = d.ReplyForTurn(context.Background(), "thr_123", "turn_2")
+	checkKind(t, err, codexappserver.ServerError)
 }
 
 func TestAcceptanceFailureStopsBeforeCompletion(t *testing.T) {

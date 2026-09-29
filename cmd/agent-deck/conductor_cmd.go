@@ -43,6 +43,8 @@ func handleConductor(profile string, args []string) {
 	}
 
 	switch args[0] {
+	case "slack-v2":
+		os.Exit(runConductorSlackV2Command(profile, args[1:], os.Stdout, os.Stderr))
 	case "setup":
 		handleConductorSetup(profile, args[1:])
 	case "teardown":
@@ -1482,6 +1484,7 @@ func printConductorHelp() {
 	fmt.Println("Multiple conductors can exist per profile.")
 	fmt.Println()
 	fmt.Println("Commands:")
+	fmt.Println("  slack-v2 run <name> --create|--resume <thread-id>  Run the selected Slack-v2 backend")
 	fmt.Println("  setup <name>     Set up a named conductor")
 	fmt.Println("  teardown <name>  Stop and optionally remove a conductor (or --all)")
 	fmt.Println("  status [name]    Show conductor health (all or specific)")

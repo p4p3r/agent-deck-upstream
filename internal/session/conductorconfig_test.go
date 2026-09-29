@@ -58,6 +58,58 @@ func writeConductorConfig(t *testing.T, tmpHome, body string) {
 	ClearUserConfigCache()
 }
 
+func TestConductorBackendAndSlackV2Config(t *testing.T) {
+	home := setupConductorTest(t)
+	writeConductorConfig(t, home, `
+[conductors.v2]
+backend = "slack-v2"
+[conductors.v2.slack_v2]
+app_token = "xapp-test"
+bot_token = "xoxb-test"
+channel_id = "C123"
+allowed_user_ids = ["U1", "U2"]
+codex_executable = "/bin/codex"
+codex_model = "model-test"
+[conductors.old]
+backend = "legacy"
+`)
+	for name, want := range map[string]string{"v2": ConductorBackendSlackV2, "old": ConductorBackendLegacy, "unset": ConductorBackendLegacy} {
+		got, err := ConductorBackend(name)
+		if err != nil || got != want {
+			t.Fatalf("ConductorBackend(%q) = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	got, err := ConductorSlackV2Config("v2")
+	if err != nil || got.AppToken != "xapp-test" || got.BotToken != "xoxb-test" || got.ChannelID != "C123" ||
+		got.CodexExecutable != "/bin/codex" || got.CodexModel != "model-test" || len(got.AllowedUserIDs) != 2 {
+		t.Fatalf("Slack v2 config did not round-trip: %+v, %v", got, err)
+	}
+	got.AllowedUserIDs[0] = "changed"
+	again, err := ConductorSlackV2Config("v2")
+	if err != nil || again.AllowedUserIDs[0] != "U1" {
+		t.Fatalf("Slack v2 config escaped the cache by alias: %+v, %v", again, err)
+	}
+	if _, err := ConductorSlackV2Config("old"); err == nil {
+		t.Fatal("legacy backend returned Slack v2 config")
+	}
+}
+
+func TestConductorBackendFailsClosed(t *testing.T) {
+	home := setupConductorTest(t)
+	writeConductorConfig(t, home, `[conductors.v2]
+backend = "surprise"
+`)
+	if _, err := ConductorBackend("v2"); err == nil {
+		t.Fatal("unknown backend was accepted")
+	}
+	writeConductorConfig(t, home, `[conductors.v2]
+backend = [
+`)
+	if _, err := ConductorBackend("v2"); err == nil {
+		t.Fatal("unreadable config defaulted to legacy")
+	}
+}
+
 // TestConductorConfig_SchemaParses locks CFG-11 test 1: the nested
 // [conductors.<name>.claude] TOML block parses into
 // UserConfig.Conductors[<name>].Claude.{ConfigDir,EnvFile} and the

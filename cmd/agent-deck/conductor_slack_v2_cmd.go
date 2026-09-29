@@ -1,0 +1,145 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+var errSlackV2Configuration = errors.New("slack-v2 configuration is unavailable")
+
+type slackV2RunArgs struct {
+	name     string
+	mode     channelruntime.Mode
+	threadID string
+}
+
+func isConductorSlackV2Command(args []string) bool {
+	return len(args) >= 2 && args[0] == "conductor" && args[1] == "slack-v2"
+}
+
+func printConductorSlackV2Help(w io.Writer) {
+	fmt.Fprintln(w, "Usage: agent-deck [-p profile] conductor slack-v2 run <name> (--create | --resume <thread-id>)")
+	fmt.Fprintln(w, "Run a conductor whose backend is explicitly set to slack-v2.")
+}
+
+func parseConductorSlackV2Run(args []string) (slackV2RunArgs, error) {
+	var result slackV2RunArgs
+	if len(args) < 2 || args[0] != "run" {
+		return result, errors.New("invalid command")
+	}
+	result.name = args[1]
+	if err := session.ValidateConductorName(result.name); err != nil {
+		return slackV2RunArgs{}, errors.New("invalid conductor name")
+	}
+	fs := flag.NewFlagSet("conductor slack-v2 run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	create := fs.Bool("create", false, "create a new Codex thread")
+	resume := fs.String("resume", "", "resume the exact existing Codex thread")
+	if err := fs.Parse(args[2:]); err != nil {
+		return slackV2RunArgs{}, err
+	}
+	if len(fs.Args()) != 0 || *create == (*resume != "") {
+		return slackV2RunArgs{}, errors.New("select exactly one bootstrap mode")
+	}
+	if *create {
+		result.mode = channelruntime.ModeCreate
+	} else {
+		if strings.TrimSpace(*resume) != *resume {
+			return slackV2RunArgs{}, errors.New("invalid resume id")
+		}
+		result.mode = channelruntime.ModeResume
+		result.threadID = *resume
+	}
+	return result, nil
+}
+
+// runConductorSlackV2Command is also the early main dispatch. It must not
+// initialize update checks, telemetry, events, tmux, or a real user home when
+// only help or argument validation is requested.
+func runConductorSlackV2Command(profile string, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		printConductorSlackV2Help(stdout)
+		return 0
+	}
+	parsed, err := parseConductorSlackV2Run(args)
+	if errors.Is(err, flag.ErrHelp) {
+		printConductorSlackV2Help(stdout)
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "slack-v2: invalid command or bootstrap mode")
+		printConductorSlackV2Help(stderr)
+		return 2
+	}
+	// Resolving the canonical conductor state directory is necessary to name
+	// its singleton lock. No credential fields are accessed until Run acquires
+	// that lock and invokes LoadConfig.
+	dir, err := session.ConductorNameDir(parsed.name)
+	if err != nil {
+		fmt.Fprintln(stderr, "slack-v2: configuration")
+		return 1
+	}
+	req := channelruntime.Request{
+		Name:           parsed.name,
+		ConductorDir:   dir,
+		Mode:           parsed.mode,
+		ResumeThreadID: parsed.threadID,
+		LoadConfig: func() (channelruntime.Config, error) {
+			backend, err := session.ConductorBackend(parsed.name)
+			if err != nil || backend != "slack-v2" {
+				return channelruntime.Config{}, errSlackV2Configuration
+			}
+			meta, err := session.LoadConductorMeta(parsed.name)
+			if err != nil || meta.Name != parsed.name || meta.Agent != session.ConductorAgentCodex || meta.Warning != "" {
+				return channelruntime.Config{}, errSlackV2Configuration
+			}
+			// The storage resolver can print an inferred profile's source path
+			// on fallback. This service command emits only fixed categories;
+			// an inferred mismatch therefore fails closed without that output.
+			selectedProfile := session.GetEffectiveProfile(profile)
+			if meta.Profile != selectedProfile {
+				return channelruntime.Config{}, errSlackV2Configuration
+			}
+			settings, err := session.ConductorSlackV2Config(parsed.name)
+			if err != nil {
+				return channelruntime.Config{}, errSlackV2Configuration
+			}
+			executable := settings.CodexExecutable
+			if executable == "" {
+				executable = "codex"
+			}
+			bindingID := selectedProfile + "/" + parsed.name
+			return channelruntime.Config{
+				ConversationID:  bindingID + "/channel-stream",
+				ConductorID:     bindingID,
+				ChannelID:       settings.ChannelID,
+				AllowedUserIDs:  settings.AllowedUserIDs,
+				AppToken:        settings.AppToken,
+				BotToken:        settings.BotToken,
+				CodexExecutable: executable,
+				CodexCWD:        dir,
+				CodexModel:      settings.CodexModel,
+			}, nil
+		},
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := channelruntime.Run(ctx, req); err != nil {
+		if ctx.Err() != nil {
+			return 0
+		}
+		fmt.Fprintln(stderr, "slack-v2:", channelruntime.KindOf(err))
+		return 1
+	}
+	return 0
+}

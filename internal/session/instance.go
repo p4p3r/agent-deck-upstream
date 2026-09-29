@@ -5062,6 +5062,52 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 // and gate are inlined here (rather than wrapping the whole body in a
 // SpawnAttempt helper) to preserve the structural-grep contract that
 // checks Start()'s body for the #745 IsForkAwaitingStart guard.
+var (
+	ErrLegacyConductorBlocked   = errors.New("named conductor uses slack-v2 backend")
+	ErrConductorIdentityInvalid = errors.New("named conductor identity is invalid")
+)
+
+// LegacyConductorAdmission classifies a session without modifying it. An old
+// conductor row may lack IsConductor, so exact title and named home also count.
+// Ordinary sessions need no conductor config or metadata lookup.
+func LegacyConductorAdmission(i *Instance) error {
+	if i == nil {
+		return ErrConductorIdentityInvalid
+	}
+	if !i.IsConductor && !strings.HasPrefix(i.Title, ConductorSessionTitlePrefix) {
+		return nil
+	}
+	name := strings.TrimPrefix(i.Title, ConductorSessionTitlePrefix)
+	if err := ValidateConductorName(name); err != nil || name == i.Title {
+		if i.IsConductor || i.GroupPath == "conductor" {
+			return ErrConductorIdentityInvalid
+		}
+		return nil
+	}
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		if i.IsConductor || i.GroupPath == "conductor" {
+			return ErrConductorIdentityInvalid
+		}
+		return nil
+	}
+	sameHome := filepath.IsAbs(i.ProjectPath) && filepath.Clean(i.ProjectPath) == filepath.Clean(dir)
+	if !i.IsConductor && i.GroupPath != "conductor" && !sameHome {
+		return nil
+	}
+	if !sameHome || i.ParentSessionID != "" || i.SSHHost != "" || i.IsSandboxed() {
+		return ErrConductorIdentityInvalid
+	}
+	backend, err := ConductorBackend(name)
+	if err != nil {
+		return err
+	}
+	if backend == ConductorBackendSlackV2 {
+		return ErrLegacyConductorBlocked
+	}
+	return nil
+}
+
 func (i *Instance) Start() error {
 	if err := i.ValidateAccount(); err != nil {
 		return err
@@ -5074,6 +5120,9 @@ func (i *Instance) Start() error {
 	defer release()
 	if spawnedSince(i.ID, beforeLock) {
 		return nil
+	}
+	if err := LegacyConductorAdmission(i); err != nil {
+		return err
 	}
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
@@ -5441,6 +5490,9 @@ func (i *Instance) StartWithMessage(message string) error {
 	defer release()
 	if spawnedSince(i.ID, beforeLock) {
 		return nil
+	}
+	if err := LegacyConductorAdmission(i); err != nil {
+		return err
 	}
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
@@ -9714,6 +9766,9 @@ func (i *Instance) restart(env map[string]string) error {
 	if spawnedSince(i.ID, beforeLock) && len(env) == 0 {
 		return nil
 	}
+	if err := LegacyConductorAdmission(i); err != nil {
+		return err
+	}
 	// #1873: the case this issue reports IS a restart — a pane that died during
 	// startup, a wrapped tree that escaped it, and a later legitimate restart
 	// that spawns a second one. The gate runs before the generation bump and
@@ -10367,6 +10422,9 @@ func (i *Instance) restart(env map[string]string) error {
 // This recreates the tmux session and clears the stored tool session binding first,
 // so the next start gets a brand-new tool session ID.
 func (i *Instance) RestartFresh() error {
+	if err := LegacyConductorAdmission(i); err != nil {
+		return err
+	}
 	i.prepareRestartMCPConfig()
 	i.spawnGen.Add(1)
 
