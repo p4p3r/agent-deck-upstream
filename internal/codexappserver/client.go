@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 )
@@ -63,19 +64,21 @@ type Result struct {
 // Client is single-threaded at the protocol boundary; concurrent callers wait
 // for the active operation. Close may be called concurrently at any time.
 type Client struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   io.ReadCloser
-	frames   chan []byte
-	closed   chan struct{}
-	done     chan struct{}
-	closeOne sync.Once
-	readErr  error
-	stderr   boundedWriter
-	nextID   int
-	threadID string
-	cfg      Config
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	stderrIn   io.ReadCloser
+	stderrDone chan struct{}
+	frames     chan []byte
+	closed     chan struct{}
+	done       chan struct{}
+	closeOne   sync.Once
+	readErr    error
+	stderr     boundedWriter
+	nextID     int
+	threadID   string
+	cfg        Config
 }
 
 type boundedWriter struct {
@@ -119,13 +122,31 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, &Error{ProcessExited, "start"}
 	}
-	c := &Client{cmd: cmd, stdin: stdin, stdout: stdout, frames: make(chan []byte, 32), closed: make(chan struct{}), done: make(chan struct{}), cfg: cfg}
-	cmd.Stderr = &c.stderr
+	// A file-backed stderr avoids exec.Cmd's unbounded copy goroutine in Wait.
+	// We own the reader and can close it even when a descendant holds the pipe.
+	stderrIn, stderrOut, err := os.Pipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, &Error{ProcessExited, "start"}
+	}
+	cmd.Stderr = stderrOut
+	c := &Client{cmd: cmd, stdin: stdin, stdout: stdout, stderrIn: stderrIn, stderrDone: make(chan struct{}), frames: make(chan []byte, 32), closed: make(chan struct{}), done: make(chan struct{}), cfg: cfg}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderrIn.Close()
+		_ = stderrOut.Close()
 		return nil, &Error{ProcessExited, "start"}
 	}
+	_ = stderrOut.Close() // Only the child should retain the write end.
+	go func() {
+		_, _ = io.Copy(&c.stderr, stderrIn)
+		close(c.stderrDone)
+	}()
 	go c.readFrames(stdout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -190,9 +211,11 @@ func (c *Client) Close() error {
 		close(c.closed)
 		_ = c.stdin.Close()
 		_ = c.stdout.Close()
+		_ = c.stderrIn.Close()
 		_ = c.cmd.Process.Kill()
 	})
 	<-c.done
+	<-c.stderrDone
 	return nil
 }
 

@@ -78,10 +78,14 @@ func fakeServer(mode string) {
 	if !strings.Contains(string(turn["params"]), `"threadId":"thr_123"`) {
 		os.Exit(8)
 	}
-	if mode == "descendant" {
+	if mode == "descendant" || mode == "descendant_stderr" {
 		child := exec.Command(os.Args[0], "app-server", "--listen", "stdio://")
 		child.Env = append(os.Environ(), "AGENT_DECK_APP_SERVER_MODE=descendant_hold")
-		child.Stdout = os.Stdout // Hold the app-server stdout pipe open after its exit.
+		if mode == "descendant" {
+			child.Stdout = os.Stdout // Hold the app-server stdout pipe open after its exit.
+		} else {
+			child.Stderr = os.Stderr // Hold the app-server stderr pipe open after its exit.
+		}
 		if child.Start() != nil {
 			os.Exit(10)
 		}
@@ -251,9 +255,18 @@ func TestOutgoingFrameBound(t *testing.T) {
 }
 
 func TestCloseDoesNotWaitForDescendantStdout(t *testing.T) {
+	testCloseWithDescendant(t, "descendant")
+}
+
+func TestCloseDoesNotWaitForDescendantStderr(t *testing.T) {
+	testCloseWithDescendant(t, "descendant_stderr")
+}
+
+func testCloseWithDescendant(t *testing.T, mode string) {
+	t.Helper()
 	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
 	t.Setenv("AGENT_DECK_APP_SERVER_DESCENDANT_PID_PATH", pidPath)
-	c := startFake(t, "descendant")
+	c := startFake(t, mode)
 	if _, err := c.StartThread(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +302,7 @@ func TestCloseDoesNotWaitForDescendantStdout(t *testing.T) {
 	select {
 	case <-closeDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close waited for descendant-held stdout")
+		t.Fatalf("Close waited for descendant-held pipe (%s)", mode)
 	}
 	select {
 	case <-c.done:
