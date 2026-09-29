@@ -229,8 +229,27 @@ Agent Deck and the supervisor are outside this contract.
 The scoped TOML fields are `[conductors.<name>] backend = "slack-v2"` and
 `[conductors.<name>.slack_v2]` `app_token`, `bot_token`, `channel_id`,
 `allowed_user_ids`, and optional `codex_executable` and `codex_model`.
-The allowlist must be explicit and nonempty; tokens are read from the existing
-private configuration, never CLI flags. Slack `auth.test` supplies the exact
+The allowlist must be explicit and nonempty. Each token, channel ID, and
+allowlisted user ID supports a plain literal or an exact environment reference
+`$NAME` or `${NAME}`, where `NAME` matches `[A-Za-z_][A-Za-z0-9_]*`. Prefer
+references so source configuration contains no credentials or private IDs:
+
+```toml
+[conductors.example.slack_v2]
+app_token = "${SLACK_APP_TOKEN}"
+bot_token = "$SLACK_BOT_TOKEN"
+channel_id = "$SLACK_DECK_CHANNEL"
+allowed_user_ids = ["${SLACK_DECK_USER}"]
+```
+
+The runtime resolves these references from its environment only after acquiring
+the conductor singleton lock and before any Slack or Codex call. Missing or
+empty environment values, malformed dollar forms, whitespace-padded configured
+or resolved values, and duplicate users after resolution fail closed with a
+fixed configuration error. Expansion is neither partial nor recursive; resolved
+values are opaque. `codex_executable`, `codex_model`, and the conductor working
+directory are not expanded by this loader. Tokens are never accepted as CLI
+flags. Slack `auth.test` supplies the exact
 team and bot-user IDs. The runtime durably binds them to the configured channel
 and allowlist; the gateway compares inbound event IDs with that binding.
 

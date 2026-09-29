@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -16,6 +17,8 @@ import (
 )
 
 var errSlackV2Configuration = errors.New("slack-v2 configuration is unavailable")
+
+var slackV2EnvReference = regexp.MustCompile(`^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$`)
 
 type slackV2RunArgs struct {
 	name     string
@@ -95,41 +98,7 @@ func runConductorSlackV2Command(profile string, args []string, stdout, stderr io
 		Mode:           parsed.mode,
 		ResumeThreadID: parsed.threadID,
 		LoadConfig: func() (channelruntime.Config, error) {
-			backend, err := session.ConductorBackend(parsed.name)
-			if err != nil || backend != "slack-v2" {
-				return channelruntime.Config{}, errSlackV2Configuration
-			}
-			meta, err := session.LoadConductorMeta(parsed.name)
-			if err != nil || meta.Name != parsed.name || meta.Agent != session.ConductorAgentCodex || meta.Warning != "" {
-				return channelruntime.Config{}, errSlackV2Configuration
-			}
-			// The storage resolver can print an inferred profile's source path
-			// on fallback. This service command emits only fixed categories;
-			// an inferred mismatch therefore fails closed without that output.
-			selectedProfile := session.GetEffectiveProfile(profile)
-			if meta.Profile != selectedProfile {
-				return channelruntime.Config{}, errSlackV2Configuration
-			}
-			settings, err := session.ConductorSlackV2Config(parsed.name)
-			if err != nil {
-				return channelruntime.Config{}, errSlackV2Configuration
-			}
-			executable := settings.CodexExecutable
-			if executable == "" {
-				executable = "codex"
-			}
-			bindingID := selectedProfile + "/" + parsed.name
-			return channelruntime.Config{
-				ConversationID:  bindingID + "/channel-stream",
-				ConductorID:     bindingID,
-				ChannelID:       settings.ChannelID,
-				AllowedUserIDs:  settings.AllowedUserIDs,
-				AppToken:        settings.AppToken,
-				BotToken:        settings.BotToken,
-				CodexExecutable: executable,
-				CodexCWD:        dir,
-				CodexModel:      settings.CodexModel,
-			}, nil
+			return loadConductorSlackV2Config(profile, parsed.name, dir, os.LookupEnv)
 		},
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -142,4 +111,86 @@ func runConductorSlackV2Command(profile string, args []string, stdout, stderr io
 		return 1
 	}
 	return 0
+}
+
+// loadConductorSlackV2Config is invoked only by the runtime's LoadConfig callback,
+// after it acquires the conductor lock. The lookup is injectable for offline tests.
+func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string) (string, bool)) (channelruntime.Config, error) {
+	backend, err := session.ConductorBackend(name)
+	if err != nil || backend != "slack-v2" {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
+	meta, err := session.LoadConductorMeta(name)
+	if err != nil || meta.Name != name || meta.Agent != session.ConductorAgentCodex || meta.Warning != "" {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
+	// The storage resolver can print an inferred profile's source path on fallback.
+	// An inferred mismatch therefore fails closed without that output.
+	selectedProfile := session.GetEffectiveProfile(profile)
+	if meta.Profile != selectedProfile {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
+	settings, err := session.ConductorSlackV2Config(name)
+	if err != nil {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
+	for _, value := range []*string{&settings.AppToken, &settings.BotToken, &settings.ChannelID} {
+		resolved, err := resolveSlackV2Value(*value, lookupEnv)
+		if err != nil {
+			return channelruntime.Config{}, errSlackV2Configuration
+		}
+		*value = resolved
+	}
+	if len(settings.AllowedUserIDs) == 0 {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
+	seen := make(map[string]bool, len(settings.AllowedUserIDs))
+	for i, value := range settings.AllowedUserIDs {
+		resolved, err := resolveSlackV2Value(value, lookupEnv)
+		if err != nil || seen[resolved] {
+			return channelruntime.Config{}, errSlackV2Configuration
+		}
+		seen[resolved] = true
+		settings.AllowedUserIDs[i] = resolved
+	}
+	executable := settings.CodexExecutable
+	if executable == "" {
+		executable = "codex"
+	}
+	bindingID := selectedProfile + "/" + name
+	return channelruntime.Config{
+		ConversationID:  bindingID + "/channel-stream",
+		ConductorID:     bindingID,
+		ChannelID:       settings.ChannelID,
+		AllowedUserIDs:  settings.AllowedUserIDs,
+		AppToken:        settings.AppToken,
+		BotToken:        settings.BotToken,
+		CodexExecutable: executable,
+		CodexCWD:        dir,
+		CodexModel:      settings.CodexModel,
+	}, nil
+}
+
+// resolveSlackV2Value accepts a literal or one exact environment reference.
+// Resolved values are opaque: no partial expansion, recursion, or trimming.
+func resolveSlackV2Value(value string, lookupEnv func(string) (string, bool)) (string, error) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return "", errSlackV2Configuration
+	}
+	if !strings.Contains(value, "$") {
+		return value, nil
+	}
+	match := slackV2EnvReference.FindStringSubmatch(value)
+	if match == nil || lookupEnv == nil {
+		return "", errSlackV2Configuration
+	}
+	name := match[1]
+	if name == "" {
+		name = match[2]
+	}
+	resolved, ok := lookupEnv(name)
+	if !ok || resolved == "" || strings.TrimSpace(resolved) != resolved {
+		return "", errSlackV2Configuration
+	}
+	return resolved, nil
 }

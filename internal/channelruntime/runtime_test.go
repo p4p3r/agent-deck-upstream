@@ -414,6 +414,37 @@ func TestHeldLockStopsBeforeConfigOrAnyRuntimeEffect(t *testing.T) {
 	require.Equal(t, "channelruntime: lease", err.Error())
 }
 
+func TestConfigLoadFailureStopsBeforeProvidersAndRuntime(t *testing.T) {
+	cfg := testConfig(t)
+	r := testRequest(t, ModeCreate, "", cfg)
+	locked, loaded, closed := false, false, 0
+	r.LoadConfig = func() (Config, error) {
+		if !locked {
+			t.Fatal("configuration loaded before lock")
+		}
+		loaded = true
+		return cfg, errors.New("configuration")
+	}
+	d := dependencies{
+		acquire: func(_, _ string) (io.Closer, error) { locked = true; return testLock{&closed}, nil },
+		identity: func(context.Context, string) (slacknetwork.Identity, error) {
+			t.Fatal("identity called after configuration failure")
+			return slacknetwork.Identity{}, nil
+		},
+		driver: func(Config) agentDriver { t.Fatal("driver created after configuration failure"); return nil },
+		socket: func(string) channelstream.Socket { t.Fatal("socket created after configuration failure"); return nil },
+		sender: func(string) slackgateway.Sender { t.Fatal("sender created after configuration failure"); return nil },
+		run: func(context.Context, *channelstream.Runner) error {
+			t.Fatal("runner started after configuration failure")
+			return nil
+		},
+	}
+	err := run(context.Background(), r, d)
+	if KindOf(err) != string(KindConfig) || !loaded || closed != 1 || err.Error() != "channelruntime: config" {
+		t.Fatal("configuration failure boundary mismatch")
+	}
+}
+
 func TestBootstrapFailureReapsDriverAndReleasesLockWithoutIngress(t *testing.T) {
 	cfg := testConfig(t)
 	r := testRequest(t, ModeCreate, "", cfg)
