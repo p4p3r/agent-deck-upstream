@@ -1,10 +1,10 @@
 # Slack v2 channel gateway: source contract
 
-This document defines a provider-neutral routing and persistence foundation for a
-future Slack conductor channel. It does not replace the current bridge or connect
-to Slack. A transport adapter will translate Slack event IDs, channel IDs, thread
-IDs, mentions, and message text into the gateway's inputs; an agent driver will
-claim turns and commit results. Neither adapter is part of this slice.
+This document defines the durable gateway and an offline Slack Socket Mode /
+`chat.postMessage` boundary for a future conductor channel. It does not replace
+the current bridge or connect to Slack. A future network adapter supplies
+authenticated Socket Mode frames and top-level posts; the agent driver separately
+claims turns and commits results.
 
 ## Two routing modes
 
@@ -63,11 +63,17 @@ transport acknowledgment is not a database acknowledgment: the adapter should
 acknowledge an external event only after the intake transaction commits.
 
 Outbound items are an outbox, with a stable item ID and a delivery state. A
-driver's turn completion and its outbound items must commit together. The
-transport later sends each item and marks it delivered; retry after a crash may
-send an item again, so the future transport needs an idempotency or reconciliation
-strategy for the external API. This slice promises durable, deduplicated enqueue,
-not exactly-once network delivery.
+driver's turn completion and its outbound items commit together. Before posting,
+the Slack boundary atomically changes `pending` to `sending` with a unique attempt
+ID. Only the creator of that attempt may call the sender. A restart or concurrent
+drain changes old `sending` work to `uncertain`, never back to `pending`; it cannot
+automatically resend. An exact late success for the same attempt may still move
+`sending` or `uncertain` to `delivered`. Delivery confirmation requires the bound
+channel and a nonempty provider message ID; two items cannot claim one provider ID
+in a conversation. The old direct `MarkDelivered` method cannot confirm an
+unprepared item. Ambiguous post results and call errors leave an item uncertain
+for external reconciliation. This is at-most-one automatic post attempt, not a
+claim of exactly-once delivery or proof of provider receipt after a lost response.
 
 On restart, the ledger retains unfinished turns and pending outbound work. The
 conversation binds one immutable, private agent thread and a last completed
@@ -89,20 +95,38 @@ turns, a missing accepted ID, and failed or interrupted terminal status require
 reconciliation. A prepared attempt is never submitted again just because no
 external turn is visible. An in-progress accepted turn remains active for a
 later inspection. Completion, outbound enqueue, and cursor advance commit in
-one transaction. Schema version 2 fails closed on older gateway files; migration
+one transaction. Schema version 3 fails closed on older gateway files; migration
 of deployed data is outside this unreleased source slice.
 
-## Adapter obligations and limits
+## Slack boundary obligations and limits
 
-The later Slack adapter will post `channel_stream` output with no thread ID and
-route `thread_segments` output to its segment's root thread. It will filter
-bot/self events, bind sender allowlists, and render superseded thread pointers.
-It must deduplicate Slack retry deliveries by Slack event ID before invoking a
-conductor. The later agent driver will preserve turn ordering and provide an
-acceptance callback that returns persistence errors; on callback failure it
-must stop and return an uncertain result. This contract
-leaves network connection, tokens, the Codex driver, configuration,
-migration from the existing bridge, and live deployment for separate work.
+`internal/slackgateway` handles only dedicated-channel `channel_stream`. It
+accepts bounded, already-authenticated Socket Mode `events_api` envelopes and
+ordinary, top-level text message events. A Socket Mode frame requires a payload
+object and boolean `accepts_response_payload` (`false` for `events_api`). It
+requires one coherent workspace identity
+across all represented team fields, rejects duplicate JSON keys, and compares
+opaque team, channel, and user IDs against explicit configuration. Bot/self,
+subtype, thread, wrong-team/channel/user, unsupported events, and messages with
+attachments or files are filtered; attached content is not silently discarded.
+Valid filtered events are acknowledged once; malformed/oversized envelopes and
+storage failures are not. For eligible events, the caller's acknowledgement
+callback runs only after `Ingest` commits, so a failed ack followed by Slack
+redelivery deduplicates on `event_id`. The boundary never starts an agent turn.
+
+The outbound sender interface accepts channel and text but no thread parameter;
+the future `chat.postMessage` implementation must omit `thread_ts`. It accepts
+success only with `ok`, the exact bound channel, and a nonempty opaque `ts`.
+Replies over 40,000 Unicode characters are marked uncertain without posting,
+because Slack may truncate longer `text` values; they need explicit handling.
+Websocket/HTTP implementations, tokens, configuration plumbing,
+`thread_segments` transport, deployment, and legacy bridge migration remain
+out of scope. The agent driver preserves turn ordering and uses a fallible
+acceptance callback; on callback failure it stops with an uncertain result.
+
+Slack wire-field behavior follows the official [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
+[Events API](https://docs.slack.dev/apis/events-api/), and
+[`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/) documentation.
 
 ## Codex app-server client boundary
 

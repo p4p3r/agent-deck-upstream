@@ -95,12 +95,14 @@ type OutboxItem struct {
 	Kind              string
 	ThreadID          string
 	Body              string
+	State             DeliveryState
+	DeliveryAttemptID string
 	ExternalMessageID string
 }
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Open creates a private SQLite file or opens an existing compatible ledger.
 // Existing files with an unknown schema are never deleted or migrated.
@@ -261,10 +263,16 @@ var schemaDDL = []string{
 		conversation_id TEXT NOT NULL REFERENCES conversations(id),
 		turn_id TEXT NOT NULL REFERENCES turns(id), kind TEXT NOT NULL,
 		thread_id TEXT NOT NULL, body TEXT NOT NULL,
-		state TEXT NOT NULL CHECK (state IN ('pending','delivered')),
-		external_message_id TEXT NOT NULL DEFAULT ''
+		state TEXT NOT NULL CHECK (state IN ('pending','sending','uncertain','delivered')),
+		delivery_attempt_id TEXT NOT NULL DEFAULT '',
+		external_message_id TEXT NOT NULL DEFAULT '',
+		CHECK ((state='pending' AND delivery_attempt_id='' AND external_message_id='') OR
+			(state IN ('sending','uncertain') AND delivery_attempt_id!='' AND external_message_id='') OR
+			(state='delivered' AND delivery_attempt_id!='' AND external_message_id!=''))
 	)`,
 	`CREATE INDEX outbox_pending ON outbox(conversation_id, ordinal) WHERE state='pending'`,
+	`CREATE UNIQUE INDEX outbox_provider_message ON outbox(conversation_id,external_message_id)
+		WHERE external_message_id != ''`,
 }
 
 func validConversation(c Conversation) bool {

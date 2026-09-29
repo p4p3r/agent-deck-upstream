@@ -251,7 +251,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, turnID, attemptID, external
 				threadID = ""
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
-				Kind: "reply", ThreadID: threadID, Body: replyBody}
+				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
 			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,body,state)
 				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, out.Body); err != nil {
 				return err

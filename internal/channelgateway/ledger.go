@@ -312,8 +312,8 @@ func (s *Store) AcceptTurn(ctx context.Context, turnID, acceptanceID string) err
 
 func loadTurnOutbox(tx *writeTx, turnID string) (*OutboxItem, error) {
 	var o OutboxItem
-	err := tx.row(`SELECT id,conversation_id,turn_id,kind,thread_id,body,external_message_id FROM outbox WHERE turn_id=?`, turnID).
-		Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body, &o.ExternalMessageID)
+	err := tx.row(`SELECT id,conversation_id,turn_id,kind,thread_id,body,state,delivery_attempt_id,external_message_id FROM outbox WHERE turn_id=?`, turnID).
+		Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body, &o.State, &o.DeliveryAttemptID, &o.ExternalMessageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -372,7 +372,7 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 				threadID = ""
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
-				Kind: "reply", ThreadID: threadID, Body: replyBody}
+				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
 			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,body,state)
 				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, out.Body); err != nil {
 				return err
@@ -389,7 +389,7 @@ func (s *Store) PendingOutbox(ctx context.Context, conversationID string, limit 
 	if conversationID == "" || limit <= 0 {
 		return nil, ErrInvalid
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,body,external_message_id
+	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,body,state,delivery_attempt_id,external_message_id
 		FROM outbox WHERE conversation_id=? AND state='pending' ORDER BY ordinal LIMIT ?`, conversationID, limit)
 	if err != nil {
 		return nil, ErrStorage
@@ -398,7 +398,7 @@ func (s *Store) PendingOutbox(ctx context.Context, conversationID string, limit 
 	var items []OutboxItem
 	for rows.Next() {
 		var o OutboxItem
-		if err := rows.Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body, &o.ExternalMessageID); err != nil {
+		if err := rows.Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body, &o.State, &o.DeliveryAttemptID, &o.ExternalMessageID); err != nil {
 			return nil, ErrStorage
 		}
 		items = append(items, o)
@@ -409,8 +409,8 @@ func (s *Store) PendingOutbox(ctx context.Context, conversationID string, limit 
 	return items, nil
 }
 
-// MarkDelivered records the external message ID. Delivery can be retried with
-// the same ID; a different ID requires explicit external reconciliation.
+// MarkDelivered is retained only for idempotent reads of an already-confirmed
+// item. It cannot bypass a prepared delivery attempt.
 func (s *Store) MarkDelivered(ctx context.Context, itemID, externalMessageID string) error {
 	if itemID == "" || externalMessageID == "" {
 		return ErrInvalid
@@ -430,7 +430,6 @@ func (s *Store) MarkDelivered(ctx context.Context, itemID, externalMessageID str
 			}
 			return ErrConflict
 		}
-		_, err = tx.exec(`UPDATE outbox SET state='delivered',external_message_id=? WHERE id=?`, externalMessageID, itemID)
-		return err
+		return ErrConflict
 	})
 }
