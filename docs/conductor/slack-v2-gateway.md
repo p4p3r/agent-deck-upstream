@@ -140,6 +140,46 @@ Slack wire-field behavior follows the official [Socket Mode](https://docs.slack.
 [Events API](https://docs.slack.dev/apis/events-api/), and
 [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/) documentation.
 
+## Single-conversation source runner
+
+`internal/channelstream` composes the channel-stream gateway, the one-session
+Socket Mode client, reconciliation worker, and outbox delivery worker for one
+conversation. It does not read environment/configuration, launch a service, or
+replace the legacy bridge. One `Run` owns at most one socket at a time and a
+single work pump; a concurrent `Run` is rejected. An eligible accepted event,
+including redelivery after a failed ack, signals the pump only after its
+durable intake and Socket Mode ack both succeed. That signal is a scheduling
+hint, not a processing gate: the committed `Ingest` transaction makes the event
+available to a startup or periodic pump pass even while the transport ack is
+pending or ambiguous. Ack is transport receipt, not durable processing consent.
+Startup and periodic passes recover active turns and drain pending outbox work.
+The ledger, not an in-memory queue, decides what may start or post.
+
+Completed turns permit the next queued turn and an outbox drain. In-progress
+turns are inspected on a bounded poll; they are never started a second time.
+`needs_reconciliation` stops automatic turn advancement until an operator
+restarts after resolving the uncertain state; ingress and pending outbox drains
+continue. An uncertain delivery is not resent, and later pending items remain
+eligible on a later pass. Fatal binding/schema/protocol conditions stop the
+runner. In this single-owner source runner, a durable binding `ErrConflict` is
+terminal/manual; a future multi-runner design would need a separately typed
+transient compare-and-swap outcome. Transient callback, ack, storage, driver,
+and socket disconnects are retried with bounded polling or capped reconnect
+backoff. Reconnect backoff resets only after an accepted-and-acked socket event,
+including acknowledged redelivery; unrelated backlog work or posts cannot mask
+a failing connection.
+A repeated no-progress refresh cannot spin. A disabled Socket Mode link is
+terminal. Cancellation stops the socket and pump without replaying a
+callback or external effect. Normal status exposes categories only, no message
+bodies, credentials, ticket URLs, or provider errors.
+
+The current network client groups HTTP transport failures and Slack auth
+denials from `apps.connections.open` under one `ErrOpen` classification. The
+runner fails closed on that unknown class rather than retrying a possible bad
+credential indefinitely. Before live wiring, the network boundary must split
+explicitly transient open failures from auth/config denial; this source runner
+does not broaden the credential-bearing network package.
+
 ## Codex app-server client boundary
 
 `internal/codexappserver` provides a stdio client for a future agent driver. It
