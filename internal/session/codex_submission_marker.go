@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	codexSubmissionMarkerVersion = 1
-	codexSubmissionMarkerMaxSize = 8 << 10
+	codexSubmissionMarkerVersionLegacy     = 1
+	codexSubmissionMarkerVersionCorrelated = 2
+	codexSubmissionMarkerMaxSize           = 8 << 10
 
 	CodexSubmissionPhasePrepared  = "prepared"
 	CodexSubmissionPhaseSubmitted = "submitted"
@@ -31,6 +33,7 @@ type CodexSubmissionMarker struct {
 	Version             int       `json:"version"`
 	InstanceID          string    `json:"instance_id"`
 	CodexSessionID      string    `json:"codex_session_id"`
+	OperationID         string    `json:"operation_id,omitempty"`
 	AttemptID           string    `json:"attempt_id"`
 	PriorTurnGeneration string    `json:"prior_turn_generation"`
 	Phase               string    `json:"phase"`
@@ -62,7 +65,7 @@ func PrepareCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration st
 	}
 	now = now.UTC()
 	marker := &CodexSubmissionMarker{
-		Version:             codexSubmissionMarkerVersion,
+		Version:             codexSubmissionMarkerVersionLegacy,
 		InstanceID:          instanceID,
 		CodexSessionID:      codexSessionID,
 		AttemptID:           attemptID,
@@ -75,6 +78,49 @@ func PrepareCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration st
 		return nil, err
 	}
 	return marker, nil
+}
+
+// PrepareCorrelatedCodexSubmissionMarker publishes a v2 fence owned by one
+// durable row-turn operation before any target write is possible.
+func PrepareCorrelatedCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration, operationID string, now time.Time) (*CodexSubmissionMarker, error) {
+	marker, err := newCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration, now)
+	if err != nil {
+		return nil, err
+	}
+	marker.Version = codexSubmissionMarkerVersionCorrelated
+	marker.OperationID = strings.TrimSpace(operationID)
+	if err := writeCodexSubmissionMarker(marker, true); err != nil {
+		return nil, err
+	}
+	return marker, nil
+}
+
+func newCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration string, now time.Time) (*CodexSubmissionMarker, error) {
+	instanceID = strings.TrimSpace(instanceID)
+	codexSessionID = strings.TrimSpace(codexSessionID)
+	if instanceID == "" || len(instanceID) > 512 {
+		return nil, fmt.Errorf("Codex submission marker: invalid instance id")
+	}
+	if err := validateExactSessionID(codexSessionID); err != nil {
+		return nil, fmt.Errorf("Codex submission marker: invalid session identity: %w", err)
+	}
+	if err := validateCodexMarkerGeneration(codexSessionID, priorGeneration, true); err != nil {
+		return nil, err
+	}
+	attemptID, err := newCodexSubmissionAttemptID()
+	if err != nil {
+		return nil, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	return &CodexSubmissionMarker{
+		Version: codexSubmissionMarkerVersionLegacy, InstanceID: instanceID,
+		CodexSessionID: codexSessionID, AttemptID: attemptID,
+		PriorTurnGeneration: priorGeneration, Phase: CodexSubmissionPhasePrepared,
+		CreatedAt: now, UpdatedAt: now,
+	}, nil
 }
 
 // MarkSubmitted records positive transport-level submission evidence. A crash
@@ -119,6 +165,9 @@ func ReconcileCodexSubmissionMarker(instanceID, codexSessionID, currentGeneratio
 	if marker.InstanceID != strings.TrimSpace(instanceID) || marker.CodexSessionID != strings.TrimSpace(codexSessionID) {
 		return "", fmt.Errorf("Codex submission marker ownership does not match this instance")
 	}
+	if marker.Version == codexSubmissionMarkerVersionCorrelated {
+		return "", fmt.Errorf("Codex submission marker belongs to durable operation %s; refusing ordinary reconciliation", marker.OperationID)
+	}
 	if currentGeneration == marker.PriorTurnGeneration {
 		path, pathErr := codexSubmissionMarkerPath(codexSessionID)
 		if pathErr != nil {
@@ -138,6 +187,31 @@ func ReconcileCodexSubmissionMarker(instanceID, codexSessionID, currentGeneratio
 	return currentGeneration, nil
 }
 
+// RecoverCorrelatedCodexSubmissionMarker returns exact newer-generation
+// evidence for the named v2 operation without clearing its durable fence.
+// The caller must first persist that generation on the operation, then clear
+// the returned marker.
+func RecoverCorrelatedCodexSubmissionMarker(instanceID, codexSessionID, operationID, currentGeneration string) (string, *CodexSubmissionMarker, error) {
+	marker, found, err := readCodexSubmissionMarker(codexSessionID)
+	if err != nil {
+		return "", nil, err
+	}
+	if !found {
+		return "", nil, fmt.Errorf("correlated Codex submission marker is missing")
+	}
+	if marker.Version != codexSubmissionMarkerVersionCorrelated || marker.InstanceID != strings.TrimSpace(instanceID) ||
+		marker.CodexSessionID != strings.TrimSpace(codexSessionID) || marker.OperationID != strings.TrimSpace(operationID) {
+		return "", nil, fmt.Errorf("correlated Codex submission marker ownership does not match this operation")
+	}
+	if currentGeneration == marker.PriorTurnGeneration {
+		return "", nil, fmt.Errorf("correlated Codex submission has no newer durable generation")
+	}
+	if err := validateCodexMarkerGeneration(marker.CodexSessionID, currentGeneration, false); err != nil {
+		return "", nil, fmt.Errorf("cannot recover correlated Codex submission marker: %w", err)
+	}
+	return currentGeneration, marker, nil
+}
+
 // ClearCodexSubmissionMarker removes only the exact attempt supplied by the
 // caller. Callers use this after an exact accepted generation or definitive
 // proof that transport never occurred, never after an ambiguous failure.
@@ -152,7 +226,7 @@ func ClearCodexSubmissionMarker(marker *CodexSubmissionMarker) error {
 	if !found {
 		return fmt.Errorf("Codex submission marker %s is missing", marker.AttemptID)
 	}
-	if current.InstanceID != marker.InstanceID || current.CodexSessionID != marker.CodexSessionID || current.AttemptID != marker.AttemptID {
+	if !sameCodexSubmissionMarkerOwner(current, marker) {
 		return fmt.Errorf("Codex submission marker ownership changed; refusing removal")
 	}
 	path, err := codexSubmissionMarkerPath(marker.CodexSessionID)
@@ -241,7 +315,17 @@ func readCodexSubmissionMarker(codexSessionID string) (*CodexSubmissionMarker, b
 	if info.Size() > codexSubmissionMarkerMaxSize {
 		return nil, false, fmt.Errorf("Codex submission marker exceeds %d bytes", codexSubmissionMarkerMaxSize)
 	}
-	decoder := json.NewDecoder(io.LimitReader(f, codexSubmissionMarkerMaxSize+1))
+	data, err := io.ReadAll(io.LimitReader(f, codexSubmissionMarkerMaxSize+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("read Codex submission marker: %w", err)
+	}
+	if len(data) > codexSubmissionMarkerMaxSize {
+		return nil, false, fmt.Errorf("Codex submission marker exceeds %d bytes", codexSubmissionMarkerMaxSize)
+	}
+	if err := rejectCodexMarkerDuplicateKeys(data); err != nil {
+		return nil, false, fmt.Errorf("parse Codex submission marker: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var marker CodexSubmissionMarker
 	if err := decoder.Decode(&marker); err != nil {
@@ -260,6 +344,43 @@ func readCodexSubmissionMarker(codexSessionID string) (*CodexSubmissionMarker, b
 	return &marker, true, nil
 }
 
+func rejectCodexMarkerDuplicateKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("marker must be a JSON object")
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("marker key is not a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate JSON key %q", key)
+		}
+		seen[key] = struct{}{}
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing data")
+	}
+	return nil
+}
+
 func writeCodexSubmissionMarker(marker *CodexSubmissionMarker, create bool) error {
 	if err := validateCodexSubmissionMarker(marker); err != nil {
 		return err
@@ -275,7 +396,7 @@ func writeCodexSubmissionMarker(marker *CodexSubmissionMarker, create bool) erro
 	if create && found {
 		return fmt.Errorf("unresolved Codex submission marker already exists")
 	}
-	if !create && (!found || current.InstanceID != marker.InstanceID || current.AttemptID != marker.AttemptID) {
+	if !create && (!found || !sameCodexSubmissionMarkerOwner(current, marker)) {
 		return fmt.Errorf("Codex submission marker ownership changed; refusing update")
 	}
 	data, err := json.Marshal(marker)
@@ -314,8 +435,14 @@ func writeCodexSubmissionMarker(marker *CodexSubmissionMarker, create bool) erro
 }
 
 func validateCodexSubmissionMarker(marker *CodexSubmissionMarker) error {
-	if marker == nil || marker.Version != codexSubmissionMarkerVersion {
+	if marker == nil || (marker.Version != codexSubmissionMarkerVersionLegacy && marker.Version != codexSubmissionMarkerVersionCorrelated) {
 		return fmt.Errorf("unsupported Codex submission marker version")
+	}
+	if marker.Version == codexSubmissionMarkerVersionLegacy && marker.OperationID != "" {
+		return fmt.Errorf("legacy Codex submission marker cannot own an operation")
+	}
+	if marker.Version == codexSubmissionMarkerVersionCorrelated && !validCorrelatedOperationID(marker.OperationID) {
+		return fmt.Errorf("invalid correlated Codex submission marker operation identity")
 	}
 	if strings.TrimSpace(marker.InstanceID) == "" || marker.InstanceID != strings.TrimSpace(marker.InstanceID) || len(marker.InstanceID) > 512 {
 		return fmt.Errorf("invalid Codex submission marker instance identity")
@@ -339,6 +466,24 @@ func validateCodexSubmissionMarker(marker *CodexSubmissionMarker) error {
 		return fmt.Errorf("invalid Codex submission marker timestamps")
 	}
 	return nil
+}
+
+func sameCodexSubmissionMarkerOwner(a, b *CodexSubmissionMarker) bool {
+	return a != nil && b != nil && a.Version == b.Version && a.InstanceID == b.InstanceID &&
+		a.CodexSessionID == b.CodexSessionID && a.OperationID == b.OperationID && a.AttemptID == b.AttemptID
+}
+
+func validCorrelatedOperationID(id string) bool {
+	if len(id) != 26 {
+		return false
+	}
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	for _, r := range id {
+		if !strings.ContainsRune(alphabet, r) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateCodexMarkerGeneration(codexSessionID, generation string, allowEmpty bool) error {
