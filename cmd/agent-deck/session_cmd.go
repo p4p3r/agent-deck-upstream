@@ -24,6 +24,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
@@ -1927,6 +1928,7 @@ func handleSessionShow(profile string, args []string) {
 	groupTree := session.NewGroupTreeWithGroups(instances, groupsData)
 	jsonData := map[string]interface{}{
 		"id":                   inst.ID,
+		"row_binding_token":    session.RowBindingToken(inst),
 		"title":                inst.Title,
 		"profile":              profile,
 		"path":                 inst.ProjectPath,
@@ -3090,6 +3092,9 @@ func handleSessionSend(profile string, args []string) {
 	queue := fs.Bool("queue", false, "Return at once with a send_id; a background worker delivers when the target is idle, at most once; every send ends landed, failed or settled with a reason (see session send-status)")
 	queueWorker := fs.Bool("queue-worker", false, "Internal: deliver a durable queued send directly")
 	noTag := fs.Bool("no-tag", false, "Do not prefix the [agent-deck from:<id>] envelope a send from inside a session gets by default ([send] tag_sends)")
+	idempotencyKey := fs.String("idempotency-key", "", "Opaque immutable request key for an idempotent correlated --queue send")
+	expectedRowBinding := fs.String("expected-row-binding", "", "Opaque immutable row binding required before a correlated --queue send can prepare transport")
+	correlatedOperation := fs.String("correlated-operation", "", "Internal: durable correlated operation owned by this queue worker")
 	var images imageList
 	fs.Var(&images, "image", "Attach an image (repeatable): Claude Code and Gemini get @<copy under .agentdeck-images/>; Codex and other harnesses exit 2")
 
@@ -3142,6 +3147,10 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  Emits one structured result correlated to the accepted Codex turn.")
 		fmt.Println("  Requires a locally readable exact accepted-turn receipt; remote or sandboxed targets are refused.")
 		fmt.Println("  Local agent-deck sends are serialized; direct pane or keyboard input is outside this guarantee.")
+		fmt.Println("Correlated --queue sends are idempotent and bound to an immutable row. Their durable states")
+		fmt.Println("  include accepted, completed, indeterminate, and result_unavailable; send-status recovers")
+		fmt.Println("  the exact accepted generation and exposes content only after completed.")
+		fmt.Println("  Use --idempotency-key with --expected-row-binding to enable this recovery contract.")
 		fmt.Println()
 		fmt.Println("Codex --acceptance-only:")
 		fmt.Println("  Emits one bounded, body-free JSON result after exact turn acceptance (within a 2s acceptance window).")
@@ -3221,6 +3230,21 @@ func handleSessionSend(profile string, args []string) {
 		out.Error(err.Error(), ErrCodeNotFound)
 		os.Exit(1)
 	}
+	defer storage.Close()
+
+	correlatedRequested := *idempotencyKey != "" || *expectedRowBinding != ""
+	if correlatedRequested {
+		if !*queue || !*jsonOutput || *wait || *stream || *draft || *noWait || *deferIfBusy || *queueWorker || *correlatedOperation != "" || len(images) != 0 {
+			out.ErrorWithData("correlated sends require --queue --json and are incompatible with other send modes", "invalid_correlated_request", map[string]interface{}{"retry_safe": false})
+			os.Exit(2)
+		}
+		queueCorrelatedSend(profile, storage, instances, sessionRef, message, *idempotencyKey, *expectedRowBinding, out)
+		return
+	}
+	if *correlatedOperation != "" && (!*queueWorker || !*wait || !*jsonOutput) {
+		out.Error("--correlated-operation is internal to a waiting queue worker", ErrCodeInvalidOperation)
+		os.Exit(2)
+	}
 
 	// Resolve session
 	inst, errMsg, errCode := ResolveSession(sessionRef, instances)
@@ -3238,6 +3262,18 @@ func handleSessionSend(profile string, args []string) {
 	if *acceptanceOnly {
 		if code := acceptanceOnlyPreconditionCode(inst); code != "" {
 			failAcceptanceOnly(code, acceptanceOnlyNotAccepted, "")
+		}
+	}
+	if *correlatedOperation != "" {
+		if sessionRef != inst.ID {
+			out.Error("correlated workers require the immutable session id", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		if err := validateCorrelatedWorkerBinding(storage, *correlatedOperation, inst); err != nil {
+			out.ErrorWithData("correlated worker binding fence refused transport", sendqueue.OperationBindingChanged, map[string]interface{}{
+				"operation_state": sendqueue.OperationBindingChanged, "retry_safe": true,
+			})
+			os.Exit(1)
 		}
 	}
 
@@ -3550,6 +3586,17 @@ func handleSessionSend(profile string, args []string) {
 		// Codex's counterpart: a new turn in the exact rollout past the
 		// acceptance fence, the evidence the accepted-turn receipt rests on.
 		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
+		if *correlatedOperation != "" {
+			_, freshInstances, _, loadErr := loadSessionData(profile)
+			freshInstance := instanceByID(freshInstances, inst.ID)
+			if loadErr != nil || freshInstance == nil || validateCorrelatedWorkerBinding(storage, *correlatedOperation, freshInstance) != nil {
+				acceptanceGuard.Release()
+				out.ErrorWithData("row binding changed before correlated transport", sendqueue.OperationBindingChanged, map[string]interface{}{
+					"operation_state": sendqueue.OperationBindingChanged, "retry_safe": true,
+				})
+				os.Exit(1)
+			}
+		}
 		if err := validateCodexAcceptanceFence(inst, acceptanceFence); err != nil {
 			acceptanceGuard.Release()
 			if *acceptanceOnly {
@@ -3558,12 +3605,18 @@ func handleSessionSend(profile string, args []string) {
 			out.Error(fmt.Sprintf("cannot submit against changed Codex turn fence: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		if err := acceptanceGuard.Prepare(inst.ID, time.Now()); err != nil {
+		var prepareErr error
+		if *correlatedOperation != "" {
+			prepareErr = acceptanceGuard.PrepareCorrelated(inst.ID, *correlatedOperation, time.Now())
+		} else {
+			prepareErr = acceptanceGuard.Prepare(inst.ID, time.Now())
+		}
+		if prepareErr != nil {
 			acceptanceGuard.Release()
 			if *acceptanceOnly {
 				failAcceptanceOnly(acceptanceOnlyCodeUnavailable, acceptanceOnlyNotAccepted, "")
 			}
-			out.Error(fmt.Sprintf("cannot durably reserve Codex turn acceptance: %v", err), ErrCodeInvalidOperation)
+			out.Error(fmt.Sprintf("cannot durably reserve Codex turn acceptance: %v", prepareErr), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 	}
@@ -3717,6 +3770,13 @@ func handleSessionSend(profile string, args []string) {
 	}
 	acceptedTurn := observeAcceptedCodexTurn(*wait, inst, sendRes.delivery, acceptedAt, acceptanceFence)
 	if acceptedTurn != nil && acceptanceGuard != nil {
+		if *correlatedOperation != "" {
+			if err := persistCorrelatedAccepted(storage, *correlatedOperation, acceptedTurn); err != nil {
+				acceptanceGuard.Release()
+				out.ErrorWithData("accepted Codex turn but failed to persist correlated ownership", ErrCodeInvalidOperation, completionTimeoutPayload(sendData))
+				os.Exit(1)
+			}
+		}
 		if err := acceptanceGuard.ResolveAccepted(); err != nil {
 			acceptanceGuard.Release()
 			sendData["accepted_turn"] = acceptedTurn
@@ -3902,6 +3962,14 @@ func handleSessionSend(profile string, args []string) {
 			sendData["accepted_turn"] = acceptedTurn
 		}
 		if acceptedTurn != nil && acceptanceGuard != nil {
+			if *correlatedOperation != "" {
+				if persistErr := persistCorrelatedAccepted(storage, *correlatedOperation, acceptedTurn); persistErr != nil {
+					acceptanceGuard.Release()
+					out.ErrorWithData("accepted Codex turn but failed to persist correlated ownership", ErrCodeInvalidOperation, completionTimeoutPayload(sendData))
+					recordSendEventOnce()
+					os.Exit(1)
+				}
+			}
 			if markerErr := acceptanceGuard.ResolveAccepted(); markerErr != nil {
 				acceptanceGuard.Release()
 				out.ErrorWithData(
@@ -3977,6 +4045,13 @@ func handleSessionSend(profile string, args []string) {
 		)
 		recordSendEventOnce()
 		os.Exit(1)
+	}
+	if *correlatedOperation != "" {
+		if err := persistCorrelatedCompletion(storage, *correlatedOperation, acceptedTurn, response); err != nil {
+			out.ErrorWithData("exact Codex result could not be durably published", ErrCodeInvalidOperation, responseReadFailureData(sendData))
+			recordSendEventOnce()
+			os.Exit(1)
+		}
 	}
 	if *jsonOutput {
 		sendData["completion"] = "complete"
@@ -4510,6 +4585,20 @@ func (g *codexAcceptanceGuard) Prepare(instanceID string, now time.Time) error {
 	}
 	marker, err := session.PrepareCodexSubmissionMarker(
 		instanceID, g.fence.codexSessionID, g.fence.priorTurnGeneration, now,
+	)
+	if err != nil {
+		return err
+	}
+	g.marker = marker
+	return nil
+}
+
+func (g *codexAcceptanceGuard) PrepareCorrelated(instanceID, operationID string, now time.Time) error {
+	if g == nil || g.lock == nil || !g.fence.available || g.marker != nil {
+		return fmt.Errorf("Codex acceptance guard is not ready to prepare a correlated submission")
+	}
+	marker, err := session.PrepareCorrelatedCodexSubmissionMarker(
+		instanceID, g.fence.codexSessionID, g.fence.priorTurnGeneration, operationID, now,
 	)
 	if err != nil {
 		return err
