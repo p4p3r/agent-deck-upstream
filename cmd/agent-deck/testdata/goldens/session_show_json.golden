@@ -16,6 +16,7 @@
   "path": "/repo/app",
   "pin": "",
   "profile": "goldens",
+  "row_binding_token": "rb1_U15IxgAuc7_cc521P9Oq3YZjdsKJ68eJl7nb9tfzn-s",
   "status": "error",
   "substate": "unknown-exit",
   "title": "claude idle",

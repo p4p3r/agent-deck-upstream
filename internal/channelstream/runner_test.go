@@ -185,6 +185,7 @@ type fakeDriver struct {
 	startWait  <-chan struct{}
 	openWait   <-chan struct{}
 	keys       map[string]string
+	resultKey  string
 }
 
 func newFakeDriver() *fakeDriver {
@@ -262,6 +263,10 @@ func (d *fakeDriver) SubmitRowOperation(ctx context.Context, key, body string) (
 	ext := channelreconcile.ExternalTurn{ID: id, Status: d.status, Reply: fmt.Sprintf("reply-%d", n)}
 	d.turns = append(d.turns, ext)
 	err := d.startErr
+	resultKey := key
+	if d.resultKey != "" {
+		resultKey = d.resultKey
+	}
 	d.mu.Unlock()
 	d.started <- n
 	if d.startWait != nil {
@@ -274,7 +279,7 @@ func (d *fakeDriver) SubmitRowOperation(ctx context.Context, key, body string) (
 	if err != nil {
 		return rowdriver.Operation{}, err
 	}
-	return fakeRowOperation(key, ext), nil
+	return fakeRowOperation(resultKey, ext), nil
 }
 
 func (d *fakeDriver) RowOperationStatus(_ context.Context, id string) (rowdriver.Operation, error) {
@@ -627,16 +632,13 @@ func TestRunnerZeroBackoffUsesDefault(t *testing.T) {
 func TestRunnerPumpFatalOutranksConcurrentTransientOpen(t *testing.T) {
 	f := newRunnerFixture(t, slacknetwork.ErrOpenTransient)
 	ctx := context.Background()
-	require.NoError(t, f.store.CreateConversation(ctx, channelgateway.Conversation{
-		ID: "other-owner", ChannelID: "C-other", ConductorID: "other", RowInstanceID: "other-row", RowBinding: "other-binding", Mode: channelgateway.ChannelStream, AllowedSenders: []string{runUser},
-	}))
-	require.NoError(t, f.store.BindAgentThread(ctx, "other-owner", "agent-thread"))
 	_, err := f.store.Ingest(ctx, channelgateway.Inbound{
 		ConversationID: runConversation, EventID: "fatal-event", MessageID: "fatal-message", ChannelID: runChannel, SenderID: runUser, Body: runPrivate,
 	})
 	require.NoError(t, err)
 	openWait := make(chan struct{})
-	f.driver.openWait = openWait // hold the pump before its fatal binding conflict
+	f.driver.startWait = openWait
+	f.driver.resultKey = "different-attempt"
 	f.socket.onRunCtx = func(ctx context.Context, _ int, _ slacknetwork.EnvelopeHandler) error {
 		<-ctx.Done() // the fake transient open returns only after pump fatal cancels it
 		return nil
@@ -816,79 +818,6 @@ func TestRunnerConcurrentRunRejectedAndSocketCanceled(t *testing.T) {
 	require.Equal(t, PhaseStopped, f.runner.Status().Phase)
 }
 
-func TestRunnerStartupPreparedAttemptRecoversWithoutReplay(t *testing.T) {
-	f := newRunnerFixture(t)
-	ctx := context.Background()
-	_, err := f.store.Ingest(ctx, channelgateway.Inbound{ConversationID: runConversation, EventID: "prepared-event", MessageID: "prepared-message", ChannelID: runChannel, SenderID: runUser, Body: runPrivate})
-	require.NoError(t, err)
-	turn, err := f.store.NextTurn(ctx, runConversation)
-	require.NoError(t, err)
-	require.NotNil(t, turn)
-	require.NoError(t, f.store.BindAgentThread(ctx, runConversation, "agent-thread"))
-	_, created, err := f.store.PrepareAttempt(ctx, turn.ID, "")
-	require.NoError(t, err)
-	require.True(t, created)
-	f.driver.turns = []channelreconcile.ExternalTurn{{ID: "recovered-external", Status: "completed", Reply: "recovered-reply"}}
-	cancel, done := f.start(t)
-	defer stopRunner(t, cancel, done)
-	f.sender.waitPost(t, 1)
-	starts, _ := f.driver.counts()
-	require.Zero(t, starts, "prepared attempt must never replay")
-	items, err := f.store.PendingOutbox(ctx, runConversation, 10)
-	require.NoError(t, err)
-	require.Empty(t, items)
-}
-
-func TestRunnerNeedsReconciliationDoesNotHotLoopOrStartNewTurn(t *testing.T) {
-	f := newRunnerFixture(t)
-	ctx := context.Background()
-	_, err := f.store.Ingest(ctx, channelgateway.Inbound{ConversationID: runConversation, EventID: "unresolved-event", MessageID: "unresolved-message", ChannelID: runChannel, SenderID: runUser, Body: runPrivate})
-	require.NoError(t, err)
-	turn, err := f.store.NextTurn(ctx, runConversation)
-	require.NoError(t, err)
-	require.NotNil(t, turn)
-	require.NoError(t, f.store.BindAgentThread(ctx, runConversation, "agent-thread"))
-	_, created, err := f.store.PrepareAttempt(ctx, turn.ID, "")
-	require.NoError(t, err)
-	require.True(t, created)
-	cancel, done := f.start(t)
-	defer stopRunner(t, cancel, done)
-	f.socket.waitRun(t, 1)
-	_ = f.clock.nextActive(t, time.Minute)
-	require.True(t, f.runner.Status().Degraded)
-	starts, inspects := f.driver.counts()
-	require.Zero(t, starts)
-	require.Equal(t, 1, inspects)
-	require.NoError(t, f.emit(t, "second-envelope", "second-event", "second-body"))
-	_ = f.clock.nextActive(t, time.Minute)
-	starts, inspects = f.driver.counts()
-	require.Zero(t, starts)
-	require.Equal(t, 1, inspects)
-}
-
-func TestRunnerAgentThreadBindingCollisionIsTerminal(t *testing.T) {
-	f := newRunnerFixture(t)
-	ctx := context.Background()
-	require.NoError(t, f.store.CreateConversation(ctx, channelgateway.Conversation{
-		ID: "other-conversation", ChannelID: "C-other", ConductorID: "other-conductor", RowInstanceID: "other-row", RowBinding: "other-binding",
-		Mode: channelgateway.ChannelStream, AllowedSenders: []string{runUser},
-	}))
-	require.NoError(t, f.store.BindAgentThread(ctx, "other-conversation", "agent-thread"))
-	_, err := f.store.Ingest(ctx, channelgateway.Inbound{
-		ConversationID: runConversation, EventID: "collision-event", MessageID: "collision-message",
-		ChannelID: runChannel, SenderID: runUser, Body: runPrivate,
-	})
-	require.NoError(t, err)
-	err = f.runner.Run(ctx)
-	require.ErrorIs(t, err, ErrFatal)
-	require.Equal(t, ErrorConfig, f.runner.Status().LastError)
-	require.False(t, f.runner.Status().Degraded, "ownership conflict needs manual intervention, not reconciliation polling")
-	starts, inspects := f.driver.counts()
-	require.Zero(t, starts)
-	require.Zero(t, inspects)
-	require.NotContains(t, err.Error(), runPrivate)
-}
-
 func TestRunnerUncertainDeliveryDoesNotBlockLaterPendingItem(t *testing.T) {
 	f := newRunnerFixture(t)
 	ctx := context.Background()
@@ -977,7 +906,7 @@ func TestRunnerBackoffResetsAfterAcknowledgedSessionProgress(t *testing.T) {
 
 func TestRunnerDriverFailurePollsWithoutSecondPump(t *testing.T) {
 	f := newRunnerFixture(t)
-	f.driver.inspectErr = errors.New("driver failed with " + runPrivate)
+	f.driver.startErr = errors.New("driver failed with " + runPrivate)
 	_, err := f.store.Ingest(context.Background(), channelgateway.Inbound{
 		ConversationID: runConversation, EventID: "driver-event", MessageID: "driver-message", ChannelID: runChannel, SenderID: runUser, Body: runPrivate,
 	})
@@ -985,17 +914,18 @@ func TestRunnerDriverFailurePollsWithoutSecondPump(t *testing.T) {
 	cancel, done := f.start(t)
 	defer stopRunner(t, cancel, done)
 	f.socket.waitRun(t, 1)
+	f.driver.waitStart(t, 1)
 	timer := f.clock.nextActive(t, time.Minute)
 	starts, inspects := f.driver.counts()
-	require.Zero(t, starts)
-	require.Equal(t, 1, inspects)
+	require.Equal(t, 1, starts)
+	require.Zero(t, inspects)
 	require.Equal(t, ErrorWork, f.runner.Status().LastError)
 	require.NotContains(t, fmt.Sprint(f.runner.Status()), runPrivate)
 	f.driver.mu.Lock()
-	f.driver.inspectErr = nil
+	f.driver.startErr = nil
 	f.driver.mu.Unlock()
 	timer.fire()
-	f.driver.waitStart(t, 1)
+	f.driver.waitStart(t, 2)
 	f.sender.waitPost(t, 1)
 	require.Equal(t, 1, f.socket.count(), "work recovery must not spawn a second socket/pump")
 }

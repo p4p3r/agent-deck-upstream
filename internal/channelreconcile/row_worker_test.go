@@ -3,9 +3,13 @@ package channelreconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelreconcile/rowdriver"
@@ -26,7 +30,12 @@ func (f *fakeRowDriver) RowOperationStatus(_ context.Context, id string) (rowdri
 
 func rowWorkerFixture(t *testing.T, bodies ...string) (*channelgateway.Store, string) {
 	t.Helper()
-	s, err := channelgateway.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	return rowWorkerFixtureAt(t, filepath.Join(t.TempDir(), "gateway.db"), bodies...)
+}
+
+func rowWorkerFixtureAt(t *testing.T, path string, bodies ...string) (*channelgateway.Store, string) {
+	t.Helper()
+	s, err := channelgateway.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,5 +220,85 @@ func TestRowReconcileProtocolFailureStopsInsteadOfRetrying(t *testing.T) {
 	}
 	if _, err := (&Worker{Store: store, RowDriver: driver}).RunOne(context.Background(), conversation); !errors.Is(err, channelgateway.ErrConflict) {
 		t.Fatalf("protocol error=%v, want fatal conflict", err)
+	}
+}
+
+func TestRowReconcileConcurrentWorkersShareOneGlobalOperation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	store, conversation := rowWorkerFixtureAt(t, path, "synthetic request")
+	other, err := channelgateway.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+
+	var mu sync.Mutex
+	var keys []string
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	driver := &fakeRowDriver{
+		submit: func(key, _ string) (rowdriver.Operation, error) {
+			mu.Lock()
+			keys = append(keys, key)
+			mu.Unlock()
+			entered <- struct{}{}
+			<-release
+			return operation(key, rowdriver.Completed), nil
+		},
+		status: func(string) (rowdriver.Operation, error) {
+			return rowdriver.Operation{}, errors.New("unexpected status before a durable operation id")
+		},
+	}
+	errs := make(chan error, 2)
+	for _, candidate := range []*channelgateway.Store{store, other} {
+		go func(candidate *channelgateway.Store) {
+			_, err := (&Worker{Store: candidate, RowDriver: driver}).RunOne(context.Background(), conversation)
+			errs <- err
+		}(candidate)
+	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(4 * time.Second):
+			t.Fatal("concurrent worker did not reach the row boundary")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	gotKeys := slices.Clone(keys)
+	mu.Unlock()
+	if len(gotKeys) != 2 || gotKeys[0] == "" || gotKeys[0] != gotKeys[1] {
+		t.Fatalf("concurrent workers used different global operations: %q", gotKeys)
+	}
+	items, err := store.PendingOutbox(context.Background(), conversation, 10)
+	if err != nil || len(items) != 1 || items[0].Body != "synthetic assistant result" {
+		t.Fatalf("concurrent completion outbox=%+v err=%v", items, err)
+	}
+}
+
+func TestRowReconcileDriverDiagnosticsDoNotExposePrivateBody(t *testing.T) {
+	store, conversation := rowWorkerFixture(t, "private prompt")
+	driver := &fakeRowDriver{
+		submit: func(string, string) (rowdriver.Operation, error) {
+			return rowdriver.Operation{}, errors.New("driver failed: private prompt")
+		},
+		status: func(string) (rowdriver.Operation, error) {
+			t.Fatal("status called without a durable operation id")
+			return rowdriver.Operation{}, nil
+		},
+	}
+	result, err := (&Worker{Store: store, RowDriver: driver}).RunOne(context.Background(), conversation)
+	if !errors.Is(err, ErrDriver) {
+		t.Fatalf("driver error=%v, want %v", err, ErrDriver)
+	}
+	if strings.Contains(err.Error(), "private prompt") || strings.Contains(fmt.Sprint(result), "private prompt") {
+		t.Fatalf("private body escaped through diagnostics: result=%+v err=%v", result, err)
 	}
 }

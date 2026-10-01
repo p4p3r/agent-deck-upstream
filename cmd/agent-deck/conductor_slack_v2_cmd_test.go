@@ -19,7 +19,7 @@ func TestConductorSlackV2EarlyDispatch(t *testing.T) {
 		args []string
 		want bool
 	}{
-		{[]string{"conductor", "slack-v2", "run"}, true},
+		{[]string{"conductor", "slack-v2", "run", "sample"}, true},
 		{[]string{"conductor", "slack-v2", "--help"}, true},
 		{[]string{"conductor", "status"}, false},
 		{[]string{"session", "start"}, false},
@@ -31,29 +31,25 @@ func TestConductorSlackV2EarlyDispatch(t *testing.T) {
 	}
 }
 
-func TestParseConductorSlackV2RunRequiresExplicitMode(t *testing.T) {
+func TestParseConductorSlackV2RunUsesRowContract(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
-		mode channelruntime.Mode
-		id   string
 		ok   bool
 	}{
-		{"create", []string{"run", "sample", "--create"}, channelruntime.ModeCreate, "", true},
-		{"resume", []string{"run", "sample", "--resume", "thread-exact"}, channelruntime.ModeResume, "thread-exact", true},
-		{"missing", []string{"run", "sample"}, "", "", false},
-		{"both", []string{"run", "sample", "--create", "--resume", "thread-exact"}, "", "", false},
-		{"empty resume", []string{"run", "sample", "--resume", ""}, "", "", false},
-		{"padded resume", []string{"run", "sample", "--resume", " thread-exact "}, "", "", false},
-		{"traversal", []string{"run", "../sample", "--create"}, "", "", false},
-		{"extra", []string{"run", "sample", "--create", "extra"}, "", "", false},
+		{"row", []string{"run", "sample"}, true},
+		{"missing name", []string{"run"}, false},
+		{"legacy create", []string{"run", "sample", "--create"}, false},
+		{"legacy resume", []string{"run", "sample", "--resume", "thread-exact"}, false},
+		{"traversal", []string{"run", "../sample"}, false},
+		{"extra", []string{"run", "sample", "extra"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseConductorSlackV2Run(tc.args)
 			if (err == nil) != tc.ok {
 				t.Fatalf("error presence = %v, want success %v", err != nil, tc.ok)
 			}
-			if tc.ok && (got.mode != tc.mode || got.threadID != tc.id || got.name != "sample") {
+			if tc.ok && (got.mode != channelruntime.ModeRow || got.threadID != "" || got.name != "sample") {
 				t.Fatalf("parsed mode/id/name = %q/%q/%q", got.mode, got.threadID, got.name)
 			}
 		})
@@ -65,7 +61,8 @@ func TestConductorSlackV2HelpDoesNotInitializeRuntime(t *testing.T) {
 	if code := runConductorSlackV2Command("", []string{"--help"}, &out, &errOut); code != 0 {
 		t.Fatalf("help exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "--create | --resume") || errOut.Len() != 0 {
+	if !strings.Contains(out.String(), "conductor slack-v2 run <name>") ||
+		strings.Contains(out.String(), "--create") || strings.Contains(out.String(), "--resume") || errOut.Len() != 0 {
 		t.Fatalf("unexpected help output")
 	}
 }
@@ -87,7 +84,7 @@ func TestConductorSlackV2RunRequiresSelectedBackendBeforeNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	code := runConductorSlackV2Command("", []string{"run", "sample", "--create"}, &out, &errOut)
+	code := runConductorSlackV2Command("", []string{"run", "sample"}, &out, &errOut)
 	if code != 1 || !strings.Contains(errOut.String(), "config") || out.Len() != 0 {
 		t.Fatalf("unselected backend result: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
@@ -124,6 +121,7 @@ func slackV2LiteralSettings() session.SlackV2ConductorConfig {
 	return session.SlackV2ConductorConfig{
 		AppToken: "fixture-app", BotToken: "fixture-bot", ChannelID: "fixture-channel",
 		AllowedUserIDs: []string{"fixture-user"}, CodexExecutable: "$CODEX_EXECUTABLE", CodexModel: "${CODEX_MODEL}",
+		RowInstanceID: "fixture-row", RowBindingToken: "fixture-binding",
 	}
 }
 
@@ -170,15 +168,18 @@ func TestLoadConductorSlackV2ConfigValues(t *testing.T) {
 				wantLookups = 5
 			}
 			if got.AppToken != env["SLACK_APP_TOKEN"] || got.BotToken != env["SLACK_BOT_TOKEN"] ||
-				got.ChannelID != env["SLACK_DECK_CHANNEL"] || !slices.Equal(got.AllowedUserIDs, wantUsers) || lookups != wantLookups {
+				got.ChannelID != env["SLACK_DECK_CHANNEL"] || got.RowInstanceID != settings.RowInstanceID ||
+				got.RowBinding != settings.RowBindingToken || !slices.Equal(got.AllowedUserIDs, wantUsers) || lookups != wantLookups {
 				t.Fatal("Slack configuration mismatch")
 			}
-			if got.CodexExecutable != settings.CodexExecutable || got.CodexModel != settings.CodexModel || got.CodexCWD != cwd ||
+			if got.CodexExecutable != "" || got.CodexModel != "" || got.CodexCWD != "" ||
 				got.ConductorID != "default/sample" || got.ConversationID != "default/sample/channel-stream" {
 				t.Fatal("runtime configuration mismatch")
 			}
 			raw, err := session.ConductorSlackV2Config("sample")
-			if err != nil || !reflect.DeepEqual(raw, settings) {
+			stored := settings
+			stored.CodexExecutable, stored.CodexModel = "", ""
+			if err != nil || !reflect.DeepEqual(raw, stored) {
 				t.Fatal("source configuration changed")
 			}
 		})
@@ -196,7 +197,7 @@ func TestLoadConductorSlackV2ConfigRejectsInvalidValues(t *testing.T) {
 		{"padded_ref_start", " $NAME"}, {"padded_ref_end", "${NAME} "},
 		{"padded_literal_start", " fixture"}, {"padded_literal_end", "fixture\n"}, {"blank", "\t"},
 	} {
-		for _, field := range []string{"app", "bot", "channel", "user"} {
+		for _, field := range []string{"app", "bot", "channel", "user", "row_instance", "row_binding"} {
 			t.Run(tc.name+"/"+field, func(t *testing.T) {
 				settings := slackV2LiteralSettings()
 				switch field {
@@ -208,6 +209,10 @@ func TestLoadConductorSlackV2ConfigRejectsInvalidValues(t *testing.T) {
 					settings.ChannelID = tc.value
 				case "user":
 					settings.AllowedUserIDs[0] = tc.value
+				case "row_instance":
+					settings.RowInstanceID = tc.value
+				case "row_binding":
+					settings.RowBindingToken = tc.value
 				}
 				dir := slackV2LoaderFixture(t, settings)
 				got, err := loadConductorSlackV2Config("default", "sample", dir, func(name string) (string, bool) {

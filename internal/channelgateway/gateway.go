@@ -132,6 +132,13 @@ func archivePristineV3(path string) error {
 			if !archiveInfo.Mode().IsRegular() {
 				return ErrSchema
 			}
+			hasSidecars, err := gatewaySidecarsPresent(archive)
+			if err != nil {
+				return err
+			}
+			if hasSidecars {
+				return ErrSchema
+			}
 			version, pristine, err := inspectGatewaySchema(archive)
 			if err != nil || version != 3 || !pristine {
 				return ErrSchema
@@ -142,6 +149,10 @@ func archivePristineV3(path string) error {
 	if !mainInfo.Mode().IsRegular() {
 		return ErrStorage
 	}
+	hasSidecars, err := gatewaySidecarsPresent(path)
+	if err != nil {
+		return err
+	}
 	version, pristine, err := inspectGatewaySchema(path)
 	if err != nil {
 		return ErrSchema
@@ -149,13 +160,8 @@ func archivePristineV3(path string) error {
 	if version == 0 || version == schemaVersion {
 		return nil
 	}
-	if version != 3 || !pristine || archiveErr == nil {
+	if version != 3 || !pristine || archiveErr == nil || hasSidecars {
 		return ErrSchema
-	}
-	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Lstat(path + suffix); !errors.Is(err, os.ErrNotExist) {
-			return ErrSchema
-		}
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return ErrStorage
@@ -174,9 +180,21 @@ func archivePristineV3(path string) error {
 	return nil
 }
 
+func gatewaySidecarsPresent(path string) (bool, error) {
+	present := false
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(path + suffix); err == nil {
+			present = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, ErrSchema
+		}
+	}
+	return present, nil
+}
+
 func inspectGatewaySchema(path string) (version int, pristine bool, resultErr error) {
 	u := url.URL{Scheme: "file", Path: path}
-	db, err := sql.Open("sqlite", u.String()+"?mode=ro&_pragma=foreign_keys(on)")
+	db, err := sql.Open("sqlite", u.String()+"?mode=ro&immutable=1&_pragma=query_only(1)&_pragma=foreign_keys(on)")
 	if err != nil {
 		return 0, false, err
 	}
@@ -193,6 +211,14 @@ func inspectGatewaySchema(path string) (version int, pristine bool, resultErr er
 	}
 	if version != 3 {
 		return version, false, nil
+	}
+	var rowContractColumns int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('conversations')
+		WHERE name IN ('row_instance_id','row_binding_token','last_row_operation_id')`).Scan(&rowContractColumns); err != nil {
+		return version, false, err
+	}
+	if rowContractColumns != 0 {
+		return version, false, errors.New("schema labeled v3 contains v4 row columns")
 	}
 	var inbound, turns, outbox, cursor, sequenced int64
 	if err := db.QueryRow(`SELECT
