@@ -165,6 +165,16 @@ func (m *CodexSubmissionMarker) updatePhase(phase string, now time.Time) error {
 // assigned to that prior attempt and makes its marker safe to remove. With no
 // new generation, delivery remains unknowable and all later sends fail closed.
 func ReconcileCodexSubmissionMarker(instanceID, codexSessionID, currentGeneration string) (string, error) {
+	return ReconcileCodexSubmissionMarkerWithTerminalOwner(instanceID, codexSessionID, currentGeneration, nil)
+}
+
+// ReconcileCodexSubmissionMarkerWithTerminalOwner permits a terminal durable
+// operation to resolve only the v2 marker it owns. The ownership callback is
+// evaluated while the caller holds the matching acceptance lock.
+func ReconcileCodexSubmissionMarkerWithTerminalOwner(
+	instanceID, codexSessionID, currentGeneration string,
+	terminalOwner func(string) bool,
+) (string, error) {
 	marker, found, err := readCodexSubmissionMarker(codexSessionID)
 	if err != nil || !found {
 		return "", err
@@ -172,7 +182,8 @@ func ReconcileCodexSubmissionMarker(instanceID, codexSessionID, currentGeneratio
 	if marker.InstanceID != strings.TrimSpace(instanceID) || marker.CodexSessionID != strings.TrimSpace(codexSessionID) {
 		return "", fmt.Errorf("Codex submission marker ownership does not match this instance")
 	}
-	if marker.Version == codexSubmissionMarkerVersionCorrelated {
+	if marker.Version == codexSubmissionMarkerVersionCorrelated &&
+		(terminalOwner == nil || !terminalOwner(marker.OperationID)) {
 		return "", fmt.Errorf("Codex submission marker belongs to durable operation %s; refusing ordinary reconciliation", marker.OperationID)
 	}
 	if currentGeneration == marker.PriorTurnGeneration {
