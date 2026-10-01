@@ -3383,6 +3383,10 @@ func handleSessionSend(profile string, args []string) {
 		turnQuery := session.TurnQuery{Path: turnPath, Prompt: message, Cursor: turnCursor}
 		tun.retry.turnAdvanced = func() bool { return session.TurnAdvanced(turnQuery) }
 	}
+	if *acceptanceOnly {
+		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
+		tun.retry.codexFenceUnchanged = func() bool { return validateCodexAcceptanceFence(inst, acceptanceFence) == nil }
+	}
 	if acceptanceGuard != nil {
 		if err := validateCodexAcceptanceFence(inst, acceptanceFence); err != nil {
 			acceptanceGuard.Release()
@@ -4672,6 +4676,15 @@ func validateCodexAcceptanceFence(inst *session.Instance, fence codexAcceptanceF
 	return nil
 }
 
+func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFence) bool {
+	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
+		return false
+	}
+	generation, err := inst.LatestCodexTurnGeneration()
+	return err == nil && generation != "" && generation != fence.priorTurnGeneration &&
+		strings.HasPrefix(generation, fence.codexSessionID+":")
+}
+
 func requireStructuredCodexAcceptedTurn(
 	inst *session.Instance,
 	jsonOutput, wait bool,
@@ -5147,6 +5160,9 @@ type sendRetryOptions struct {
 	// and wins over every heuristic below. nil for callers without a
 	// transcript (non-Claude tools, slash commands, unknown path).
 	turnAdvanced func() bool
+
+	// Recovery requires a readable rollout still at the pre-send generation.
+	codexFenceUnchanged func() bool
 }
 
 // verificationChecks is how many post-send checks the verify loop runs for
@@ -5238,7 +5254,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// wire none can never receive a queued verdict and pay nothing extra.
 	var arrivalBaseline sendArrivalBaseline
 	if skipVerify || opts.targetBusyByHook != nil {
-		arrivalBaseline = captureArrivalBaseline(target, message)
+		arrivalBaseline = captureArrivalBaseline(target, message, session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil)
 	}
 	// hookBusyBeforeSend distinguishes the two ways the hook can read busy
 	// after a send that landed: the target was ALREADY mid-turn, so the
@@ -5246,7 +5262,27 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// is the target taking this message up (submitted).
 	hookBusyBeforeSend := opts.hookBusyNow()
 
-	if err := sendInitialKeysChecked(target, message, opts.expectedPasteBreaks); err != nil {
+	fencedCodex := session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil
+	var initialErr error
+	if fencedCodex {
+		capture := send.PaneCapture{Raw: arrivalBaseline.raw, OK: arrivalBaseline.paneOK, Geometry: arrivalBaseline.geometry}
+		_, clear := send.CaptureClearCodexComposerFrame(capture)
+		writer, pinned := target.(interface {
+			SendKeysAndEnterIfUnattached(string, tmux.PaneGeometry) (bool, error)
+		})
+		if !clear || !arrivalBaseline.statusOK || !arrivalBaseline.idle || hookBusyBeforeSend ||
+			!pinned || opts.codexFenceUnchanged == nil || !opts.codexFenceUnchanged() {
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: detached, idle, clear exact target is unproven")
+		}
+		started, err := writer.SendKeysAndEnterIfUnattached(message, *arrivalBaseline.geometry)
+		if !started {
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: exact target attached, changed or unreadable")
+		}
+		initialErr = err
+	} else {
+		initialErr = sendInitialKeysChecked(target, message, opts.expectedPasteBreaks)
+	}
+	if err := initialErr; err != nil {
 		// A refused over-long line is a distinct, actionable outcome: the
 		// transport typed nothing, so the composer is untouched and the
 		// caller must not retry the same body against the same pane
@@ -5546,6 +5582,8 @@ const arrivalSafeLineBytes = 1023
 // against. Every field here is meaningless on its own and meaningful only as a
 // delta (see the comment at the capture site).
 type sendArrivalBaseline struct {
+	geometry *tmux.PaneGeometry
+	idle     bool
 	// occurrences is how many copies of the message body were already
 	// visible in the pane before the send.
 	occurrences int
@@ -5578,20 +5616,40 @@ type sendArrivalBaseline struct {
 	statusOK bool
 }
 
+// captureSendPane uses structural captures only for fenced Codex recovery.
+func captureSendPane(target sendRetryTarget, structural bool) send.PaneCapture {
+	if structural {
+		if source, ok := target.(interface {
+			CapturePaneSnapshot() (tmux.PaneSnapshot, error)
+		}); ok {
+			snapshot, err := source.CapturePaneSnapshot()
+			capture := send.CaptureOutcome(snapshot.Raw, err)
+			if err == nil {
+				capture.Geometry = &snapshot.Geometry
+			}
+			return capture
+		}
+	}
+	raw, err := target.CapturePaneFresh()
+	return send.CaptureOutcome(raw, err)
+}
+
 // captureArrivalBaseline snapshots the pane and status before a send. Each
 // signal records whether it was actually observed; a signal without a valid
 // baseline is disabled, never guessed.
 //
 // The capture is taken even for a message too short to yield a token: the
 // observer still needs the pre-send frame for the paste-marker delta.
-func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
+func captureArrivalBaseline(target sendRetryTarget, message string, structural bool) sendArrivalBaseline {
 	base := sendArrivalBaseline{}
-	if raw, err := target.CapturePaneFresh(); err == nil {
-		base.raw, base.paneOK = raw, true
-		base.occurrences, base.pasteMarkers, _ = paneArrivalCounts(raw, message)
+	capture := captureSendPane(target, structural)
+	if capture.OK {
+		base.raw, base.paneOK, base.geometry = capture.Raw, true, capture.Geometry
+		base.occurrences, base.pasteMarkers, _ = paneArrivalCounts(capture.Raw, message)
 	}
 	if status, err := target.GetStatus(); err == nil {
 		base.wasActive, base.statusOK = status == "active", true
+		base.idle = status == "waiting" || status == "idle"
 	}
 	return base
 }
@@ -5643,6 +5701,27 @@ func verificationWindow(checks int, delay time.Duration) string {
 // taking it up; hookBusyBeforeSend is the pre-send reading of
 // opts.targetBusyByHook. A composer paste marker never feeds that verdict.
 func verifyContentArrival(target sendRetryTarget, message string, opts sendRetryOptions, baseline sendArrivalBaseline, hookBusyBeforeSend bool) (string, error) {
+	// A fenced Codex send can recover a swallowed Enter, but only from a
+	// composer that was positively empty before this operation. The rollout
+	// generation, rather than pane activity or a disappearing draft, remains
+	// the authoritative submission signal for this path.
+	fencedCodex := session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil
+	var codexFrame send.CodexComposerFrame
+	codexComposerWasClear := false
+	if fencedCodex && opts.codexFenceUnchanged != nil && baseline.paneOK && baseline.statusOK && baseline.idle && !hookBusyBeforeSend {
+		codexFrame, codexComposerWasClear = send.CaptureClearCodexComposerFrame(send.PaneCapture{Raw: baseline.raw, OK: baseline.paneOK, Geometry: baseline.geometry})
+	}
+	attrib := send.EnterAttribution{Message: message, CodexFrame: codexFrame}
+	normalizedMessage := send.NormalizePromptText(message)
+	structuralRefused := !codexComposerWasClear
+	recoveryAttempted := false
+	guardedTarget, canGuard := target.(interface {
+		SendEnterIfUnattached(tmux.PaneGeometry) error
+	})
+	if fencedCodex && !canGuard {
+		structuralRefused = true
+	}
+
 	// Whether an unverified outcome is a failure depends on the longest LINE,
 	// not on the total payload. Canonical buffering is per line — that is the
 	// whole finding this fix rests on — so a 20 KB body of 80-byte lines is
@@ -5661,7 +5740,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 
 	token := collapseWhitespace(messageDeliveryToken(message))
-	if token == "" {
+	if token == "" && !fencedCodex {
 		// Nothing distinctive enough to look for. Verification is impossible
 		// rather than failed — but "impossible" must not become an exit 0 for
 		// a payload with a line big enough to be silently eaten, which would
@@ -5688,18 +5767,29 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	sawBody := false
 	lastContent := ""
 	for i := 0; i < checks; i++ {
-		// Strongest signal first: an idle agent that starts working received
+		// Turn advancement in the harness's own transcript is authoritative.
+		if opts.turnAdvanced != nil && opts.turnAdvanced() {
+			return deliverySubmitted, nil
+		}
+		if fencedCodex && i == 0 {
+			time.Sleep(opts.checkDelay)
+		}
+		// Strongest pane signal: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
-		if baseline.statusOK && !baseline.wasActive {
+		if !fencedCodex && baseline.statusOK && !baseline.wasActive {
 			if status, err := target.GetStatus(); err == nil && status == "active" {
 				return deliverySubmitted, nil
 			}
 		}
 		if baseline.paneOK {
-			raw, captureErr := target.CapturePaneFresh()
-			obs.Observe(send.CaptureOutcome(raw, captureErr))
-			if obs.TurnStarted() {
+			capture := captureSendPane(target, fencedCodex)
+			raw, captureErr := capture.Raw, capture.Err
+			obs.Observe(capture)
+			if !fencedCodex && obs.TurnStarted() {
 				return deliverySubmitted, nil
+			}
+			if fencedCodex && obs.BodyArrived() {
+				sawBody = true
 			}
 			if n, markers, ok := paneArrivalCounts(raw, message); captureErr == nil && ok {
 				content := tmux.StripANSI(raw)
@@ -5716,7 +5806,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					// already busy can only be inferred queued, and this path
 					// has no queue acknowledgement to read, so it keeps the
 					// #1793 verdict below.
-					if !hookBusyBeforeSend && !send.HasUnsentComposerPrompt(content, message) && opts.hookBusyNow() {
+					if !fencedCodex && !hookBusyBeforeSend && !send.HasUnsentComposerPrompt(content, message) && opts.hookBusyNow() {
 						return deliverySubmitted, nil
 					}
 					// Keep polling: the body is in, but the turn may still
@@ -5743,10 +5833,44 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					sawBody = true
 				}
 			}
+			// Recovery sends no body and never clears input. Require the FULL
+			// visible draft to equal our payload; the observer's token, prefix
+			// and paste-marker matches are arrival evidence only. A failed read,
+			// foreign addition, collapsed paste or partial rendering gets no Enter.
+			if codexComposerWasClear && !structuralRefused && !recoveryAttempted && normalizedMessage != "" {
+				draft, visible := codexFrame.Prompt(capture)
+				if !visible {
+					structuralRefused = true
+				}
+				if visible && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft) && !opts.hookBusyNow() {
+					status, statusErr := target.GetStatus()
+					if statusErr == nil && (status == "waiting" || status == "idle") {
+						// Acceptance may have landed while capturing the pane or
+						// reading status. Recheck immediately before the gated press
+						// so a stale composer frame cannot duplicate an accepted turn.
+						if opts.turnAdvanced() {
+							return deliverySubmitted, nil
+						}
+						recoveryAttempted = true
+						if !opts.codexFenceUnchanged() || !attrib.NudgeEnter(guardedEnterPresser{target: guardedTarget, geometry: *capture.Geometry}, capture, tmux.StripANSI) {
+							structuralRefused = true
+						}
+					} else {
+						structuralRefused = true
+					}
+				}
+			}
 		}
 		if i < checks-1 {
 			time.Sleep(opts.checkDelay)
 		}
+	}
+	// The final permitted Enter can start the turn on the last iteration.
+	if fencedCodex && opts.turnAdvanced() {
+		return deliverySubmitted, nil
+	}
+	if fencedCodex && structuralRefused {
+		return composerHoldsFailure(checks)
 	}
 
 	if sawBody {
@@ -5761,6 +5885,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		v := obs.Verdict(checks, verificationWindow(checks, opts.checkDelay))
 		switch v.Outcome {
 		case send.OutcomeConfirmed:
+			if fencedCodex {
+				// A held-then-cleared composer alone cannot issue an exact
+				// Codex accepted-turn receipt. Keep its confirmation unknown.
+				return deliveryDelivered, nil
+			}
 			return deliverySubmitted, nil
 		case send.OutcomeFailed:
 			return deliveryFailure(v, checks)
@@ -5783,6 +5912,13 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 	return deliveryUnverified, nil
 }
+
+type guardedEnterPresser struct {
+	target   interface{ SendEnterIfUnattached(tmux.PaneGeometry) error }
+	geometry tmux.PaneGeometry
+}
+
+func (p guardedEnterPresser) SendEnter() error { return p.target.SendEnterIfUnattached(p.geometry) }
 
 // longestMessageLineBytes is the length of the longest line of message.
 // Mirrors the quantity the tmux transport measures, because the terminal

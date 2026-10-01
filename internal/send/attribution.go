@@ -1,6 +1,10 @@
 package send
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
 
 // EnterAttribution is the single chokepoint every automated bare-Enter press
 // must route through (issue #1777).
@@ -24,6 +28,10 @@ type EnterAttribution struct {
 	// Message is the payload agent-deck itself typed into this pane. Composer
 	// content matching it is attributable and safe to nudge.
 	Message string
+
+	// CodexFrame requires exact full-draft attribution against a positively
+	// clear pre-send viewport. Other callers retain their existing gate.
+	CodexFrame CodexComposerFrame
 
 	// OwnPasteMarker records that a "[Pasted text #N +M lines]" marker found
 	// in the composer AFTER the send is the collapsed rendering of Message.
@@ -65,6 +73,8 @@ type PaneCapture struct {
 	// Err is the capture error when OK is false (nil otherwise). It lets a
 	// consumer tell a gone pane (tmux.ErrCaptureGone) from a transient failure.
 	Err error
+	// Geometry is present only for a complete, fresh viewport snapshot.
+	Geometry *tmux.PaneGeometry
 }
 
 // Captured wraps a successful pane capture.
@@ -116,6 +126,11 @@ func (a EnterAttribution) EnterWouldSubmitForeignDraft(c PaneCapture, strip func
 	}
 	strip = orIdentity(strip)
 	raw := c.Raw
+	if len(a.CodexFrame.footerRows) != 0 {
+		draft, visible := a.CodexFrame.Prompt(c)
+		return !visible || a.Message == "" || draft != NormalizePromptText(a.Message) ||
+			ComposerBodyIsSuggestion(raw) || HasUnsentPastedPrompt(draft)
+	}
 	draft, visible := ComposerDraft(raw, strip)
 	if !visible || draft == "" {
 		// Empty composer, suggestion, or placeholder: Enter submits nothing.
