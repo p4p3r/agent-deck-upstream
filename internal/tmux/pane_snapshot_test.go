@@ -44,6 +44,49 @@ func TestPaneSnapshot_CompleteViewport(t *testing.T) {
 	}
 }
 
+func TestPaneSnapshot_AllowsOSC8HyperlinksOnly(t *testing.T) {
+	const geometry = "%7|120|6|2|2|0|0|1|$3|0|12345"
+	const openST = "\x1b]8;;https://community.openai.com/c/codex/37\x1b\\"
+	const closeST = "\x1b]8;;\x1b\\"
+	const openBEL = "\x1b]8;id=tip;https://example.test\x07"
+	const closeBEL = "\x1b]8;;\x07"
+
+	for _, tc := range []struct {
+		name string
+		link string
+	}{
+		{"string terminator", openST + "Codex community forum" + closeST},
+		{"bell terminator", openBEL + "linked tip" + closeBEL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "\n\n› Ask Codex to do anything\n\n  Tip: Visit the " + tc.link + "\n  ? for shortcuts\n"
+			snapshot, err := parsePaneSnapshot(geometry + "\n" + raw + geometry + "\n")
+			if err != nil {
+				t.Fatalf("OSC 8 is width-neutral viewport decoration: %v", err)
+			}
+			rows, ok := snapshot.Rows()
+			if !ok || len(rows) != snapshot.Geometry.Height {
+				t.Fatalf("OSC 8 viewport must remain structurally readable: ok=%v rows=%d", ok, len(rows))
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name, escape string
+	}{
+		{"unterminated hyperlink", "\x1b]8;;https://example.test"},
+		{"window title", "\x1b]0;not-a-link\x07"},
+		{"cursor movement", "\x1b[2K"},
+	} {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			raw := "\n\n› Ask Codex to do anything\n\n  Tip: " + tc.escape + "unsafe\n  ? for shortcuts\n"
+			if _, err := parsePaneSnapshot(geometry + "\n" + raw + geometry + "\n"); err == nil {
+				t.Fatal("non-OSC-8 or malformed terminal control must fail closed")
+			}
+		})
+	}
+}
+
 func TestCapturePaneSnapshot_StyledFixedRows(t *testing.T) {
 	const model = "  gpt-test · /work/fixture · Context 90% left · Context 10% used"
 	const shortcuts = "  ? for shortcuts · Warning: experimental features enabled"

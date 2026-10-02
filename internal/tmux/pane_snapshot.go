@@ -30,6 +30,17 @@ type PaneSnapshot struct {
 }
 
 var paneSGR = regexp.MustCompile(`\x1b\[[0-9;:]*m`)
+var paneOSC8 = regexp.MustCompile(`\x1b\]8;[^\x07\x1b]*;[^\x07\x1b]*(?:\x07|\x1b\\)`)
+
+// stripPaneRowDecorations removes only the terminal decorations that tmux's
+// capture-pane -e can legitimately preserve in a viewport used for structural
+// input attribution. SGR changes styling; OSC 8 adds a hyperlink around
+// otherwise ordinary visible text. Neither moves the cursor or changes cell
+// width. Every other control sequence remains in the row and is rejected by
+// Rows below.
+func stripPaneRowDecorations(row string) string {
+	return paneOSC8.ReplaceAllString(paneSGR.ReplaceAllString(row, ""), "")
+}
 
 // Rows rejects incomplete viewports, invalid cursors and unsupported escapes.
 func (s PaneSnapshot) Rows() ([]string, bool) {
@@ -50,7 +61,7 @@ func (s PaneSnapshot) Rows() ([]string, bool) {
 		return nil, false
 	}
 	for _, row := range rows {
-		plain := paneSGR.ReplaceAllString(row, "")
+		plain := stripPaneRowDecorations(row)
 		if strings.ContainsFunc(plain, unicode.IsControl) || ansi.StringWidth(plain) > g.Width {
 			return nil, false
 		}
