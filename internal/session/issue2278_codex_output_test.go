@@ -360,6 +360,20 @@ func TestLatestCodexTurnGenerationScansBoundedTail(t *testing.T) {
 			t.Fatalf("generation = %q, want no stale generation beyond scan bound", generation)
 		}
 	})
+
+	t.Run("completion preserves a long idle turn beyond the start boundary", func(t *testing.T) {
+		start := `{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-long"}}` + "\n"
+		completion := `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-long"}}` + "\n"
+		content := start + strings.Repeat(" ", int(codexTurnGenerationScanMaxBytes)+1) + "\n" + completion
+		inst := writeRollout(t, "thread-long-idle", content)
+		generation, err := inst.LatestCodexTurnGeneration()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if generation != "thread-long-idle:turn-long" {
+			t.Fatalf("generation = %q, want completed long-turn generation", generation)
+		}
+	})
 }
 
 func TestCodexAcceptanceLockSerializesAcrossProcesses(t *testing.T) {
