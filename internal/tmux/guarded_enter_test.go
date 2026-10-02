@@ -12,8 +12,8 @@ import (
 	"github.com/creack/pty"
 )
 
-func TestSendEnterIfUnattached_RealClients(t *testing.T) {
-	for _, mode := range []string{"unattached", "attached", "unrelated", "attach queued before guard", "changed target"} {
+func TestSendEnterIfStable_RealClients(t *testing.T) {
+	for _, mode := range []string{"unattached", "stable attached", "attached", "unrelated", "attach queued before guard", "changed target"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			keys := filepath.Join(dir, "keys")
@@ -46,7 +46,7 @@ func TestSendEnterIfUnattached_RealClients(t *testing.T) {
 			if mode == "changed target" {
 				snapshot.Geometry.SessionID = "$99999999"
 			}
-			if mode == "attached" || mode == "unrelated" || mode == "attach queued before guard" {
+			if mode == "stable attached" || mode == "attached" || mode == "unrelated" || mode == "attach queued before guard" {
 				target := s.Name
 				if mode == "unrelated" {
 					other := NewSession("guarded-unrelated", dir)
@@ -80,8 +80,15 @@ func TestSendEnterIfUnattached_RealClients(t *testing.T) {
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
+				if mode == "stable attached" {
+					var err error
+					snapshot, err = s.CapturePaneSnapshot()
+					if err != nil || snapshot.Geometry.AttachedClients != 1 {
+						t.Fatalf("capture stable attached target: %#v %v", snapshot.Geometry, err)
+					}
+				}
 			}
-			wantEnter := mode == "unattached" || mode == "unrelated"
+			wantEnter := mode == "unattached" || mode == "stable attached" || mode == "unrelated"
 			if mode == "attach queued before guard" {
 				for {
 					out, err := s.tmuxCmd("show-option", "-gqv", "@guard-completed").Output()
@@ -93,7 +100,7 @@ func TestSendEnterIfUnattached_RealClients(t *testing.T) {
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
-			} else if err := s.SendEnterIfUnattached(snapshot.Geometry); (err == nil) != wantEnter {
+			} else if err := s.SendEnterIfStable(snapshot.Geometry); (err == nil) != wantEnter {
 				t.Fatalf("guard result: %v; want Enter=%v", err, wantEnter)
 			}
 			time.Sleep(40 * time.Millisecond)
@@ -121,20 +128,20 @@ func TestSendEnterIfUnattached_RealClients(t *testing.T) {
 	}
 }
 
-func TestSendEnterIfUnattached_InvalidEvidence(t *testing.T) {
+func TestSendEnterIfStable_InvalidEvidence(t *testing.T) {
 	s := &Session{Name: "unused"}
 	for _, g := range []PaneGeometry{
 		{}, {PaneID: "%0", SessionID: "$0", AttachedClients: -1},
 		{PaneID: "%0;send-keys Enter", SessionID: "$0"}, {PaneID: "%0", SessionID: "$"},
 	} {
-		if err := s.SendEnterIfUnattached(g); err == nil {
+		if err := s.SendEnterIfStable(g); err == nil {
 			t.Fatal("invalid evidence authorized Enter")
 		}
 	}
 }
 
-func TestSendKeysAndEnterIfUnattached_RealClients(t *testing.T) {
-	for _, mode := range []string{"unattached", "attached", "unrelated", "changed target"} {
+func TestSendKeysAndEnterIfStable_RealClients(t *testing.T) {
+	for _, mode := range []string{"unattached", "stable attached", "attached", "unrelated", "changed target"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			keys := filepath.Join(dir, "keys")
@@ -167,7 +174,7 @@ func TestSendKeysAndEnterIfUnattached_RealClients(t *testing.T) {
 			if mode == "changed target" {
 				snapshot.Geometry.SessionID = "$99999999"
 			}
-			if mode == "attached" || mode == "unrelated" || mode == "attach queued before guard" {
+			if mode == "stable attached" || mode == "attached" || mode == "unrelated" {
 				target := s.Name
 				if mode == "unrelated" {
 					other := NewSession("guarded-unrelated", dir)
@@ -196,9 +203,16 @@ func TestSendKeysAndEnterIfUnattached_RealClients(t *testing.T) {
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
+				if mode == "stable attached" {
+					var err error
+					snapshot, err = s.CapturePaneSnapshot()
+					if err != nil || snapshot.Geometry.AttachedClients != 1 {
+						t.Fatalf("capture stable attached target: %#v %v", snapshot.Geometry, err)
+					}
+				}
 			}
-			wantEnter := mode == "unattached" || mode == "unrelated"
-			started, err := s.SendKeysAndEnterIfUnattached("synthetic body", snapshot.Geometry)
+			wantEnter := mode == "unattached" || mode == "stable attached" || mode == "unrelated"
+			started, err := s.SendKeysAndEnterIfStable("synthetic body", snapshot.Geometry)
 			if (err == nil) != wantEnter || started != wantEnter {
 				t.Fatalf("admission result: started=%v err=%v; want transport=%v", started, err, wantEnter)
 			}

@@ -18,7 +18,7 @@ type CodexComposerFrame struct {
 // on an empty composer or Codex's native placeholder.
 func CaptureClearCodexComposerFrame(c PaneCapture) (CodexComposerFrame, bool) {
 	rawRows, ok := codexViewportRows(c)
-	if !ok || !strings.HasPrefix(c.Geometry.SessionID, "$") || c.Geometry.ServerPID <= 0 || c.Geometry.AttachedClients != 0 {
+	if !ok || !strings.HasPrefix(c.Geometry.SessionID, "$") || c.Geometry.ServerPID <= 0 || c.Geometry.AttachedClients < 0 {
 		return CodexComposerFrame{}, false
 	}
 	lines := make([]string, len(rawRows))
@@ -63,7 +63,7 @@ func CaptureClearCodexComposerFrame(c PaneCapture) (CodexComposerFrame, bool) {
 func (f CodexComposerFrame) Prompt(c PaneCapture) (string, bool) {
 	rows, ok := codexViewportRows(c)
 	if !ok || len(f.footerRows) == 0 || c.Geometry.PaneID != f.geometry.PaneID ||
-		c.Geometry.SessionID != f.geometry.SessionID || c.Geometry.AttachedClients != 0 ||
+		c.Geometry.SessionID != f.geometry.SessionID ||
 		c.Geometry.ServerPID != f.geometry.ServerPID ||
 		c.Geometry.Width != f.geometry.Width || c.Geometry.Height != f.geometry.Height {
 		return "", false
