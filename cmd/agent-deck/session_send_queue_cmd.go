@@ -20,6 +20,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/google/uuid"
 )
 
 // imageList is the repeatable --image flag.
@@ -152,6 +153,72 @@ func queueSend(profile string, storage *session.Storage, inst *session.Instance,
 	out.Success(fmt.Sprintf("Queued %s for '%s' (%s)", rec.SendID, inst.Title, status), queuedSendFields(rec))
 }
 
+func queueCorrelatedSend(profile string, storage *session.Storage, instances []*session.Instance, sessionRef, message, idempotencyKey, expectedBinding string, out *CLIOutput) {
+	if sendqueue.ValidateOpaque(idempotencyKey) != nil || sendqueue.ValidateOpaque(expectedBinding) != nil {
+		out.ErrorWithData("invalid correlated queue identity", "invalid_correlated_request", map[string]interface{}{"retry_safe": false})
+		os.Exit(2)
+	}
+	if !validInstanceID.MatchString(sessionRef) || strings.Contains(sessionRef, "..") {
+		out.ErrorWithData("correlated sends require an immutable session id", sendqueue.OperationRefused, map[string]interface{}{"operation_state": sendqueue.OperationRefused, "retry_safe": true})
+		os.Exit(2)
+	}
+	inst := instanceByID(instances, sessionRef)
+
+	initialState := sendqueue.OperationQueued
+	operationError := ""
+	retrySafe := false
+	switch {
+	case inst == nil:
+		initialState, operationError, retrySafe = sendqueue.OperationRefused, sendqueue.OperationRefused, true
+	case expectedBinding != session.RowBindingToken(inst):
+		initialState, operationError, retrySafe = sendqueue.OperationBindingChanged, sendqueue.OperationBindingChanged, true
+	case !session.IsCodexCompatible(inst.Tool):
+		initialState, operationError, retrySafe = sendqueue.OperationRefused, sendqueue.OperationRefused, true
+	}
+	request := sendqueue.CorrelatedRequest{
+		SessionID: sessionRef, IdempotencyKey: idempotencyKey, RowBindingToken: expectedBinding,
+		Message: message, Now: time.Now(), InitialState: initialState,
+		OperationError: operationError, RetrySafe: retrySafe,
+	}
+	var record *sendqueue.Record
+	var created bool
+	var err error
+	if inst == nil {
+		var found bool
+		record, found, err = sendqueue.LookupCorrelated(sendQueueDir(storage), request)
+		if err == nil && !found {
+			out.ErrorWithData("immutable session id was not found", sendqueue.OperationRefused, map[string]interface{}{"operation_state": sendqueue.OperationRefused, "retry_safe": true})
+			os.Exit(2)
+		}
+	} else {
+		record, created, err = sendqueue.EnqueueCorrelated(sendQueueDir(storage), request)
+	}
+	if errors.Is(err, sendqueue.ErrIdempotencyConflict) {
+		out.ErrorWithData("idempotency key is already bound to a different request", "idempotency_conflict", map[string]interface{}{"retry_safe": false})
+		os.Exit(1)
+	}
+	if err != nil {
+		out.ErrorWithData("cannot durably queue correlated send", "durability_failure", map[string]interface{}{"retry_safe": false})
+		os.Exit(1)
+	}
+	fields := correlatedRecordFields(record)
+	if record.Final() {
+		code := record.OperationError
+		if code == "" {
+			code = record.OperationState
+		}
+		out.ErrorWithData("correlated operation ended before transport", code, fields)
+		os.Exit(1)
+	}
+	if created && inst != nil && inst.Exists() {
+		if err := spawnSendWorker(profile, inst.ID); err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: correlated operation is durable but its worker has not started yet")
+		}
+	}
+	fields["success"] = true
+	out.Success(fmt.Sprintf("Queued correlated operation %s", record.SendID), fields)
+}
+
 // queuedSendFields is the immediate --json reply for a queued send: the
 // record plus the documented sync-send keys (success, delivery, submitted,
 // confirmation), so a reader written against the synchronous reply keeps
@@ -170,10 +237,120 @@ func queuedSendFields(rec *sendqueue.Record) map[string]interface{} {
 }
 
 func recordFields(r *sendqueue.Record) map[string]interface{} {
+	if r.Correlated() {
+		return correlatedRecordFields(r)
+	}
 	b, _ := json.Marshal(r)
 	var m map[string]interface{}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+func correlatedRecordFields(record *sendqueue.Record) map[string]interface{} {
+	fields := map[string]interface{}{
+		"schema_version":    record.SchemaVersion,
+		"send_id":           record.SendID,
+		"session_id":        record.SessionID,
+		"idempotency_key":   record.IdempotencyKey,
+		"row_binding_token": record.RowBindingToken,
+		"operation_state":   record.OperationState,
+	}
+	if record.Attempts > 0 || record.Final() {
+		fields["attempts"] = record.Attempts
+	}
+	if record.AcceptedTurn != nil {
+		fields["accepted_turn"] = map[string]interface{}{
+			"receipt_id": record.AcceptedTurn.ReceiptID, "instance_id": record.AcceptedTurn.InstanceID,
+			"codex_session_id": record.AcceptedTurn.CodexSessionID,
+			"turn_generation":  record.AcceptedTurn.TurnGeneration, "accepted_at": record.AcceptedTurn.AcceptedAt,
+		}
+	}
+	if record.OperationState == sendqueue.OperationCompleted && record.Completion != nil {
+		completion := map[string]interface{}{"turn_generation": record.Completion.TurnGeneration}
+		if record.Completion.CompletedAt != "" {
+			completion["completed_at"] = record.Completion.CompletedAt
+		}
+		fields["completion"] = completion
+		fields["content"] = record.Content
+	}
+	if record.Final() && record.OperationState != sendqueue.OperationCompleted {
+		code := record.OperationError
+		if code == "" {
+			code = record.OperationState
+		}
+		fields["code"] = code
+		retrySafe := false
+		if record.RetrySafe != nil {
+			retrySafe = *record.RetrySafe
+		}
+		fields["retry_safe"] = retrySafe
+	}
+	return fields
+}
+
+func persistCorrelatedAccepted(storage *session.Storage, operationID string, receipt *codexAcceptedTurnReceipt) error {
+	if storage == nil || receipt == nil {
+		return fmt.Errorf("correlated acceptance persistence is unavailable")
+	}
+	_, err := sendqueue.Update(sendQueueDir(storage), operationID, time.Now(), func(record *sendqueue.Record) {
+		record.OperationState = sendqueue.OperationAccepted
+		record.State = sendqueue.StateSubmitted
+		record.Verdict = "delivered"
+		record.CodexSessionID = receipt.CodexSessionID
+		record.AcceptedTurn = &sendqueue.AcceptedTurn{
+			ReceiptID: receipt.ReceiptID, InstanceID: receipt.InstanceID,
+			CodexSessionID: receipt.CodexSessionID, TurnGeneration: receipt.TurnGeneration,
+			AcceptedAt: receipt.AcceptedAt,
+		}
+	})
+	return err
+}
+
+func persistCorrelatedCompletion(storage *session.Storage, operationID string, receipt *codexAcceptedTurnReceipt, response *session.ResponseOutput) error {
+	if storage == nil || receipt == nil || response == nil || response.CodexTurnGeneration != receipt.TurnGeneration {
+		return fmt.Errorf("correlated completion does not match its accepted generation")
+	}
+	_, err := sendqueue.Update(sendQueueDir(storage), operationID, time.Now(), func(record *sendqueue.Record) {
+		record.OperationState = sendqueue.OperationCompleted
+		record.State = sendqueue.StateLanded
+		record.Verdict = "delivered"
+		record.Completion = &sendqueue.Completion{
+			TurnGeneration: receipt.TurnGeneration,
+			CompletedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		record.Content = response.Content
+	})
+	return err
+}
+
+func validateCorrelatedWorkerBinding(storage *session.Storage, operationID string, instance *session.Instance) error {
+	if storage == nil || instance == nil {
+		return fmt.Errorf("correlated worker binding is unavailable")
+	}
+	dir := sendQueueDir(storage)
+	record, err := sendqueue.Load(dir, operationID)
+	if err != nil {
+		return err
+	}
+	if !record.Correlated() || record.SessionID != instance.ID || record.OperationState != sendqueue.OperationPreparing {
+		return fmt.Errorf("correlated worker does not own the prepared operation")
+	}
+	if session.RowBindingToken(instance) == record.RowBindingToken {
+		return nil
+	}
+	retrySafe := true
+	_, updateErr := sendqueue.Update(dir, operationID, time.Now(), func(current *sendqueue.Record) {
+		current.OperationState = sendqueue.OperationBindingChanged
+		current.OperationError = sendqueue.OperationBindingChanged
+		current.State = sendqueue.StateFailed
+		current.Verdict = "unknown"
+		current.ChildPID = 0
+		current.RetrySafe = &retrySafe
+	})
+	if updateErr != nil {
+		return updateErr
+	}
+	return fmt.Errorf("row binding changed before transport")
 }
 
 // spawnSendWorker starts a detached worker for the target. A second worker
@@ -224,6 +401,9 @@ func handleSessionSendStatus(profile string, args []string) {
 		fmt.Println("landed is reported only on transcript evidence (a user row, or a queued message absorbed")
 		fmt.Println("into the turn). failed means nothing was typed, so resending is safe. A send whose outcome")
 		fmt.Println("could not be proven settles as typed/submitted (settled: true) and is never typed again.")
+		fmt.Println()
+		fmt.Println("Correlated operations expose accepted_turn with its exact turn_generation, then completed")
+		fmt.Println("with exact content. Missing exact evidence ends as result_unavailable; earlier states are body-free.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -297,6 +477,7 @@ func handleSessionSendWorker(profile string, args []string) {
 		return
 	}
 	sendqueue.Prune(dir, time.Now().Add(-sendqueue.RetainFinished))
+	sendqueue.PruneWithRetention(dir, time.Now(), sendqueue.DefaultRetentionPolicy())
 	for {
 		lock, ok, err := sendqueue.TryLock(dir, *target)
 		if err != nil || !ok {
@@ -321,6 +502,9 @@ func handleSessionSendWorker(profile string, args []string) {
 func nextPending(dir, target string) *sendqueue.Record {
 	recs, _ := sendqueue.List(dir, target)
 	for _, r := range recs {
+		if r.Correlated() && !r.Final() {
+			return r
+		}
 		if r.State == sendqueue.StateQueued || r.State == sendqueue.StateTyping {
 			return r
 		}
@@ -395,6 +579,7 @@ var notSentDeliveries = map[string]bool{
 	deliveryTargetBusy:        true,
 	deliveryComposerBlocked:   true,
 	deliveryAcceptanceRefused: true,
+	deliveryLineTooLong:       true,
 }
 
 // classifyChild reads a `session send --json` result. Only a refusal that
@@ -438,6 +623,10 @@ func deliverQueuedAsync(profile, dir string, rec *sendqueue.Record) {
 }
 
 func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
+	if rec.Correlated() {
+		deliverCorrelated(profile, dir, rec)
+		return
+	}
 	poll := sendWorkerPoll()
 	deadline, _ := time.Parse(time.RFC3339Nano, rec.Deadline)
 	set := func(fn func(*sendqueue.Record)) error {
@@ -510,6 +699,210 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 	}
 }
 
+var correlatedSendChild = startCorrelatedChildSend
+
+func deliverCorrelated(profile, dir string, record *sendqueue.Record) {
+	set := func(update func(*sendqueue.Record)) error {
+		next, err := sendqueue.Update(dir, record.SendID, time.Now(), update)
+		if err == nil {
+			*record = *next
+		}
+		return err
+	}
+	deadline, _ := time.Parse(time.RFC3339Nano, record.Deadline)
+	if record.OperationState == sendqueue.OperationPreparing {
+		reconcileCorrelatedPreparing(profile, dir, record, set)
+	}
+	if record.OperationState == sendqueue.OperationAccepted {
+		completeCorrelatedOperation(profile, record, deadline, set)
+		return
+	}
+	if record.OperationState != sendqueue.OperationQueued {
+		return
+	}
+
+	for record.OperationState == sendqueue.OperationQueued {
+		_, instances, _, err := loadSessionData(profile)
+		if err != nil {
+			setCorrelatedTerminal(record, sendqueue.OperationRefused, true, set)
+			return
+		}
+		instance := instanceByID(instances, record.SessionID)
+		if instance == nil || !session.IsCodexCompatible(instance.Tool) {
+			setCorrelatedTerminal(record, sendqueue.OperationRefused, true, set)
+			return
+		}
+		if session.RowBindingToken(instance) != record.RowBindingToken {
+			setCorrelatedTerminal(record, sendqueue.OperationBindingChanged, true, set)
+			return
+		}
+		if !instance.Exists() {
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				setCorrelatedTerminal(record, sendqueue.OperationExpired, true, set)
+			}
+			return
+		}
+		status, _ := fetchHookDrivenStatus(profile, instance.ID)
+		if shouldWaitForIdle(instance.Tool, status) {
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				setCorrelatedTerminal(record, sendqueue.OperationExpired, true, set)
+				return
+			}
+			time.Sleep(sendWorkerPoll())
+			continue
+		}
+		if session.RowBindingToken(instance) != record.RowBindingToken {
+			setCorrelatedTerminal(record, sendqueue.OperationBindingChanged, true, set)
+			return
+		}
+		resultPath := sendqueue.ResultPath(dir, record.SendID)
+		_ = os.Remove(resultPath)
+		if err := set(func(current *sendqueue.Record) {
+			current.OperationState = sendqueue.OperationPreparing
+			current.State = sendqueue.StateTyping
+			current.Reason = ""
+			current.Attempts++
+			current.TargetStatus = status
+			current.CodexSessionID = instance.CodexSessionID
+			current.Tool = instance.Tool
+			current.HarnessAccount = instance.Account
+			current.HarnessCommand = instance.Command
+			current.HarnessWrapper = instance.Wrapper
+			current.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+			current.ChildPID = 0
+		}); err != nil {
+			return
+		}
+		pid, wait, err := correlatedSendChild(profile, record.SessionID, record.SendID, record.Message, resultPath, deadline)
+		if err != nil {
+			setCorrelatedTerminal(record, sendqueue.OperationRefused, true, set)
+			return
+		}
+		_ = set(func(current *sendqueue.Record) { current.ChildPID = pid })
+		code := wait()
+		if latest, err := sendqueue.Load(dir, record.SendID); err == nil {
+			*record = *latest
+		}
+		if record.Final() {
+			return
+		}
+		applyChildResult(record, readChildResult(resultPath), code, true, set)
+		if record.OperationState == sendqueue.OperationAccepted {
+			completeCorrelatedOperation(profile, record, deadline, set)
+		}
+		return
+	}
+}
+
+func setCorrelatedTerminal(record *sendqueue.Record, state string, retrySafe bool, set func(func(*sendqueue.Record)) error) {
+	_ = set(func(current *sendqueue.Record) {
+		current.OperationState = state
+		current.OperationError = state
+		current.State = sendqueue.StateFailed
+		current.Verdict = "unknown"
+		current.ChildPID = 0
+		current.RetrySafe = new(bool)
+		*current.RetrySafe = retrySafe
+	})
+}
+
+func reconcileCorrelatedPreparing(profile, dir string, record *sendqueue.Record, set func(func(*sendqueue.Record)) error) {
+	resultPath := sendqueue.ResultPath(dir, record.SendID)
+	end := time.Now().Add(sendChildWaitMax())
+	for {
+		if result, ok := parseChildResult(resultPath); ok {
+			code := 1
+			if success, _ := result["success"].(bool); success {
+				code = 0
+			}
+			applyChildResult(record, result, code, true, set)
+			return
+		}
+		if !processAlive(record.ChildPID) || time.Now().After(end) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		setCorrelatedTerminal(record, sendqueue.OperationIndeterminate, false, set)
+		return
+	}
+	instance := instanceByID(instances, record.SessionID)
+	if instance == nil || record.CodexSessionID == "" {
+		setCorrelatedTerminal(record, sendqueue.OperationIndeterminate, false, set)
+		return
+	}
+	bound := instance
+	bound.CodexSessionID = record.CodexSessionID
+	bound.Tool, bound.Account = record.Tool, record.HarnessAccount
+	bound.Command, bound.Wrapper = record.HarnessCommand, record.HarnessWrapper
+	generation, err := bound.LatestCodexTurnGeneration()
+	if err != nil {
+		setCorrelatedTerminal(record, sendqueue.OperationIndeterminate, false, set)
+		return
+	}
+	generation, marker, err := session.RecoverCorrelatedCodexSubmissionMarker(record.SessionID, record.CodexSessionID, record.SendID, generation)
+	if err != nil {
+		setCorrelatedTerminal(record, sendqueue.OperationIndeterminate, false, set)
+		return
+	}
+	accepted := &sendqueue.AcceptedTurn{
+		ReceiptID: uuid.NewString(), InstanceID: record.SessionID, CodexSessionID: record.CodexSessionID,
+		TurnGeneration: generation, AcceptedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := set(func(current *sendqueue.Record) {
+		current.OperationState = sendqueue.OperationAccepted
+		current.State = sendqueue.StateSubmitted
+		current.Verdict = "delivered"
+		current.ChildPID = 0
+		current.AcceptedTurn = accepted
+	}); err != nil {
+		return
+	}
+	_ = session.ClearCodexSubmissionMarker(marker)
+}
+
+func completeCorrelatedOperation(profile string, record *sendqueue.Record, deadline time.Time, set func(func(*sendqueue.Record)) error) {
+	if record.AcceptedTurn == nil {
+		setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		return
+	}
+	_, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		return
+	}
+	instance := instanceByID(instances, record.SessionID)
+	if instance == nil {
+		setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		return
+	}
+	bound := instance
+	bound.CodexSessionID = record.AcceptedTurn.CodexSessionID
+	bound.Tool, bound.Account = record.Tool, record.HarnessAccount
+	bound.Command, bound.Wrapper = record.HarnessCommand, record.HarnessWrapper
+	if deadline.IsZero() {
+		deadline = time.Now().Add(sendqueue.RetainUncertainBodies)
+	}
+	response, err := waitForCodexTurnOutput(bound, record.AcceptedTurn.TurnGeneration, deadline)
+	if err != nil {
+		setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		return
+	}
+	_ = set(func(current *sendqueue.Record) {
+		current.OperationState = sendqueue.OperationCompleted
+		current.State = sendqueue.StateLanded
+		current.Verdict = "delivered"
+		current.ChildPID = 0
+		current.Completion = &sendqueue.Completion{
+			TurnGeneration: current.AcceptedTurn.TurnGeneration,
+			CompletedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		current.Content = response.Content
+	})
+}
+
 func shouldWaitForIdle(tool, status string) bool {
 	return status == "" || status == "unknown" || status == "starting" || (status == "running" && !session.AcceptsInputWhileBusy(tool))
 }
@@ -546,6 +939,10 @@ func typeQueued(profile, dir string, rec *sendqueue.Record, status, path string,
 
 // applyChildResult moves a typing record on from its child's result.
 func applyChildResult(rec *sendqueue.Record, result map[string]interface{}, code int, haveResult bool, set func(func(*sendqueue.Record)) error) {
+	if rec.Correlated() {
+		applyCorrelatedChildResult(rec, result, code, haveResult, set)
+		return
+	}
 	outcome, reason := childUnknown, "worker restarted mid-send and the child left no result"
 	if haveResult {
 		outcome, reason = classifyChild(result, code)
@@ -571,6 +968,49 @@ func applyChildResult(rec *sendqueue.Record, result map[string]interface{}, code
 			r.State, r.Reason, r.Verdict = sendqueue.StateTyped, "outcome unknown ("+reason+"); not retyped, watching the transcript", "unknown"
 		}
 	})
+}
+
+func applyCorrelatedChildResult(record *sendqueue.Record, result map[string]interface{}, code int, haveResult bool, set func(func(*sendqueue.Record)) error) {
+	if haveResult {
+		if accepted := acceptedTurnFromResult(result); accepted != nil {
+			if accepted.InstanceID == record.SessionID && (record.CodexSessionID == "" || accepted.CodexSessionID == record.CodexSessionID) {
+				if err := set(func(current *sendqueue.Record) {
+					current.OperationState = sendqueue.OperationAccepted
+					current.State = sendqueue.StateSubmitted
+					current.Verdict = "delivered"
+					current.ChildPID = 0
+					current.CodexSessionID = accepted.CodexSessionID
+					current.AcceptedTurn = accepted
+				}); err == nil {
+					return
+				}
+			}
+		}
+	}
+	delivery, _ := result["delivery"].(string)
+	if haveResult && (delivery == deliveryTargetBusy || delivery == deliveryComposerBlocked || delivery == deliveryLineTooLong || delivery == deliveryAcceptanceRefused) {
+		setCorrelatedTerminal(record, sendqueue.OperationRefused, true, set)
+		return
+	}
+	setCorrelatedTerminal(record, sendqueue.OperationIndeterminate, false, set)
+}
+
+func acceptedTurnFromResult(result map[string]interface{}) *sendqueue.AcceptedTurn {
+	raw, ok := result["accepted_turn"]
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var accepted sendqueue.AcceptedTurn
+	if err := json.Unmarshal(data, &accepted); err != nil || accepted.ReceiptID == "" || accepted.InstanceID == "" ||
+		accepted.CodexSessionID == "" || accepted.TurnGeneration == "" ||
+		!strings.HasPrefix(accepted.TurnGeneration, accepted.CodexSessionID+":") {
+		return nil
+	}
+	return &accepted
 }
 
 // reconcileTyping settles a record a dead worker left in typing. The
@@ -744,6 +1184,45 @@ func startChildSend(profile, id, message, resultPath string) (int, func() int, e
 	wait := func() int {
 		err := cmd.Wait()
 		out.Close()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		if err != nil {
+			return 1
+		}
+		return 0
+	}
+	return cmd.Process.Pid, wait, nil
+}
+
+func startCorrelatedChildSend(profile, id, operationID, message, resultPath string, deadline time.Time) (int, func() int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, nil, err
+	}
+	msgPath := strings.TrimSuffix(resultPath, ".result") + ".message"
+	if err := os.WriteFile(msgPath, []byte(message), 0o600); err != nil {
+		return 0, nil, err
+	}
+	out, err := os.OpenFile(resultPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, nil, err
+	}
+	timeout := time.Until(deadline)
+	if deadline.IsZero() || timeout <= 0 {
+		timeout = sendqueue.RetainUncertainBodies
+	}
+	args := profileArgs(profile, "session", "send", id, "--message-file", msgPath, "--json", "--wait", "--queue-worker", "--correlated-operation", operationID, "--timeout", timeout.String())
+	cmd := exec.Command(exe, args...)
+	cmd.Stdout = out
+	if err := cmd.Start(); err != nil {
+		_ = out.Close()
+		return 0, nil, err
+	}
+	wait := func() int {
+		err := cmd.Wait()
+		_ = out.Close()
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode()

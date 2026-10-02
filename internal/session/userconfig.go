@@ -1250,12 +1250,84 @@ type GroupDeepSeekSettings struct {
 // declared in conductor.go:49 (heartbeat, telegram, slack, discord).
 // Closes issue #602.
 type ConductorOverrides struct {
+	// Backend selects the named conductor's transport. Empty preserves the
+	// historical session and bridge behavior.
+	Backend string                 `toml:"backend,omitempty"`
+	SlackV2 SlackV2ConductorConfig `toml:"slack_v2,omitempty"`
 	// Claude defines Claude Code overrides for a specific conductor.
 	Claude ConductorClaudeSettings `toml:"claude,omitempty"`
 	// Hermes defines Hermes overrides for a specific conductor.
 	Hermes ConductorHermesSettings `toml:"hermes,omitempty"`
 	// DeepSeek defines DeepSeek Harness overrides for a specific conductor.
 	DeepSeek ConductorDeepSeekSettings `toml:"deepseek,omitempty"`
+}
+
+// SlackV2ConductorConfig is the source-only channel configuration for one
+// named conductor. Callers must not include these values in public errors.
+type SlackV2ConductorConfig struct {
+	AppToken        string   `toml:"app_token,omitempty"`
+	BotToken        string   `toml:"bot_token,omitempty"`
+	ChannelID       string   `toml:"channel_id,omitempty"`
+	AllowedUserIDs  []string `toml:"allowed_user_ids,omitempty"`
+	RowInstanceID   string   `toml:"row_instance_id,omitempty"`
+	RowBindingToken string   `toml:"row_binding_token,omitempty"`
+
+	// Source compatibility only. These values are neither serialized nor
+	// accepted by the Slack v2 row runtime.
+	CodexExecutable string `toml:"-"`
+	CodexModel      string `toml:"-"`
+}
+
+const (
+	ConductorBackendLegacy  = "legacy"
+	ConductorBackendSlackV2 = "slack-v2"
+)
+
+// ConductorBackend returns the configured backend, failing closed on an
+// unreadable config or an unrecognized value.
+func ConductorBackend(name string) (string, error) {
+	if err := ValidateConductorName(name); err != nil {
+		return "", fmt.Errorf("invalid conductor name")
+	}
+	cfg, err := LoadUserConfig()
+	if err != nil || cfg == nil {
+		return "", fmt.Errorf("conductor configuration unavailable")
+	}
+	return conductorBackendFromConfig(cfg, name)
+}
+
+func conductorBackendFromConfig(cfg *UserConfig, name string) (string, error) {
+	backend := strings.TrimSpace(cfg.Conductors[name].Backend)
+	switch backend {
+	case "", ConductorBackendLegacy:
+		return ConductorBackendLegacy, nil
+	case ConductorBackendSlackV2:
+		return ConductorBackendSlackV2, nil
+	default:
+		return "", fmt.Errorf("unknown conductor backend")
+	}
+}
+
+// ConductorSlackV2Config reads the explicitly selected Slack v2 backend.
+// It returns a copy so callers cannot mutate the cached user config.
+func ConductorSlackV2Config(name string) (SlackV2ConductorConfig, error) {
+	if err := ValidateConductorName(name); err != nil {
+		return SlackV2ConductorConfig{}, fmt.Errorf("invalid conductor name")
+	}
+	cfg, err := LoadUserConfig()
+	if err != nil || cfg == nil {
+		return SlackV2ConductorConfig{}, fmt.Errorf("conductor configuration unavailable")
+	}
+	backend, err := conductorBackendFromConfig(cfg, name)
+	if err != nil {
+		return SlackV2ConductorConfig{}, err
+	}
+	if backend != ConductorBackendSlackV2 {
+		return SlackV2ConductorConfig{}, fmt.Errorf("conductor backend is not slack-v2")
+	}
+	value := cfg.Conductors[name].SlackV2
+	value.AllowedUserIDs = append([]string(nil), value.AllowedUserIDs...)
+	return value, nil
 }
 
 // ConductorDeepSeekSettings defines conductor-specific DeepSeek Harness

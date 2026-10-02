@@ -341,6 +341,14 @@ func main() {
 	// even malformed values for this opt-in flag receive only the safe result.
 	acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])
 
+	// The long-running Slack-v2 conductor is a service command. Dispatch it
+	// before update, telemetry, event, or tmux initialization; those are CLI
+	// concerns and must not run on a hidden service startup path.
+	if profile, args := extractProfileFlag(os.Args[1:]); isConductorSlackV2Command(args) {
+		applyProfileFlag(profile)
+		os.Exit(runConductorSlackV2Command(profile, args[2:], os.Stdout, os.Stderr))
+	}
+
 	// Make bare `tmux` invocations resolve even when launched from a minimal
 	// environment (notably a `terminal-notifier -execute` notification click,
 	// whose launchd PATH omits Homebrew's /opt/homebrew/bin). Must run before any
