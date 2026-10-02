@@ -8,7 +8,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-func TestCodexAdmission_RequiresDetachedTargetProofBeforeTyping(t *testing.T) {
+func TestCodexAdmission_RequiresStableTargetProofBeforeTyping(t *testing.T) {
 	target := &mockSendRetryTarget{statuses: []string{"waiting"}}
 	res, err := executeSend(target, "codex", "Inspect the synthetic admission fixture", false, sendExecTuning{
 		retry: sendRetryOptions{maxRetries: 1, turnAdvanced: func() bool { return false }, codexFenceUnchanged: func() bool { return true }},
@@ -19,15 +19,13 @@ func TestCodexAdmission_RequiresDetachedTargetProofBeforeTyping(t *testing.T) {
 }
 
 func TestCodexAdmission_PretransportRefusals(t *testing.T) {
-	for _, name := range []string{"attached", "unknown clients", "unknown session", "unknown server", "capture error", "draft", "busy", "status error", "fence error", "changed target"} {
+	for _, name := range []string{"unknown clients", "unknown session", "unknown server", "capture error", "draft", "busy", "status error", "fence error", "changed target"} {
 		t.Run(name, func(t *testing.T) {
 			inst, fence, advance := codexRecoveryFence(t)
 			target := &codexEnterRecoveryTarget{acceptRetry: true, accept: advance}
 			target.statuses = []string{"waiting"}
 			opts := codexRecoveryOptions(inst, fence, 3)
 			switch name {
-			case "attached":
-				target.attachedClients = 1
 			case "unknown clients":
 				target.attachedClients = -1
 			case "unknown session":
@@ -61,6 +59,18 @@ func TestCodexAdmission_PretransportRefusals(t *testing.T) {
 	}
 }
 
+func TestCodexAdmission_StableAttachedTargetCanSubmit(t *testing.T) {
+	inst, fence, advance := codexRecoveryFence(t)
+	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: advance, attachedClients: 1}
+	target.statuses = []string{"waiting"}
+	res, err := executeSend(target, "codex", "Inspect the synthetic admission fixture", false, sendExecTuning{
+		retry: codexRecoveryOptions(inst, fence, 3),
+	})
+	if err != nil || res.delivery != deliverySubmitted || target.sendKeysCalls != 1 || target.sendEnterCalls != 1 || target.acceptedTurns != 1 {
+		t.Fatalf("stable attached target: delivery=%q err=%v bodies=%d Enters=%d accepted=%d", res.delivery, err, target.sendKeysCalls, target.sendEnterCalls, target.acceptedTurns)
+	}
+}
+
 func TestCodexAdmission_RecoveryIsOneAttempt(t *testing.T) {
 	inst, fence, advance := codexRecoveryFence(t)
 	target := &codexEnterRecoveryTarget{accept: advance}
@@ -71,13 +81,13 @@ func TestCodexAdmission_RecoveryIsOneAttempt(t *testing.T) {
 	}
 }
 
-func TestCodexAdmission_AttachAfterTypingIsUncertain(t *testing.T) {
+func TestCodexAdmission_AttachAfterTypingCanRecoverOnceStable(t *testing.T) {
 	inst, fence, advance := codexRecoveryFence(t)
 	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: advance}
 	target.statuses = []string{"waiting"}
 	target.onStage = func() { target.attachedClients = 1 }
 	res, err := executeSend(target, "codex", "Inspect the synthetic admission fixture", false, sendExecTuning{retry: codexRecoveryOptions(inst, fence, 3)})
-	if err == nil || res.delivery != deliveryTypedNotSubmitted || target.guardCalls != 0 || target.sendEnterCalls != 0 || target.sendKeysCalls != 1 || target.acceptedTurns != 0 {
+	if err != nil || res.delivery != deliverySubmitted || target.guardCalls != 1 || target.sendEnterCalls != 1 || target.sendKeysCalls != 1 || target.acceptedTurns != 1 {
 		t.Fatalf("attachment after typing: delivery=%q err=%v bodies=%d Enters=%d guards=%d", res.delivery, err, target.sendKeysCalls, target.sendEnterCalls, target.guardCalls)
 	}
 }

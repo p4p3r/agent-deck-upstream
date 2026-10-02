@@ -19,19 +19,19 @@ func validTmuxID(id, prefix string) bool {
 	return true
 }
 
-// SendKeysAndEnterIfUnattached proves the target again before typing and pins
-// the body and initial Enter to its pane. started means transport may have begun.
-func (s *Session) SendKeysAndEnterIfUnattached(keys string, g PaneGeometry) (started bool, err error) {
+// SendKeysAndEnterIfStable proves the target again before typing and pins the
+// body and initial Enter to its pane. started means transport may have begun.
+func (s *Session) SendKeysAndEnterIfStable(keys string, g PaneGeometry) (started bool, err error) {
 	current, err := s.CapturePaneSnapshot()
-	if err != nil || s.VimMode || g.AttachedClients != 0 || current.Geometry != g {
-		return false, fmt.Errorf("exact target attached, changed or unreadable")
+	if err != nil || s.VimMode || g.AttachedClients < 0 || current.Geometry != g {
+		return false, fmt.Errorf("exact target changed or unreadable")
 	}
 	return true, s.sendKeysAndEnterCheckedToTarget(g.PaneID, keys, nil, nil)
 }
 
 func guardedEnterArgs(name string, g PaneGeometry) []string {
 	conditions := []string{
-		"#{==:#{session_attached},0}",
+		"#{==:#{session_attached}," + strconv.Itoa(g.AttachedClients) + "}",
 		"#{==:#{pid}," + strconv.Itoa(g.ServerPID) + "}",
 		"#{==:#{session_id}," + g.SessionID + "}",
 		"#{==:#{pane_id}," + g.PaneID + "}",
@@ -54,13 +54,14 @@ func guardedEnterArgs(name string, g PaneGeometry) []string {
 		"display-message -p guarded-enter-withheld"}
 }
 
-// SendEnterIfUnattached evaluates the exact-session guard and sends one Enter
-// in the same server command queue. The format branch and send-keys never yield
-// that queue, so another client's attach command cannot run between them.
-func (s *Session) SendEnterIfUnattached(g PaneGeometry) error {
-	if s.VimMode || !validTmuxID(g.PaneID, "%") || !validTmuxID(g.SessionID, "$") || g.ServerPID <= 0 || g.AttachedClients != 0 ||
+// SendEnterIfStable evaluates the exact-session guard and sends one Enter in
+// the same server command queue. Attachment count is part of the captured
+// target identity; observers do not block delivery, but an attachment change
+// between capture and submission does.
+func (s *Session) SendEnterIfStable(g PaneGeometry) error {
+	if s.VimMode || !validTmuxID(g.PaneID, "%") || !validTmuxID(g.SessionID, "$") || g.ServerPID <= 0 || g.AttachedClients < 0 ||
 		g.Width < 1 || g.Height < 1 || g.CursorX < 0 || g.CursorX >= g.Width || g.CursorY < 0 || g.CursorY >= g.Height {
-		return fmt.Errorf("guarded Enter requires an unattached, stable target")
+		return fmt.Errorf("guarded Enter requires a stable target")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxSendKeysTimeout)
 	defer cancel()
@@ -70,7 +71,7 @@ func (s *Session) SendEnterIfUnattached(g PaneGeometry) error {
 		return fmt.Errorf("guarded Enter failed: %w", err)
 	}
 	if string(output) != "guarded-enter-sent\n" {
-		return fmt.Errorf("guarded Enter withheld: target attached, changed or unreadable")
+		return fmt.Errorf("guarded Enter withheld: target changed or unreadable")
 	}
 	return nil
 }

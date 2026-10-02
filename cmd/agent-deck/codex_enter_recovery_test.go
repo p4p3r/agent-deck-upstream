@@ -122,7 +122,7 @@ func (m *codexEnterRecoveryTarget) SendEnter() error {
 	return nil
 }
 
-func (m *codexEnterRecoveryTarget) SendEnterIfUnattached(_ tmux.PaneGeometry) error {
+func (m *codexEnterRecoveryTarget) SendEnterIfStable(_ tmux.PaneGeometry) error {
 	m.guardCalls++
 	if m.guardErr != nil {
 		return m.guardErr
@@ -178,9 +178,9 @@ func codexRecoveryOptions(inst *session.Instance, fence codexAcceptanceFence, ch
 	}
 }
 
-func (m *codexEnterRecoveryTarget) SendKeysAndEnterIfUnattached(message string, g tmux.PaneGeometry) (bool, error) {
+func (m *codexEnterRecoveryTarget) SendKeysAndEnterIfStable(message string, g tmux.PaneGeometry) (bool, error) {
 	current, err := m.CapturePaneSnapshot()
-	if err != nil || current.Geometry != g || g.AttachedClients != 0 {
+	if err != nil || current.Geometry != g || g.AttachedClients < 0 {
 		return false, errors.New("target changed")
 	}
 	return true, m.SendKeysAndEnter(message)
@@ -191,7 +191,6 @@ func TestCodexAdmission_PreTransportRefusalsTypeNothing(t *testing.T) {
 		name  string
 		setup func(*codexEnterRecoveryTarget)
 	}{
-		{"attached", func(target *codexEnterRecoveryTarget) { target.attachedClients = 1 }},
 		{"snapshot error", func(target *codexEnterRecoveryTarget) { target.snapshotErr = errors.New("snapshot unavailable") }},
 		{"indeterminate identity", func(target *codexEnterRecoveryTarget) {
 			target.snapshotAdjust = func(snapshot *tmux.PaneSnapshot) { snapshot.Geometry.SessionID = "" }
@@ -225,7 +224,7 @@ func TestCodexAdmission_PreTransportRefusalsTypeNothing(t *testing.T) {
 
 func TestCodexEnterRecovery_SerializedGuardRefusal(t *testing.T) {
 	inst, fence, advance := codexRecoveryFence(t)
-	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: advance, guardErr: errors.New("target attached or changed")}
+	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: advance, guardErr: errors.New("target changed")}
 	target.statuses = []string{"waiting"}
 	res, err := executeSend(target, "codex", "Please inspect the synthetic fixture", false, sendExecTuning{retry: codexRecoveryOptions(inst, fence, 3)})
 	if err == nil || res.delivery != deliveryTypedNotSubmitted || target.sendEnterCalls != 0 || target.acceptedTurns != 0 || codexTurnAdvancedPastFence(inst, fence) {

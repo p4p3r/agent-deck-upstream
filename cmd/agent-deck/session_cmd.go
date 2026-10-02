@@ -5503,15 +5503,15 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		capture := send.PaneCapture{Raw: arrivalBaseline.raw, OK: arrivalBaseline.paneOK, Geometry: arrivalBaseline.geometry}
 		_, clear := send.CaptureClearCodexComposerFrame(capture)
 		writer, pinned := target.(interface {
-			SendKeysAndEnterIfUnattached(string, tmux.PaneGeometry) (bool, error)
+			SendKeysAndEnterIfStable(string, tmux.PaneGeometry) (bool, error)
 		})
 		if !clear || !arrivalBaseline.statusOK || !arrivalBaseline.idle || hookBusyBeforeSend ||
 			!pinned || opts.codexFenceUnchanged == nil || !opts.codexFenceUnchanged() {
-			return deliveryComposerBlocked, fmt.Errorf("message not sent: detached, idle, clear exact target is unproven")
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: idle, clear, stable exact target is unproven")
 		}
-		started, err := writer.SendKeysAndEnterIfUnattached(message, *arrivalBaseline.geometry)
+		started, err := writer.SendKeysAndEnterIfStable(message, *arrivalBaseline.geometry)
 		if !started {
-			return deliveryComposerBlocked, fmt.Errorf("message not sent: exact target attached, changed or unreadable")
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: exact target changed or unreadable")
 		}
 		initialErr = err
 	} else {
@@ -5954,7 +5954,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	structuralRefused := !codexComposerWasClear
 	recoveryAttempted := false
 	guardedTarget, canGuard := target.(interface {
-		SendEnterIfUnattached(tmux.PaneGeometry) error
+		SendEnterIfStable(tmux.PaneGeometry) error
 	})
 	if fencedCodex && !canGuard {
 		structuralRefused = true
@@ -6152,11 +6152,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 }
 
 type guardedEnterPresser struct {
-	target   interface{ SendEnterIfUnattached(tmux.PaneGeometry) error }
+	target   interface{ SendEnterIfStable(tmux.PaneGeometry) error }
 	geometry tmux.PaneGeometry
 }
 
-func (p guardedEnterPresser) SendEnter() error { return p.target.SendEnterIfUnattached(p.geometry) }
+func (p guardedEnterPresser) SendEnter() error { return p.target.SendEnterIfStable(p.geometry) }
 
 // longestMessageLineBytes is the length of the longest line of message.
 // Mirrors the quantity the tmux transport measures, because the terminal

@@ -70,3 +70,21 @@ func TestCodexComposerFrame_TextOnlyCannotProveFooter(t *testing.T) {
 		t.Fatal("footer text cannot establish its own viewport position")
 	}
 }
+
+func TestCodexComposerFrame_StableAttachedViewer(t *testing.T) {
+	baseline := codexFrameCapture("Ask Codex to do anything", "  ? for shortcuts")
+	baseline.Geometry.AttachedClients = 1
+	frame, clear := CaptureClearCodexComposerFrame(baseline)
+	if !clear {
+		t.Fatal("an attached observer must not invalidate a clear composer")
+	}
+	capture := codexFrameCapture("inspect the fixture", "  ? for shortcuts")
+	capture.Geometry.AttachedClients = 1
+	if draft, visible := frame.Prompt(capture); !visible || draft != "inspect the fixture" {
+		t.Fatalf("stable attached observer: draft=%q visible=%v", draft, visible)
+	}
+	capture.Geometry.AttachedClients = 2
+	if draft, visible := frame.Prompt(capture); !visible || draft != "inspect the fixture" {
+		t.Fatalf("attachment changes do not alter the composer frame: draft=%q visible=%v", draft, visible)
+	}
+}
