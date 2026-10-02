@@ -27,6 +27,7 @@ func TestCodexComposerFrame_StructuralAttribution(t *testing.T) {
 		model,
 		model + "\n" + shortcuts,
 		"\x1b[2m" + model + "\x1b[0m\n\x1b[2m" + shortcuts + "\x1b[0m",
+		"  Tip: Visit the \x1b]8;;https://community.openai.com/c/codex/37\x1b\\Codex community forum\x1b]8;;\x1b\\",
 	} {
 		t.Run(footer, func(t *testing.T) {
 			baseline := codexFrameCapture("Ask Codex to do anything", footer)
