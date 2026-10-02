@@ -3983,9 +3983,10 @@ func retainCodexAcceptanceGuardForCompletion(wait bool, receipt *codexAcceptedTu
 // issue #876.
 func defaultSendOptions() sendRetryOptions {
 	return sendRetryOptions{
-		maxRetries:     50,
-		checkDelay:     300 * time.Millisecond,
-		verifyDelivery: true,
+		maxRetries:        50,
+		checkDelay:        300 * time.Millisecond,
+		verifyDelivery:    true,
+		codexRecoveryWait: 900 * time.Millisecond,
 	}
 }
 
@@ -5030,9 +5031,10 @@ func executeDraft(target draftSender, message string) error {
 // path (issue #479 — would otherwise double-send).
 func noWaitSendOptions() sendRetryOptions {
 	return sendRetryOptions{
-		maxRetries:     30,
-		checkDelay:     200 * time.Millisecond,
-		maxFullResends: -1,
+		maxRetries:        30,
+		checkDelay:        200 * time.Millisecond,
+		maxFullResends:    -1,
+		codexRecoveryWait: 900 * time.Millisecond,
 		// Issue #876: even on the --no-wait path, callers expect that a
 		// `Sent` exit means the message reached the agent. Without this,
 		// the verification loop would still fall through to nil on a
@@ -5163,6 +5165,13 @@ type sendRetryOptions struct {
 
 	// Recovery requires a readable rollout still at the pre-send generation.
 	codexFenceUnchanged func() bool
+
+	// codexRecoveryWait keeps the single fenced recovery Enter outside
+	// Codex's paste-burst window.  A fast literal body followed by Enter can
+	// occasionally be coalesced into editor input, leaving one trailing blank
+	// line instead of starting a turn.  Recovery remains bounded to one Enter
+	// and still requires the exact composer, target and rollout generation.
+	codexRecoveryWait time.Duration
 }
 
 // verificationChecks is how many post-send checks the verify loop runs for
@@ -5715,6 +5724,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	normalizedMessage := send.NormalizePromptText(message)
 	structuralRefused := !codexComposerWasClear
 	recoveryAttempted := false
+	recoveryEligibleAt := time.Now().Add(opts.codexRecoveryWait)
 	guardedTarget, canGuard := target.(interface {
 		SendEnterIfStable(tmux.PaneGeometry) error
 	})
@@ -5842,7 +5852,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 				if !visible {
 					structuralRefused = true
 				}
-				if visible && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft) && !opts.hookBusyNow() {
+				if visible && !time.Now().Before(recoveryEligibleAt) && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft) && !opts.hookBusyNow() {
 					status, statusErr := target.GetStatus()
 					if statusErr == nil && (status == "waiting" || status == "idle") {
 						// Acceptance may have landed while capturing the pane or

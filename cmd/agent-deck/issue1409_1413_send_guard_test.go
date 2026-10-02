@@ -362,6 +362,9 @@ func TestNoWaitSendTuning_GuardLatencyIsSmallAndBounded(t *testing.T) {
 	if !tun.retry.verifyDelivery {
 		t.Fatal("--no-wait must keep delivery verification on (#876/#1413)")
 	}
+	if tun.retry.codexRecoveryWait < 500*time.Millisecond || tun.retry.codexRecoveryWait > 1500*time.Millisecond {
+		t.Fatalf("--no-wait Codex recovery must clear the paste-burst window, got %v", tun.retry.codexRecoveryWait)
+	}
 }
 
 func TestDefaultSendTuning_GuardBounds(t *testing.T) {
@@ -371,6 +374,9 @@ func TestDefaultSendTuning_GuardBounds(t *testing.T) {
 	}
 	if !tun.retry.verifyDelivery {
 		t.Fatal("default path must keep delivery verification on (#876/#1413)")
+	}
+	if tun.retry.codexRecoveryWait < 500*time.Millisecond || tun.retry.codexRecoveryWait > 1500*time.Millisecond {
+		t.Fatalf("default Codex recovery must clear the paste-burst window, got %v", tun.retry.codexRecoveryWait)
 	}
 }
 
