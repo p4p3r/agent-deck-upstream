@@ -3156,7 +3156,9 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  Emits one bounded, body-free JSON result after exact turn acceptance (within a 2s acceptance window).")
 		fmt.Println("  Returns before completion and never retries after an indeterminate result.")
 		fmt.Println("  Supports only local Codex targets with a uniquely readable exact rollout.")
-		fmt.Println("  Incompatible with --wait, --stream, --no-wait, --draft, and -q; --json is optional.")
+		fmt.Println("  Incompatible with --wait, --stream, --no-wait, --draft, -q, --queue, and --queue-worker.")
+		fmt.Println("  Also incompatible with --idempotency-key, --expected-row-binding, and --correlated-operation.")
+		fmt.Println("  --json is optional and does not queue an acceptance-only send.")
 	}
 	if acceptanceOnlyDiagnostics {
 		// flag.Parse invokes Usage for both malformed flags and --help. Neither
@@ -3190,7 +3192,8 @@ func handleSessionSend(profile string, args []string) {
 		out.Error("session and message (or --message-file) are required", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
-	if *acceptanceOnly && (*wait || *stream || *noWait || *draft || *quiet) {
+	if *acceptanceOnly && (*wait || *stream || *noWait || *draft || *quiet ||
+		*queue || *queueWorker || *idempotencyKey != "" || *expectedRowBinding != "" || *correlatedOperation != "") {
 		failAcceptanceOnly(acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "")
 	}
 
@@ -3279,7 +3282,7 @@ func handleSessionSend(profile string, args []string) {
 
 	// Machine callers get a durable id immediately. The worker opts out of
 	// this branch so its own JSON result describes the actual transport.
-	asyncJSON := *jsonOutput && !*queueWorker && !*wait && !*stream && !*draft && !*deferIfBusy && !*noWait
+	asyncJSON := *jsonOutput && !*acceptanceOnly && !*queueWorker && !*wait && !*stream && !*draft && !*deferIfBusy && !*noWait
 	// Opt-in telemetry: count the send by tool and length bucket only (no-op
 	// without consent), once it was queued or delivered. A send from inside
 	// a session is automation; the queue worker's delivery was counted when

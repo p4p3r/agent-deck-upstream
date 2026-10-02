@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -517,6 +518,189 @@ func TestAcceptanceOnlyMainDiagnosticsStayInsideSafeResultBoundary(t *testing.T)
 			privateConfigDir, "PRIVATE", "SENSITIVE prompt body", "legacy-a",
 		)
 	})
+}
+
+func TestAcceptanceOnlyQueueBoundaryRejectsIncompatibleOptions(t *testing.T) {
+	const (
+		body    = "synthetic acceptance request delta-61"
+		key     = "synthetic-acceptance-key-delta-61"
+		content = "synthetic completed result delta-61"
+	)
+	for _, tt := range []struct {
+		name      string
+		flags     []string
+		completed bool
+		fileInput bool
+	}{
+		{name: "ordinary queue", flags: []string{"--queue"}},
+		{name: "ordinary JSON queue", flags: []string{"--queue", "--json"}},
+		{name: "correlated queue", flags: []string{"--queue", "--json", "--idempotency-key", key, "--expected-row-binding", "BINDING"}},
+		{name: "completed correlated retry", flags: []string{"--queue", "--json", "--idempotency-key", key, "--expected-row-binding", "BINDING"}, completed: true},
+		{name: "queued unreadable input", flags: []string{"--queue"}, fileInput: true},
+		{name: "correlated unreadable input", flags: []string{"--queue", "--json", "--idempotency-key", key, "--expected-row-binding", "BINDING"}, fileInput: true},
+		{name: "idempotency key alone", flags: []string{"--idempotency-key", key}},
+		{name: "row binding alone", flags: []string{"--expected-row-binding", "BINDING"}},
+		{name: "queue worker", flags: []string{"--queue-worker"}},
+		{name: "correlated worker operation", flags: []string{"--correlated-operation", key}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+			t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+			t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+			inst := session.NewInstanceWithTool("synthetic acceptance row", home, "codex")
+			storage, err := session.NewStorageWithProfile("ch_support_test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+				t.Fatal(err)
+			}
+			queueDir := sendQueueDir(storage)
+			if err := storage.Close(); err != nil {
+				t.Fatal(err)
+			}
+			binding := session.RowBindingToken(inst)
+			if tt.completed {
+				now := time.Now().UTC()
+				record, created, err := sendqueue.EnqueueCorrelated(queueDir, sendqueue.CorrelatedRequest{
+					SessionID: inst.ID, IdempotencyKey: key, RowBindingToken: binding, Message: body, Now: now,
+				})
+				if err != nil || !created {
+					t.Fatalf("seed correlated request: created=%v err=%v", created, err)
+				}
+				for _, state := range []string{sendqueue.OperationPreparing, sendqueue.OperationAccepted, sendqueue.OperationCompleted} {
+					if _, err := sendqueue.Update(queueDir, record.SendID, now, func(current *sendqueue.Record) {
+						current.OperationState = state
+						if state == sendqueue.OperationAccepted {
+							current.AcceptedTurn = &sendqueue.AcceptedTurn{
+								ReceiptID: "synthetic-receipt", InstanceID: inst.ID, CodexSessionID: "synthetic-thread",
+								TurnGeneration: "synthetic-thread:turn-one", AcceptedAt: now.Format(time.RFC3339Nano),
+							}
+						}
+						if state == sendqueue.OperationCompleted {
+							current.Completion = &sendqueue.Completion{TurnGeneration: current.AcceptedTurn.TurnGeneration}
+							current.Content = content
+						}
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				loaded, err := sendqueue.Load(queueDir, record.SendID)
+				if err != nil || loaded.OperationState != sendqueue.OperationCompleted || loaded.Content != content {
+					t.Fatalf("completed fixture unavailable: record=%+v err=%v", loaded, err)
+				}
+			}
+			before := acceptanceOnlyQueueSnapshot(t, queueDir)
+			if tt.completed && len(before) == 0 {
+				t.Fatal("completed queue snapshot is empty")
+			}
+
+			binDir := t.TempDir()
+			effects := filepath.Join(home, "synthetic-effects")
+			shim := "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$ACCEPTANCE_ONLY_TEST_EFFECTS\"\nexit 1\n"
+			for _, name := range []string{"tmux", "codex", "claude", "gemini", "agent-deck"} {
+				if err := os.WriteFile(filepath.Join(binDir, name), []byte(shim), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"session", "send", inst.ID, body, "--acceptance-only"}
+			missingInput := filepath.Join(home, "synthetic-missing-input")
+			if tt.fileInput {
+				args = []string{"session", "send", inst.ID, "--message-file", missingInput, "--acceptance-only"}
+			}
+			for _, value := range tt.flags {
+				if value == "BINDING" {
+					value = binding
+				}
+				args = append(args, value)
+			}
+			stdout, stderr, code := runAgentDeckEnv(t, home, "", []string{
+				"PATH=" + binDir, "CODEX_HOME=" + filepath.Join(home, "codex"), "ACCEPTANCE_ONLY_TEST_EFFECTS=" + effects,
+			}, args...)
+			assertAcceptanceOnlyProcessFailure(t, stdout, stderr, code, acceptanceOnlyCodeInvalidOptions,
+				body, key, binding, content, inst.ID, inst.Title, home, missingInput)
+			want := "{\"schema_version\":1,\"success\":false,\"acceptance\":\"not_accepted\",\"code\":\"INVALID_OPTIONS\"}\n"
+			if stdout != want {
+				t.Fatalf("stdout = %q, want exactly one failure envelope %q", stdout, want)
+			}
+			if after := acceptanceOnlyQueueSnapshot(t, queueDir); !reflect.DeepEqual(after, before) {
+				t.Fatal("rejected acceptance-only request changed durable queue or worker state")
+			}
+			if _, err := os.Stat(effects); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected acceptance-only request invoked a transport tool: %v", err)
+			}
+		})
+	}
+}
+
+func TestAcceptanceOnlyQueueBoundaryKeepsJSONSynchronous(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	inst := session.NewInstanceWithTool("synthetic acceptance JSON row", home, "codex")
+	storage, err := session.NewStorageWithProfile("ch_support_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+		t.Fatal(err)
+	}
+	queueDir := sendQueueDir(storage)
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runAgentDeckEnv(t, home, "", []string{"PATH=" + t.TempDir()}, "session", "send", inst.ID,
+		"synthetic acceptance JSON request", "--acceptance-only", "--json")
+	assertAcceptanceOnlyProcessFailure(t, stdout, stderr, code, acceptanceOnlyCodeTargetUnavailable,
+		"synthetic acceptance JSON request", home)
+	if len(acceptanceOnlyQueueSnapshot(t, queueDir)) != 0 {
+		t.Fatal("acceptance-only JSON request created durable queue state")
+	}
+}
+
+func TestAcceptanceOnlyQueueBoundaryHelpDescribesIncompatibilities(t *testing.T) {
+	stdout, stderr, code := runAgentDeck(t, t.TempDir(), "session", "send", "--help")
+	if code != 0 || stderr != "" {
+		t.Fatalf("send help: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"Incompatible with --wait, --stream, --no-wait, --draft, -q, --queue, and --queue-worker.",
+		"Also incompatible with --idempotency-key, --expected-row-binding, and --correlated-operation.",
+		"--json is optional and does not queue an acceptance-only send.",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("acceptance-only help omitted %q", want)
+		}
+	}
+}
+
+func acceptanceOnlyQueueSnapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	files := make(map[string]string)
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if errors.Is(err, os.ErrNotExist) && path == dir {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		files[path] = info.Mode().String() + info.ModTime().String()
+		if !info.IsDir() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			files[path] += string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }
 
 func assertAcceptanceOnlyProcessFailure(
