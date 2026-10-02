@@ -67,6 +67,40 @@ func TestSendKeysAndEnterPrivateKeepsEveryPromptOutOfSubprocessArgv(t *testing.T
 	}
 }
 
+func TestSendKeysAndEnterPrivateToTargetFramesShortSingleLine(t *testing.T) {
+	calls := recordTransport(t)
+	s := &Session{Name: "private-target-pane"}
+	prompt := "short single-line Slack message"
+	if err := s.sendKeysAndEnterPrivateToTarget("%42", prompt); err != nil {
+		t.Fatal(err)
+	}
+	assertPrivateLaunchTransport(t, prompt, *calls)
+
+	var pasteTarget, enterTarget string
+	for _, call := range *calls {
+		if len(call.argv) == 0 {
+			continue
+		}
+		switch call.argv[0] {
+		case "paste-buffer":
+			for i := 0; i+1 < len(call.argv); i++ {
+				if call.argv[i] == "-t" {
+					pasteTarget = call.argv[i+1]
+				}
+			}
+		case "send-keys":
+			for i := 0; i+1 < len(call.argv); i++ {
+				if call.argv[i] == "-t" {
+					enterTarget = call.argv[i+1]
+				}
+			}
+		}
+	}
+	if pasteTarget != "%42" || enterTarget != "%42" {
+		t.Fatalf("framed body and Enter must use the pinned pane: paste=%q enter=%q", pasteTarget, enterTarget)
+	}
+}
+
 func TestSendKeysAndEnterPrivateDoesNotRetryAfterPasteUncertainty(t *testing.T) {
 	original := keySenderExec
 	var mu sync.Mutex

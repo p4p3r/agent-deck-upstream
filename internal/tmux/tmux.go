@@ -6006,8 +6006,19 @@ func (s *Session) SendKeysAndEnter(keys string) error {
 // never falls back to body-bearing send-keys. A failed paste is returned to
 // the caller as indeterminate and is never retried here.
 func (s *Session) SendKeysAndEnterPrivate(keys string) error {
+	return s.sendKeysAndEnterPrivateToTarget(s.primaryWindowTarget(), keys)
+}
+
+// sendKeysAndEnterPrivateToTarget is the always-framed variant of
+// SendKeysAndEnterPrivate for a caller that has already pinned an immutable
+// pane target. In addition to keeping prompt bytes out of argv, the explicit
+// bracketed-paste frame prevents a TUI's burst-paste detector from treating
+// the following Enter as another editor byte. That matters for short Codex
+// prompts: the ordinary transport deliberately uses unframed send-keys -l for
+// short single lines, and a mature composer can otherwise turn the submit
+// into a trailing newline.
+func (s *Session) sendKeysAndEnterPrivateToTarget(target, keys string) error {
 	s.invalidateCache()
-	target := s.primaryWindowTarget()
 
 	// Match the ordinary transport's line-break semantics before checking the
 	// pane's line discipline and staging the private buffer.

@@ -26,7 +26,7 @@ func (s *Session) SendKeysAndEnterIfStable(keys string, g PaneGeometry) (started
 	if err != nil || s.VimMode || g.AttachedClients < 0 || current.Geometry != g {
 		return false, fmt.Errorf("exact target changed or unreadable")
 	}
-	return true, s.sendKeysAndEnterCheckedToTarget(g.PaneID, keys, nil, nil)
+	return true, s.sendKeysAndEnterPrivateToTarget(g.PaneID, keys)
 }
 
 func guardedEnterArgs(name string, g PaneGeometry) []string {
