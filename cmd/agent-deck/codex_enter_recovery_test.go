@@ -248,6 +248,19 @@ func TestCodexEnterRecovery_AttemptsAtMostOnce(t *testing.T) {
 	}
 }
 
+func TestCodexEnterRecovery_WaitsForPasteBurstCooldown(t *testing.T) {
+	inst, fence, accept := codexRecoveryFence(t)
+	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: accept}
+	target.statuses = []string{"waiting"}
+	opts := codexRecoveryOptions(inst, fence, 4)
+	opts.codexRecoveryWait = time.Hour
+	res, err := executeSend(target, "codex", "Please inspect the synthetic fixture", false, sendExecTuning{retry: opts})
+	if err == nil || res.delivery != deliveryTypedNotSubmitted || target.sendKeysCalls != 1 ||
+		target.guardCalls != 0 || target.sendEnterCalls != 0 || target.acceptedTurns != 0 {
+		t.Fatalf("recovery fired inside cooldown: delivery=%q err=%v target=%#v", res.delivery, err, target)
+	}
+}
+
 func TestCodexEnterRecovery_SwallowedInitialEnter(t *testing.T) {
 	inst, fence, accept := codexRecoveryFence(t)
 	const message = "Reply with exactly: recovered-pong"
