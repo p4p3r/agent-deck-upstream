@@ -607,14 +607,18 @@ func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 	}
 }
 
-func TestBridgeTemplate_SendToConductorSupportsSingleCallWait(t *testing.T) {
+func TestBridgeTemplate_SendToConductorUsesAcceptanceHandoff(t *testing.T) {
 	template := conductorBridgePy
-	waitPattern := `"--wait", "--timeout", f"{response_timeout}s", "--json",`
+	acceptancePattern := `"--acceptance-only",`
+	legacyWaitPattern := `"--wait", "--timeout", f"{response_timeout}s", "--json",`
 	noWaitPattern := `"session", "send", session, message, "--no-wait",`
 	oldPattern := `"session", "send", session, message, profile=profile, timeout=120`
 
-	if !strings.Contains(template, waitPattern) {
-		t.Fatalf("template should include --wait send path: %q", waitPattern)
+	if !strings.Contains(template, acceptancePattern) {
+		t.Fatalf("template should include acceptance-only handoff: %q", acceptancePattern)
+	}
+	if !strings.Contains(template, legacyWaitPattern) {
+		t.Fatalf("template should retain the safe legacy wait fallback: %q", legacyWaitPattern)
 	}
 	if !strings.Contains(template, noWaitPattern) {
 		t.Fatalf("template should retain --no-wait send path: %q", noWaitPattern)

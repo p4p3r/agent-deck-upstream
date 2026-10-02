@@ -52,6 +52,7 @@ import (
 type tmuxCall struct {
 	argv  []string
 	stdin *bytes.Buffer
+	env   []string
 }
 
 // recordTransport swaps keySenderExec for a recorder that captures the full
@@ -75,9 +76,12 @@ func recordTransport(t *testing.T) *[]*tmuxCall {
 			// so the buffer is complete once runSendKeysBounded returns.
 			cmd := exec.Command("cat")
 			cmd.Stdout = call.stdin
+			call.env = cmd.Environ()
 			return cmd
 		}
-		return exec.Command("true")
+		cmd := exec.Command("true")
+		call.env = cmd.Environ()
+		return cmd
 	}
 	t.Cleanup(func() { keySenderExec = original })
 	return &calls

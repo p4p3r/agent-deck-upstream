@@ -1,3 +1,5 @@
+  -acceptance-only
+    	Wait only for exact acceptance of the fresh local Codex session's first turn and emit a bounded body-free JSON receipt
   -account string
     	Named account slot (uses its per-tool config_dir; overrides AGENTDECK_ACCOUNT)
   -additional-path value

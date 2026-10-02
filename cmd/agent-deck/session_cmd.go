@@ -3048,12 +3048,22 @@ func hookDrivenBusy(inst *session.Instance) (busy, known bool) {
 // handleSessionSend sends a message to a running session
 // Waits for the agent to be ready before sending (Claude, Gemini, etc.)
 func handleSessionSend(profile string, args []string) {
-	fs := flag.NewFlagSet("session send", flag.ExitOnError)
-	fs.SetOutput(os.Stdout)
+	acceptanceOnlyDiagnostics := acceptanceOnlyFlagRequestsBoundary(args)
+	errorHandling := flag.ExitOnError
+	if acceptanceOnlyDiagnostics {
+		errorHandling = flag.ContinueOnError
+	}
+	fs := flag.NewFlagSet("session send", errorHandling)
+	if acceptanceOnlyDiagnostics {
+		fs.SetOutput(io.Discard)
+	} else {
+		fs.SetOutput(os.Stdout)
+	}
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("q", false, "Quiet mode")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output (on a socket send, first waits up to 30s for the turn to start; returns immediately with wait_outcome=unverified_busy_target/unverified_busy_probe_failed if the target could not be shown idle)")
+	acceptanceOnly := fs.Bool("acceptance-only", false, "Wait only for exact local Codex turn acceptance, emit a body-free JSON receipt, and return before completion")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
 	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
@@ -3088,6 +3098,7 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck session send my-project \"Summarize recent changes\"")
 		fmt.Println("  agent-deck session send my-project \"run tests\" --wait")
+		fmt.Println("  agent-deck session send my-project \"start the task\" --acceptance-only")
 		fmt.Println("  agent-deck session send my-project \"quick ping\" --no-wait")
 		fmt.Println("  agent-deck session send my-project \"trace progress\" --stream")
 		fmt.Println("  agent-deck session send my-project \"cwd: /path/to/dir\" --draft")
@@ -3111,20 +3122,47 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  Emits one structured result correlated to the accepted Codex turn.")
 		fmt.Println("  Requires a locally readable exact accepted-turn receipt; remote or sandboxed targets are refused.")
 		fmt.Println("  Local agent-deck sends are serialized; direct pane or keyboard input is outside this guarantee.")
+		fmt.Println()
+		fmt.Println("Codex --acceptance-only:")
+		fmt.Println("  Emits one bounded, body-free JSON result after exact turn acceptance (within a 2s acceptance window).")
+		fmt.Println("  Returns before completion and never retries after an indeterminate result.")
+		fmt.Println("  Supports only local Codex targets with a uniquely readable exact rollout.")
+		fmt.Println("  Incompatible with --wait, --stream, --no-wait, --draft, and -q; --json is optional.")
+	}
+	if acceptanceOnlyDiagnostics {
+		// flag.Parse invokes Usage for both malformed flags and --help. Neither
+		// free-form parser diagnostics nor help text belong in this mode's
+		// bounded machine-readable channel.
+		fs.Usage = func() {}
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		if acceptanceOnlyDiagnostics {
+			emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(
+				acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "",
+			))
+		}
 		os.Exit(1)
 	}
 	remaining := fs.Args()
 
 	out := NewCLIOutput(*jsonOutput, *quiet)
+	failAcceptanceOnly := func(code, outcome, delivery string) {
+		emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(code, outcome, delivery))
+		os.Exit(1)
+	}
 
 	needPositionalMessage := *messageFile == ""
 	if len(remaining) < 1 || (needPositionalMessage && len(remaining) < 2) {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "")
+		}
 		fs.Usage()
 		out.Error("session and message (or --message-file) are required", ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+	if *acceptanceOnly && (*wait || *stream || *noWait || *draft || *quiet) {
+		failAcceptanceOnly(acceptanceOnlyCodeInvalidOptions, acceptanceOnlyNotAccepted, "")
 	}
 
 	if *stream && *wait {
@@ -3147,6 +3185,9 @@ func handleSessionSend(profile string, args []string) {
 	sessionRef := remaining[0]
 	message, err := resolveMessageInput(strings.Join(remaining[1:], " "), *messageFile, os.Stdin)
 	if err != nil {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeInputUnreadable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -3154,6 +3195,9 @@ func handleSessionSend(profile string, args []string) {
 	// Load sessions
 	storage, instances, _, err := loadSessionData(profile)
 	if err != nil {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error(err.Error(), ErrCodeNotFound)
 		os.Exit(1)
 	}
@@ -3161,12 +3205,20 @@ func handleSessionSend(profile string, args []string) {
 	// Resolve session
 	inst, errMsg, errCode := ResolveSession(sessionRef, instances)
 	if inst == nil {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error(errMsg, errCode)
 		if errCode == ErrCodeNotFound {
 			os.Exit(2)
 		}
 		os.Exit(1)
 		return // unreachable, satisfies staticcheck SA5011
+	}
+	if *acceptanceOnly {
+		if code := acceptanceOnlyPreconditionCode(inst); code != "" {
+			failAcceptanceOnly(code, acceptanceOnlyNotAccepted, "")
+		}
 	}
 
 	// Machine callers get a durable id immediately. The worker opts out of
@@ -3221,6 +3273,9 @@ func handleSessionSend(profile string, args []string) {
 
 	// Check if session is running
 	if !inst.Exists() {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error(fmt.Sprintf("session '%s' is not running", inst.Title), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -3231,11 +3286,17 @@ func handleSessionSend(profile string, args []string) {
 	// success. Silent message loss is the worst failure class here, so it is a
 	// hard refusal rather than a warning. Every other tool returns nil.
 	if err := inst.PromptDeliveryError(); err != nil {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
 	if shouldSkipConductorHeartbeatSend(inst, message) {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Success(fmt.Sprintf("Skipped heartbeat for '%s'", inst.Title), map[string]interface{}{
 			"success":       true,
 			"skipped":       true,
@@ -3249,6 +3310,9 @@ func handleSessionSend(profile string, args []string) {
 	// Get tmux session
 	tmuxSess := inst.GetTmuxSession()
 	if tmuxSess == nil {
+		if *acceptanceOnly {
+			failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+		}
 		out.Error("could not determine tmux session", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -3262,6 +3326,9 @@ func handleSessionSend(profile string, args []string) {
 		if err := send.WaitUntilNotBusy(func() (string, error) {
 			return fetchHookDrivenStatus(profile, sessionRef)
 		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
+			if *acceptanceOnly {
+				failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+			}
 			out.Error(err.Error(), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -3274,7 +3341,7 @@ func handleSessionSend(profile string, args []string) {
 	structuredCodexWait := *jsonOutput && *wait && session.IsCodexCompatible(inst.Tool)
 	acceptanceFence := codexAcceptanceFence{}
 	var acceptanceGuard *codexAcceptanceGuard
-	if shouldAcquireCodexAcceptanceGuard(inst, *jsonOutput, *wait, *draft) {
+	if shouldAcquireCodexAcceptanceGuard(inst, *jsonOutput || *acceptanceOnly, *wait || *acceptanceOnly, *draft) {
 		// Every send keeps the double-send refusal: an unresolved earlier
 		// submission, an identity owned by another session, a held
 		// acceptance lock or a remote rollout all refuse, whatever the
@@ -3289,6 +3356,8 @@ func handleSessionSend(profile string, args []string) {
 		switch {
 		case guardErr == nil:
 			acceptanceFence = acceptanceGuard.fence
+		case *acceptanceOnly:
+			failAcceptanceOnly(acceptanceOnlyCodeUnavailable, acceptanceOnlyNotAccepted, "")
 		case codexComposerFallbackAllowed(guardErr, *codexComposerFallback, structuredCodexWait):
 			acceptanceGuard = nil
 			fmt.Fprintf(os.Stderr, "Note: no Codex accepted-turn receipt yet (%v); sending through the composer (--codex-composer-fallback)\n", guardErr)
@@ -3316,6 +3385,9 @@ func handleSessionSend(profile string, args []string) {
 			if acceptanceGuard != nil {
 				acceptanceGuard.Release()
 			}
+			if *acceptanceOnly {
+				failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
+			}
 			out.Error(fmt.Sprintf("timeout waiting for agent: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -3330,6 +3402,9 @@ func handleSessionSend(profile string, args []string) {
 			if err := waitForSlashCommandReady(tmuxSess, inst.Tool, slashTimeout); err != nil {
 				if acceptanceGuard != nil {
 					acceptanceGuard.Release()
+				}
+				if *acceptanceOnly {
+					failAcceptanceOnly(acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyNotAccepted, "")
 				}
 				out.Error(fmt.Sprintf("timeout waiting for slash-command registration: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -3429,17 +3504,27 @@ func handleSessionSend(profile string, args []string) {
 		turnQuery := session.TurnQuery{Path: turnPath, Prompt: message, Cursor: turnCursor}
 		tun.retry.turnAdvanced = func() bool { return session.TurnAdvanced(turnQuery) }
 	}
+	if *acceptanceOnly {
+		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
+		tun.retry.codexFenceUnchanged = func() bool { return validateCodexAcceptanceFence(inst, acceptanceFence) == nil }
+	}
 	if acceptanceGuard != nil {
 		// Codex's counterpart: a new turn in the exact rollout past the
 		// acceptance fence, the evidence the accepted-turn receipt rests on.
 		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
 		if err := validateCodexAcceptanceFence(inst, acceptanceFence); err != nil {
 			acceptanceGuard.Release()
+			if *acceptanceOnly {
+				failAcceptanceOnly(acceptanceOnlyCodeUnavailable, acceptanceOnlyNotAccepted, "")
+			}
 			out.Error(fmt.Sprintf("cannot submit against changed Codex turn fence: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 		if err := acceptanceGuard.Prepare(inst.ID, time.Now()); err != nil {
 			acceptanceGuard.Release()
+			if *acceptanceOnly {
+				failAcceptanceOnly(acceptanceOnlyCodeUnavailable, acceptanceOnlyNotAccepted, "")
+			}
 			out.Error(fmt.Sprintf("cannot durably reserve Codex turn acceptance: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -3449,7 +3534,7 @@ func handleSessionSend(profile string, args []string) {
 	// strictly before any byte is written, so falling back to tmux here is
 	// indistinguishable from today's behavior on any resolution failure.
 	sendTransportValue, sendTransportWarn := sendTransportFromConfig()
-	if sendTransportWarn != "" {
+	if sendTransportWarn != "" && !*acceptanceOnly {
 		fmt.Fprintln(os.Stderr, sendTransportWarn)
 	}
 	// The busy probe reads the same hook-driven status --defer-if-busy holds
@@ -3461,9 +3546,17 @@ func handleSessionSend(profile string, args []string) {
 	// exit path below — never before it, per the same rule applied to
 	// handleSessionStop/handleSessionRestart.
 	sendDetail := sendEventDetail(sendRes, sendErr, sentAt)
+	failAcceptanceOnlyAfterSend := func(code, outcome, delivery string) {
+		emitAcceptanceOnlyResult(newAcceptanceOnlyFailureResult(code, outcome, delivery))
+		recordSendEvent(profile, inst.ID, sendDetail)
+		os.Exit(1)
+	}
 	if acceptanceGuard != nil {
 		if markerErr := acceptanceGuard.RecordTransportOutcome(sendRes.delivery, time.Now()); markerErr != nil {
 			acceptanceGuard.Release()
+			if *acceptanceOnly {
+				failAcceptanceOnlyAfterSend(acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, sendRes.delivery)
+			}
 			extra := sendRes.jsonFields()
 			extra["session_id"] = inst.ID
 			extra["session_title"] = inst.Title
@@ -3475,6 +3568,15 @@ func handleSessionSend(profile string, args []string) {
 	if sendErr != nil {
 		if acceptanceGuard != nil {
 			acceptanceGuard.Release()
+		}
+		if *acceptanceOnly {
+			outcome := acceptanceOnlyIndeterminate
+			code := acceptanceOnlyCodeIndeterminate
+			if acceptanceOnlyDefinitiveNonDelivery(sendRes.delivery) {
+				outcome = acceptanceOnlyNotAccepted
+				code = acceptanceOnlyCodeNotAccepted
+			}
+			failAcceptanceOnlyAfterSend(code, outcome, sendRes.delivery)
 		}
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
@@ -3530,17 +3632,31 @@ func handleSessionSend(profile string, args []string) {
 	// also in saved_draft in --json) so the operator can recover it rather
 	// than discovering a silent loss. draft_restore_failed never blocks the
 	// send: the automated message did go through.
-	if sendRes.draftSaved != "" && sendRes.draftRestoreFailed {
+	if sendRes.draftSaved != "" && sendRes.draftRestoreFailed && !*acceptanceOnly {
 		fmt.Fprintf(os.Stderr,
 			"Warning: cleared the operator draft to deliver this message but could not restore it. Recover it from: %s\n",
 			sendRes.draftSaved)
+	}
+
+	acceptedAt := time.Now()
+	if *acceptanceOnly {
+		result := acceptedTurnOnlyVerdict(inst, sendRes.delivery, acceptedAt, acceptanceFence, acceptanceGuard)
+		if acceptanceGuard != nil {
+			acceptanceGuard.Release()
+			acceptanceGuard = nil
+		}
+		emitAcceptanceOnlyResult(result)
+		recordSendEvent(profile, inst.ID, sendDetail)
+		if !result.Success {
+			os.Exit(1)
+		}
+		return
 	}
 
 	sendData := sendSuccessData(inst, message, sendRes, *wait)
 	if session.IsCodexCompatible(inst.Tool) {
 		sendData["accepted_turn_kind"] = "codex_rollout"
 	}
-	acceptedAt := time.Now()
 	acceptedTurn := observeAcceptedCodexTurn(*wait, inst, sendRes.delivery, acceptedAt, acceptanceFence)
 	if acceptedTurn != nil && acceptanceGuard != nil {
 		if err := acceptanceGuard.ResolveAccepted(); err != nil {
@@ -3833,6 +3949,39 @@ func handleSessionSend(profile string, args []string) {
 	}
 }
 
+// acceptanceOnlyFlagRequestsBoundary recognizes the same one- and two-dash
+// boolean flag forms accepted by flag.FlagSet. Invalid explicit boolean values
+// still activate the boundary: they are precisely the parse failures whose raw
+// values must not be echoed. A valid explicit false preserves legacy behavior.
+func acceptanceOnlyFlagRequestsBoundary(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		nameValue := ""
+		switch {
+		case strings.HasPrefix(arg, "--"):
+			nameValue = strings.TrimPrefix(arg, "--")
+		case strings.HasPrefix(arg, "-"):
+			nameValue = strings.TrimPrefix(arg, "-")
+		default:
+			continue
+		}
+		name, value, hasValue := strings.Cut(nameValue, "=")
+		if name != "acceptance-only" {
+			continue
+		}
+		if !hasValue {
+			return true
+		}
+		enabled, err := strconv.ParseBool(value)
+		if err != nil || enabled {
+			return true
+		}
+	}
+	return false
+}
+
 // awaitClaudeWaitReply is the whole Claude --wait reply path after delivery,
 // and the only place handleSessionSend obtains a Claude reply from: establish
 // the turn identity (blocking until the message's own user record exists —
@@ -3968,9 +4117,10 @@ func retainCodexAcceptanceGuardForCompletion(wait bool, receipt *codexAcceptedTu
 // issue #876.
 func defaultSendOptions() sendRetryOptions {
 	return sendRetryOptions{
-		maxRetries:     50,
-		checkDelay:     300 * time.Millisecond,
-		verifyDelivery: true,
+		maxRetries:        50,
+		checkDelay:        300 * time.Millisecond,
+		verifyDelivery:    true,
+		codexRecoveryWait: 900 * time.Millisecond,
 	}
 }
 
@@ -4239,7 +4389,39 @@ type codexAcceptedTurnReceipt struct {
 	AcceptedAt     string `json:"accepted_at"`
 }
 
+// acceptanceOnlyResult is the complete public result for --acceptance-only.
+// It is deliberately separate from sendSuccessData: that legacy envelope owns
+// message, response, title, draft, transport, and diagnostic fields which must
+// never cross this mode's output boundary.
+type acceptanceOnlyResult struct {
+	SchemaVersion    int                       `json:"schema_version"`
+	Success          bool                      `json:"success"`
+	Acceptance       string                    `json:"acceptance"`
+	Code             string                    `json:"code,omitempty"`
+	InstanceID       string                    `json:"instance_id,omitempty"`
+	Delivery         string                    `json:"delivery,omitempty"`
+	Submitted        *bool                     `json:"submitted,omitempty"`
+	AcceptedTurnKind string                    `json:"accepted_turn_kind,omitempty"`
+	AcceptedTurn     *codexAcceptedTurnReceipt `json:"accepted_turn,omitempty"`
+}
+
 const (
+	acceptanceOnlySchemaVersion    = 1
+	acceptanceOnlyResultMaxBytes   = 2048
+	acceptanceOnlyOpaqueIDMaxBytes = 128
+
+	acceptanceOnlyAccepted      = "accepted"
+	acceptanceOnlyNotAccepted   = "not_accepted"
+	acceptanceOnlyIndeterminate = "indeterminate"
+
+	acceptanceOnlyCodeInvalidOptions    = "INVALID_OPTIONS"
+	acceptanceOnlyCodeInputUnreadable   = "INPUT_UNREADABLE"
+	acceptanceOnlyCodeTargetUnavailable = "TARGET_UNAVAILABLE"
+	acceptanceOnlyCodeUnsupported       = "UNSUPPORTED_TARGET"
+	acceptanceOnlyCodeUnavailable       = "EXACT_ACCEPTANCE_UNAVAILABLE"
+	acceptanceOnlyCodeNotAccepted       = "NOT_ACCEPTED"
+	acceptanceOnlyCodeIndeterminate     = "ACCEPTANCE_INDETERMINATE"
+
 	sessionSendDefaultTimeout  = 10 * time.Minute
 	codexAcceptanceLockTimeout = 5 * time.Second
 )
@@ -4294,6 +4476,230 @@ func (g *codexAcceptanceGuard) ResolveAccepted() error {
 		return fmt.Errorf("Codex submission marker is unavailable")
 	}
 	return session.ClearCodexSubmissionMarker(g.marker)
+}
+
+func acceptanceOnlyPreconditionCode(inst *session.Instance) string {
+	if inst == nil {
+		return acceptanceOnlyCodeTargetUnavailable
+	}
+	if !session.IsCodexCompatible(inst.Tool) {
+		return acceptanceOnlyCodeUnsupported
+	}
+	if !inst.CodexRolloutIsResolvableLocally() {
+		return acceptanceOnlyCodeUnavailable
+	}
+	return ""
+}
+
+func acceptanceOnlyDefinitiveNonDelivery(delivery string) bool {
+	switch delivery {
+	case deliveryLineTooLong, deliveryComposerBlocked, deliveryTargetBusy:
+		return true
+	default:
+		return false
+	}
+}
+
+func acceptanceOnlyKnownDelivery(delivery string) bool {
+	switch delivery {
+	case deliverySubmitted, deliveryUnverified, deliveryDelivered, deliveryLineTooLong,
+		deliveryMenuOpen, deliveryPaneGone, deliveryTypedNotSubmitted, deliveryNoEvidence,
+		deliverySendFailed, deliveryComposerBlocked, deliveryTargetBusy, deliveryQueued,
+		deliveryQueuedSocket, deliverySocketWriteFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func newAcceptanceOnlyFailureResult(code, outcome, delivery string) acceptanceOnlyResult {
+	return newAcceptanceOnlyFailureResultForInstance(code, outcome, delivery, "")
+}
+
+func newAcceptanceOnlyFailureResultForInstance(code, outcome, delivery, instanceID string) acceptanceOnlyResult {
+	result := acceptanceOnlyResult{
+		SchemaVersion: acceptanceOnlySchemaVersion,
+		Success:       false,
+		Acceptance:    outcome,
+		Code:          code,
+		InstanceID:    strings.TrimSpace(instanceID),
+	}
+	if acceptanceOnlyKnownDelivery(delivery) {
+		result.Delivery = delivery
+		submitted := delivery == deliverySubmitted
+		result.Submitted = &submitted
+	}
+	return result
+}
+
+func newAcceptanceOnlySuccessResult(receipt *codexAcceptedTurnReceipt) (acceptanceOnlyResult, error) {
+	if err := validateAcceptanceOnlyReceipt(receipt); err != nil {
+		return acceptanceOnlyResult{}, err
+	}
+	submitted := true
+	return acceptanceOnlyResult{
+		SchemaVersion:    acceptanceOnlySchemaVersion,
+		Success:          true,
+		Acceptance:       acceptanceOnlyAccepted,
+		InstanceID:       receipt.InstanceID,
+		Delivery:         deliverySubmitted,
+		Submitted:        &submitted,
+		AcceptedTurnKind: "codex_rollout",
+		AcceptedTurn:     receipt,
+	}, nil
+}
+
+func validateAcceptanceOnlyReceipt(receipt *codexAcceptedTurnReceipt) error {
+	if receipt == nil || !acceptanceOnlyOpaqueID(receipt.InstanceID) ||
+		!acceptanceOnlyOpaqueID(receipt.CodexSessionID) {
+		return fmt.Errorf("accepted-turn identity is invalid")
+	}
+	receiptID, err := uuid.Parse(receipt.ReceiptID)
+	if err != nil || receiptID.String() != receipt.ReceiptID {
+		return fmt.Errorf("accepted-turn receipt identity is invalid")
+	}
+	prefix := receipt.CodexSessionID + ":"
+	if !strings.HasPrefix(receipt.TurnGeneration, prefix) ||
+		!acceptanceOnlyOpaqueID(strings.TrimPrefix(receipt.TurnGeneration, prefix)) {
+		return fmt.Errorf("accepted-turn generation is invalid")
+	}
+	if len(receipt.AcceptedAt) > 64 {
+		return fmt.Errorf("accepted-turn timestamp is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, receipt.AcceptedAt); err != nil {
+		return fmt.Errorf("accepted-turn timestamp is invalid")
+	}
+	return nil
+}
+
+func acceptanceOnlyOpaqueID(value string) bool {
+	if value == "" || len(value) > acceptanceOnlyOpaqueIDMaxBytes {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func acceptedTurnOnlyVerdict(
+	inst *session.Instance,
+	delivery string,
+	acceptedAt time.Time,
+	fence codexAcceptanceFence,
+	guard *codexAcceptanceGuard,
+) acceptanceOnlyResult {
+	receiptDelivery := acceptanceOnlyReceiptDelivery(inst, delivery, fence, guard)
+	receipt := observeAcceptedCodexTurn(true, inst, receiptDelivery, acceptedAt, fence)
+	if receipt == nil || guard == nil {
+		return newAcceptanceOnlyFailureResult(
+			acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, delivery,
+		)
+	}
+	result, err := newAcceptanceOnlySuccessResult(receipt)
+	if err != nil {
+		return newAcceptanceOnlyFailureResult(
+			acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, delivery,
+		)
+	}
+	if err := guard.ResolveAccepted(); err != nil {
+		return newAcceptanceOnlyFailureResult(
+			acceptanceOnlyCodeIndeterminate, acceptanceOnlyIndeterminate, delivery,
+		)
+	}
+	return result
+}
+
+// acceptanceOnlyReceiptDelivery promotes transport-level uncertainty only
+// for the one outcome that proves the body and Enter reached the pane, and
+// only after that exact attempt was durably marked ambiguous under the same
+// instance/session/generation fence. The existing accepted-turn observer must
+// still prove a strictly newer exact rollout generation before this can
+// produce a receipt. Generic send modes continue to require deliverySubmitted.
+func acceptanceOnlyReceiptDelivery(
+	inst *session.Instance,
+	delivery string,
+	fence codexAcceptanceFence,
+	guard *codexAcceptanceGuard,
+) string {
+	if delivery != deliveryDelivered || inst == nil || guard == nil || guard.marker == nil ||
+		!guard.marker.IsTransportAmbiguous() || guard.fence != fence ||
+		guard.marker.InstanceID != strings.TrimSpace(inst.ID) ||
+		guard.marker.CodexSessionID != fence.codexSessionID ||
+		guard.marker.PriorTurnGeneration != fence.priorTurnGeneration {
+		return delivery
+	}
+	return deliverySubmitted
+}
+
+func marshalAcceptanceOnlyResult(result acceptanceOnlyResult) ([]byte, error) {
+	if err := validateAcceptanceOnlyResult(result); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw)+1 > acceptanceOnlyResultMaxBytes {
+		return nil, fmt.Errorf("acceptance-only result exceeds its output bound")
+	}
+	return raw, nil
+}
+
+func validateAcceptanceOnlyResult(result acceptanceOnlyResult) error {
+	if result.SchemaVersion != acceptanceOnlySchemaVersion {
+		return fmt.Errorf("invalid acceptance-only schema version")
+	}
+	if result.Success {
+		if result.Acceptance != acceptanceOnlyAccepted || result.Code != "" ||
+			result.Delivery != deliverySubmitted || result.Submitted == nil || !*result.Submitted ||
+			result.AcceptedTurnKind != "codex_rollout" || result.AcceptedTurn == nil ||
+			result.InstanceID != result.AcceptedTurn.InstanceID {
+			return fmt.Errorf("invalid acceptance-only success result")
+		}
+		return validateAcceptanceOnlyReceipt(result.AcceptedTurn)
+	}
+	if result.Acceptance != acceptanceOnlyNotAccepted && result.Acceptance != acceptanceOnlyIndeterminate {
+		return fmt.Errorf("invalid acceptance-only failure outcome")
+	}
+	switch result.Code {
+	case acceptanceOnlyCodeInvalidOptions, acceptanceOnlyCodeInputUnreadable,
+		acceptanceOnlyCodeTargetUnavailable, acceptanceOnlyCodeUnsupported,
+		acceptanceOnlyCodeUnavailable, acceptanceOnlyCodeNotAccepted,
+		acceptanceOnlyCodeIndeterminate:
+	default:
+		return fmt.Errorf("invalid acceptance-only failure code")
+	}
+	if result.InstanceID != "" && !acceptanceOnlyOpaqueID(result.InstanceID) {
+		return fmt.Errorf("acceptance-only failure contains invalid instance identity")
+	}
+	if result.AcceptedTurnKind != "" || result.AcceptedTurn != nil {
+		return fmt.Errorf("acceptance-only failure contains receipt fields")
+	}
+	if result.Delivery == "" {
+		if result.Submitted != nil {
+			return fmt.Errorf("acceptance-only failure has submission without delivery")
+		}
+		return nil
+	}
+	if !acceptanceOnlyKnownDelivery(result.Delivery) || result.Submitted == nil ||
+		*result.Submitted != (result.Delivery == deliverySubmitted) {
+		return fmt.Errorf("invalid acceptance-only delivery classification")
+	}
+	return nil
+}
+
+func emitAcceptanceOnlyResult(result acceptanceOnlyResult) {
+	raw, err := marshalAcceptanceOnlyResult(result)
+	if err != nil {
+		raw = []byte(`{"schema_version":1,"success":false,"acceptance":"indeterminate","code":"ACCEPTANCE_INDETERMINATE"}`)
+	}
+	fmt.Fprintln(os.Stdout, string(raw))
 }
 
 // hydrateLegacyCodexIdentity repairs the narrow upgrade case where a live,
@@ -4443,6 +4849,15 @@ func validateCodexAcceptanceFence(inst *session.Instance, fence codexAcceptanceF
 	return nil
 }
 
+func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFence) bool {
+	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
+		return false
+	}
+	generation, err := inst.LatestCodexTurnGeneration()
+	return err == nil && generation != "" && generation != fence.priorTurnGeneration &&
+		strings.HasPrefix(generation, fence.codexSessionID+":")
+}
+
 func requireStructuredCodexAcceptedTurn(
 	inst *session.Instance,
 	jsonOutput, wait bool,
@@ -4469,16 +4884,6 @@ func retryAndRequireStructuredCodexAcceptedTurn(
 		receipt = waitForAcceptedCodexTurn(inst, delivery, acceptedAt, fence)
 	}
 	return receipt, requireStructuredCodexAcceptedTurn(inst, jsonOutput, wait, receipt)
-}
-
-// codexTurnAdvancedPastFence reports whether the exact rollout has started a
-// turn after the acceptance fence was captured.
-func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFence) bool {
-	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
-		return false
-	}
-	generation, err := inst.LatestCodexTurnGeneration()
-	return err == nil && generation != "" && generation != fence.priorTurnGeneration
 }
 
 func captureCodexAcceptanceFence(inst *session.Instance) codexAcceptanceFence {
@@ -4798,9 +5203,10 @@ func executeDraft(target draftSender, message string) error {
 // path (issue #479 — would otherwise double-send).
 func noWaitSendOptions() sendRetryOptions {
 	return sendRetryOptions{
-		maxRetries:     30,
-		checkDelay:     200 * time.Millisecond,
-		maxFullResends: -1,
+		maxRetries:        30,
+		checkDelay:        200 * time.Millisecond,
+		maxFullResends:    -1,
+		codexRecoveryWait: 900 * time.Millisecond,
 		// Issue #876: even on the --no-wait path, callers expect that a
 		// `Sent` exit means the message reached the agent. Without this,
 		// the verification loop would still fall through to nil on a
@@ -4928,6 +5334,16 @@ type sendRetryOptions struct {
 	// and wins over every heuristic below. nil for callers without a
 	// transcript (non-Claude tools, slash commands, unknown path).
 	turnAdvanced func() bool
+
+	// Recovery requires a readable rollout still at the pre-send generation.
+	codexFenceUnchanged func() bool
+
+	// codexRecoveryWait keeps the single fenced recovery Enter outside
+	// Codex's paste-burst window.  A fast literal body followed by Enter can
+	// occasionally be coalesced into editor input, leaving one trailing blank
+	// line instead of starting a turn.  Recovery remains bounded to one Enter
+	// and still requires the exact composer, target and rollout generation.
+	codexRecoveryWait time.Duration
 }
 
 // verificationChecks is how many post-send checks the verify loop runs for
@@ -5019,7 +5435,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// wire none can never receive a queued verdict and pay nothing extra.
 	var arrivalBaseline sendArrivalBaseline
 	if skipVerify || opts.targetBusyByHook != nil {
-		arrivalBaseline = captureArrivalBaseline(target, message)
+		arrivalBaseline = captureArrivalBaseline(target, message, session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil)
 	}
 	// hookBusyBeforeSend distinguishes the two ways the hook can read busy
 	// after a send that landed: the target was ALREADY mid-turn, so the
@@ -5027,7 +5443,27 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// is the target taking this message up (submitted).
 	hookBusyBeforeSend := opts.hookBusyNow()
 
-	if err := sendInitialKeysChecked(target, message, opts.expectedPasteBreaks); err != nil {
+	fencedCodex := session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil
+	var initialErr error
+	if fencedCodex {
+		capture := send.PaneCapture{Raw: arrivalBaseline.raw, OK: arrivalBaseline.paneOK, Geometry: arrivalBaseline.geometry}
+		_, clear := send.CaptureClearCodexComposerFrame(capture)
+		writer, pinned := target.(interface {
+			SendKeysAndEnterIfStable(string, tmux.PaneGeometry) (bool, error)
+		})
+		if !clear || !arrivalBaseline.statusOK || !arrivalBaseline.idle || hookBusyBeforeSend ||
+			!pinned || opts.codexFenceUnchanged == nil || !opts.codexFenceUnchanged() {
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: idle, clear, stable exact target is unproven")
+		}
+		started, err := writer.SendKeysAndEnterIfStable(message, *arrivalBaseline.geometry)
+		if !started {
+			return deliveryComposerBlocked, fmt.Errorf("message not sent: exact target changed or unreadable")
+		}
+		initialErr = err
+	} else {
+		initialErr = sendInitialKeysChecked(target, message, opts.expectedPasteBreaks)
+	}
+	if err := initialErr; err != nil {
 		// A refused over-long line is a distinct, actionable outcome: the
 		// transport typed nothing, so the composer is untouched and the
 		// caller must not retry the same body against the same pane
@@ -5329,6 +5765,8 @@ const arrivalSafeLineBytes = 1023
 // against. Every field here is meaningless on its own and meaningful only as a
 // delta (see the comment at the capture site).
 type sendArrivalBaseline struct {
+	geometry *tmux.PaneGeometry
+	idle     bool
 	// occurrences is how many copies of the message body were already
 	// visible in the pane before the send.
 	occurrences int
@@ -5361,20 +5799,40 @@ type sendArrivalBaseline struct {
 	statusOK bool
 }
 
+// captureSendPane uses structural captures only for fenced Codex recovery.
+func captureSendPane(target sendRetryTarget, structural bool) send.PaneCapture {
+	if structural {
+		if source, ok := target.(interface {
+			CapturePaneSnapshot() (tmux.PaneSnapshot, error)
+		}); ok {
+			snapshot, err := source.CapturePaneSnapshot()
+			capture := send.CaptureOutcome(snapshot.Raw, err)
+			if err == nil {
+				capture.Geometry = &snapshot.Geometry
+			}
+			return capture
+		}
+	}
+	raw, err := target.CapturePaneFresh()
+	return send.CaptureOutcome(raw, err)
+}
+
 // captureArrivalBaseline snapshots the pane and status before a send. Each
 // signal records whether it was actually observed; a signal without a valid
 // baseline is disabled, never guessed.
 //
 // The capture is taken even for a message too short to yield a token: the
 // observer still needs the pre-send frame for the paste-marker delta.
-func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
+func captureArrivalBaseline(target sendRetryTarget, message string, structural bool) sendArrivalBaseline {
 	base := sendArrivalBaseline{}
-	if raw, err := target.CapturePaneFresh(); err == nil {
-		base.raw, base.paneOK = raw, true
-		base.occurrences, base.pasteMarkers, _ = paneArrivalCounts(raw, message)
+	capture := captureSendPane(target, structural)
+	if capture.OK {
+		base.raw, base.paneOK, base.geometry = capture.Raw, true, capture.Geometry
+		base.occurrences, base.pasteMarkers, _ = paneArrivalCounts(capture.Raw, message)
 	}
 	if status, err := target.GetStatus(); err == nil {
 		base.wasActive, base.statusOK = status == "active", true
+		base.idle = status == "waiting" || status == "idle"
 	}
 	return base
 }
@@ -5426,6 +5884,28 @@ func verificationWindow(checks int, delay time.Duration) string {
 // taking it up; hookBusyBeforeSend is the pre-send reading of
 // opts.targetBusyByHook. A composer paste marker never feeds that verdict.
 func verifyContentArrival(target sendRetryTarget, message string, opts sendRetryOptions, baseline sendArrivalBaseline, hookBusyBeforeSend bool) (string, error) {
+	// A fenced Codex send can recover a swallowed Enter, but only from a
+	// composer that was positively empty before this operation. The rollout
+	// generation, rather than pane activity or a disappearing draft, remains
+	// the authoritative submission signal for this path.
+	fencedCodex := session.IsCodexCompatible(opts.tool) && opts.turnAdvanced != nil && opts.codexFenceUnchanged != nil
+	var codexFrame send.CodexComposerFrame
+	codexComposerWasClear := false
+	if fencedCodex && opts.codexFenceUnchanged != nil && baseline.paneOK && baseline.statusOK && baseline.idle && !hookBusyBeforeSend {
+		codexFrame, codexComposerWasClear = send.CaptureClearCodexComposerFrame(send.PaneCapture{Raw: baseline.raw, OK: baseline.paneOK, Geometry: baseline.geometry})
+	}
+	attrib := send.EnterAttribution{Message: message, CodexFrame: codexFrame}
+	normalizedMessage := send.NormalizePromptText(message)
+	structuralRefused := !codexComposerWasClear
+	recoveryAttempted := false
+	recoveryEligibleAt := time.Now().Add(opts.codexRecoveryWait)
+	guardedTarget, canGuard := target.(interface {
+		SendEnterIfStable(tmux.PaneGeometry) error
+	})
+	if fencedCodex && !canGuard {
+		structuralRefused = true
+	}
+
 	// Whether an unverified outcome is a failure depends on the longest LINE,
 	// not on the total payload. Canonical buffering is per line — that is the
 	// whole finding this fix rests on — so a 20 KB body of 80-byte lines is
@@ -5444,7 +5924,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 
 	token := collapseWhitespace(messageDeliveryToken(message))
-	if token == "" {
+	if token == "" && !fencedCodex {
 		// Nothing distinctive enough to look for. Verification is impossible
 		// rather than failed — but "impossible" must not become an exit 0 for
 		// a payload with a line big enough to be silently eaten, which would
@@ -5475,18 +5955,25 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		if opts.turnAdvanced != nil && opts.turnAdvanced() {
 			return deliverySubmitted, nil
 		}
+		if fencedCodex && i == 0 {
+			time.Sleep(opts.checkDelay)
+		}
 		// Strongest pane signal: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
-		if baseline.statusOK && !baseline.wasActive {
+		if !fencedCodex && baseline.statusOK && !baseline.wasActive {
 			if status, err := target.GetStatus(); err == nil && status == "active" {
 				return deliverySubmitted, nil
 			}
 		}
 		if baseline.paneOK {
-			raw, captureErr := target.CapturePaneFresh()
-			obs.Observe(send.CaptureOutcome(raw, captureErr))
-			if obs.TurnStarted() {
+			capture := captureSendPane(target, fencedCodex)
+			raw, captureErr := capture.Raw, capture.Err
+			obs.Observe(capture)
+			if !fencedCodex && obs.TurnStarted() {
 				return deliverySubmitted, nil
+			}
+			if fencedCodex && obs.BodyArrived() {
+				sawBody = true
 			}
 			if n, markers, ok := paneArrivalCounts(raw, message); captureErr == nil && ok {
 				content := tmux.StripANSI(raw)
@@ -5503,7 +5990,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					// already busy can only be inferred queued, and this path
 					// has no queue acknowledgement to read, so it keeps the
 					// #1793 verdict below.
-					if !hookBusyBeforeSend && !send.HasUnsentComposerPrompt(content, message) && opts.hookBusyNow() {
+					if !fencedCodex && !hookBusyBeforeSend && !send.HasUnsentComposerPrompt(content, message) && opts.hookBusyNow() {
 						return deliverySubmitted, nil
 					}
 					// Keep polling: the body is in, but the turn may still
@@ -5530,10 +6017,44 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					sawBody = true
 				}
 			}
+			// Recovery sends no body and never clears input. Require the FULL
+			// visible draft to equal our payload; the observer's token, prefix
+			// and paste-marker matches are arrival evidence only. A failed read,
+			// foreign addition, collapsed paste or partial rendering gets no Enter.
+			if codexComposerWasClear && !structuralRefused && !recoveryAttempted && normalizedMessage != "" {
+				draft, visible := codexFrame.Prompt(capture)
+				if !visible {
+					structuralRefused = true
+				}
+				if visible && !time.Now().Before(recoveryEligibleAt) && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft) && !opts.hookBusyNow() {
+					status, statusErr := target.GetStatus()
+					if statusErr == nil && (status == "waiting" || status == "idle") {
+						// Acceptance may have landed while capturing the pane or
+						// reading status. Recheck immediately before the gated press
+						// so a stale composer frame cannot duplicate an accepted turn.
+						if opts.turnAdvanced() {
+							return deliverySubmitted, nil
+						}
+						recoveryAttempted = true
+						if !opts.codexFenceUnchanged() || !attrib.NudgeEnter(guardedEnterPresser{target: guardedTarget, geometry: *capture.Geometry}, capture, tmux.StripANSI) {
+							structuralRefused = true
+						}
+					} else {
+						structuralRefused = true
+					}
+				}
+			}
 		}
 		if i < checks-1 {
 			time.Sleep(opts.checkDelay)
 		}
+	}
+	// The final permitted Enter can start the turn on the last iteration.
+	if fencedCodex && opts.turnAdvanced() {
+		return deliverySubmitted, nil
+	}
+	if fencedCodex && structuralRefused {
+		return composerHoldsFailure(checks)
 	}
 
 	if sawBody {
@@ -5548,6 +6069,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		v := obs.Verdict(checks, verificationWindow(checks, opts.checkDelay))
 		switch v.Outcome {
 		case send.OutcomeConfirmed:
+			if fencedCodex {
+				// A held-then-cleared composer alone cannot issue an exact
+				// Codex accepted-turn receipt. Keep its confirmation unknown.
+				return deliveryDelivered, nil
+			}
 			return deliverySubmitted, nil
 		case send.OutcomeFailed:
 			return deliveryFailure(v, checks)
@@ -5570,6 +6096,13 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 	return deliveryUnverified, nil
 }
+
+type guardedEnterPresser struct {
+	target   interface{ SendEnterIfStable(tmux.PaneGeometry) error }
+	geometry tmux.PaneGeometry
+}
+
+func (p guardedEnterPresser) SendEnter() error { return p.target.SendEnterIfStable(p.geometry) }
 
 // longestMessageLineBytes is the length of the longest line of message.
 // Mirrors the quantity the tmux transport measures, because the terminal

@@ -4077,6 +4077,58 @@ func (i *Instance) queryCodexSessionFromProcessFiles() (string, string, error) {
 	return "", missingDep, errors.Join(candidateErr, lsofErr)
 }
 
+// LiveCodexSessionIdentity returns only the exact rollout identity held open by
+// a Codex process in this instance's live pane tree. It deliberately has no
+// directory-scan fallback: callers use it when same-directory historical
+// rollouts must not be eligible identity evidence.
+func (i *Instance) LiveCodexSessionIdentity() (string, error) {
+	if i == nil || !IsCodexCompatible(i.Tool) || !i.CodexRolloutIsResolvableLocally() {
+		return "", fmt.Errorf("live local Codex identity is unavailable")
+	}
+	sessionID, err := i.liveCodexSessionIdentityFromProcessFiles()
+	if err != nil {
+		return "", err
+	}
+	sessionID = i.filterCodexProcessProbeCandidate(sessionID)
+	if sessionID == "" {
+		return "", nil
+	}
+	paths, err := exactCodexRolloutMatches(sessionID, i.getCodexHomeDir())
+	if err != nil {
+		return "", err
+	}
+	if _, err := uniqueRegularArtifact(paths, "rollout for "+sessionID); err != nil {
+		return "", err
+	}
+	return sessionID, nil
+}
+
+func (i *Instance) liveCodexSessionIdentityFromProcessFiles() (string, error) {
+	if runtime.GOOS != "linux" {
+		sessionID, _, err := i.queryCodexSessionFromProcessFiles()
+		return sessionID, err
+	}
+	candidates, probeErr := i.collectCodexProcessCandidates()
+	identities := make(map[string]bool)
+	for _, pid := range candidates {
+		sessionID, err := i.extractCodexSessionIDFromProcFD(pid)
+		probeErr = errors.Join(probeErr, err)
+		if sessionID != "" {
+			identities[sessionID] = true
+		}
+	}
+	if len(identities) > 1 {
+		return "", fmt.Errorf("live Codex process identity is ambiguous")
+	}
+	if probeErr != nil {
+		return "", probeErr
+	}
+	for sessionID := range identities {
+		return sessionID, nil
+	}
+	return "", nil
+}
+
 // ConsumeCodexRestartWarning returns and clears any pending Codex restart warning.
 func (i *Instance) ConsumeCodexRestartWarning() string {
 	i.mu.Lock()
@@ -8092,9 +8144,11 @@ func (i *Instance) codexRolloutTail() ([]string, error) {
 }
 
 // Codex generation discovery expands backward by bytes rather than limiting
-// the number of records emitted after a turn starts. Most starts resolve from
-// the first small read; the maximum prevents an unresolved submission from
-// causing an unbounded historical read.
+// the number of records emitted during a turn. A start identifies an active
+// turn and its matching completion identifies the same durable generation
+// once the turn is idle. Most lifecycle records resolve from the first small
+// read; the maximum prevents an unresolved submission from causing an
+// unbounded historical read.
 const (
 	codexTurnGenerationInitialScanBytes = int64(64 << 10)
 	codexTurnGenerationScanMaxBytes     = int64(8 << 20)
@@ -8153,7 +8207,7 @@ func latestCodexTurnIDFromRollout(path string) (string, error) {
 			}
 			var record codexRolloutRecord
 			if json.Unmarshal(line, &record) != nil || record.Type != "event_msg" ||
-				(record.Payload.Type != "task_started" && record.Payload.Type != "turn_started") ||
+				!isCodexTurnLifecycleEvent(record.Payload.Type) ||
 				record.Payload.TurnID == "" {
 				continue
 			}
@@ -8164,6 +8218,15 @@ func latestCodexTurnIDFromRollout(path string) (string, error) {
 			return "", nil
 		}
 		scanBytes = min(size, min(scanBytes*2, codexTurnGenerationScanMaxBytes))
+	}
+}
+
+func isCodexTurnLifecycleEvent(eventType string) bool {
+	switch eventType {
+	case "task_started", "turn_started", "task_complete", "turn_complete":
+		return true
+	default:
+		return false
 	}
 }
 
