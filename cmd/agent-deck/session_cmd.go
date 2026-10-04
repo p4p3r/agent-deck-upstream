@@ -3527,16 +3527,7 @@ func handleSessionSend(profile string, args []string) {
 	//
 	// Both modes run the composer-draft guard (issue #1409) and submit
 	// verification with a machine-checkable delivery status (issue #1413).
-	tun := defaultSendTuning()
-	if *noWait {
-		tun = noWaitSendTuning()
-	}
-	if *queueWorker || busyAcceptsInput {
-		// A live Claude composer already exists. Startup preflight and the
-		// 30-check idle-turn probe add delay without proving this queued send.
-		tun.preflightWait, tun.settleDelay = 0, 0
-		tun.retry.maxRetries, tun.retry.checkDelay = 10, 100*time.Millisecond
-	}
+	tun := sessionSendTuning(*noWait, *queueWorker || busyAcceptsInput, inst.Tool)
 	// #2033: give the verification loop the hook-driven busy signal so the
 	// Ctrl+C-and-resend recovery can tell a queued message on a live turn
 	// from a message lost during TUI init. Same signal --defer-if-busy reads.
@@ -5211,6 +5202,24 @@ func noWaitSendTuning() sendExecTuning {
 		settleDelay:    500 * time.Millisecond,
 		retry:          noWaitSendOptions(),
 	}
+}
+
+func sessionSendTuning(noWait, quickQueue bool, tool string) sendExecTuning {
+	tun := defaultSendTuning()
+	if noWait {
+		tun = noWaitSendTuning()
+	}
+	if quickQueue {
+		// A live Claude composer already exists. Startup preflight and the
+		// 30-check idle-turn probe add delay without proving this queued send.
+		tun.preflightWait, tun.settleDelay = 0, 0
+		// Codex delays its one recovery Enter, so it keeps the normal budget
+		// to observe the exact rollout generation after that press.
+		if !session.IsCodexCompatible(tool) {
+			tun.retry.maxRetries, tun.retry.checkDelay = 10, 100*time.Millisecond
+		}
+	}
+	return tun
 }
 
 // executeSend is the prompt-state-aware send pipeline used by
