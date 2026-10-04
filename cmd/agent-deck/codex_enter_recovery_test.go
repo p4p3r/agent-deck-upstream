@@ -39,6 +39,8 @@ type codexEnterRecoveryTarget struct {
 	guardErr        error
 	guardCalls      int
 	attachedClients int
+	acceptCaptures  int
+	acceptPending   bool
 }
 
 func (m *codexEnterRecoveryTarget) CapturePaneFresh() (string, error) {
@@ -49,6 +51,13 @@ func (m *codexEnterRecoveryTarget) CapturePaneFresh() (string, error) {
 	}
 	raw := "• Previous turn complete\n\n› " + strings.ReplaceAll(m.body, "\n", "\n  ") + "\n\n  ? for shortcuts\n"
 	if m.initialEnters > 0 {
+		if m.acceptPending {
+			m.acceptCaptures--
+			if m.acceptCaptures == 0 {
+				m.acceptPending = false
+				m.acceptTurn()
+			}
+		}
 		if m.onCapture != nil {
 			m.onCapture()
 		}
@@ -117,7 +126,11 @@ func (m *codexEnterRecoveryTarget) SendKeysAndEnter(message string) error {
 func (m *codexEnterRecoveryTarget) SendEnter() error {
 	atomic.AddInt32(&m.sendEnterCalls, 1)
 	if m.acceptRetry && m.sendEnterCalls >= m.acceptAfter {
-		m.acceptTurn()
+		if m.acceptCaptures > 0 {
+			m.acceptPending = true
+		} else {
+			m.acceptTurn()
+		}
 	}
 	return nil
 }
@@ -284,6 +297,32 @@ func TestCodexEnterRecovery_SwallowedInitialEnter(t *testing.T) {
 	}
 	if receipt := waitForAcceptedCodexTurn(inst, res.delivery, time.Now(), fence); receipt == nil || receipt.TurnGeneration != inst.CodexSessionID+":recovery-turn" {
 		t.Fatalf("recovery must produce the fenced accepted-turn receipt: %#v", receipt)
+	}
+}
+
+func TestCodexEnterRecovery_QueuedWorkerKeepsPostRecoveryWindow(t *testing.T) {
+	inst, fence, accept := codexRecoveryFence(t)
+	const message = "ok"
+	target := &codexEnterRecoveryTarget{
+		acceptRetry: true, accept: accept, acceptCaptures: 4,
+	}
+	target.statuses = []string{"waiting"}
+	tun := sessionSendTuning(false, true, "codex")
+	tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, fence) }
+	tun.retry.codexFenceUnchanged = func() bool { return validateCodexAcceptanceFence(inst, fence) == nil }
+	window := time.Duration(tun.retry.verificationChecks(false)) * tun.retry.checkDelay
+	needed := tun.retry.codexRecoveryWait + time.Duration(target.acceptCaptures)*tun.retry.checkDelay
+	if window <= needed {
+		t.Fatalf("queued verification window %v cannot observe recovery after %v", window, needed)
+	}
+
+	res, err := executeSend(target, "codex", message, false, tun)
+	if err != nil || res.delivery != deliverySubmitted {
+		t.Fatalf("queued short send: delivery=%q err=%v target=%#v", res.delivery, err, target)
+	}
+	if target.sendKeysCalls != 1 || target.guardCalls != 1 || target.sendEnterCalls != 1 || target.acceptedTurns != 1 {
+		t.Fatalf("queued recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d",
+			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns)
 	}
 }
 
