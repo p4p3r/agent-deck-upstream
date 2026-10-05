@@ -6021,7 +6021,8 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	attrib := send.EnterAttribution{Message: message, CodexFrame: codexFrame}
 	normalizedMessage := send.NormalizePromptText(message)
 	structuralRefused := !codexComposerWasClear
-	recoveryAttempted := false
+	recoveryActions := 0
+	var firstRecoveryCapture send.PaneCapture
 	recoveryEligibleAt := time.Now().Add(opts.codexRecoveryWait)
 	guardedTarget, canGuard := target.(interface {
 		SendEnterIfStable(tmux.PaneGeometry) error
@@ -6145,12 +6146,23 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 			// visible draft to equal our payload; the observer's token, prefix
 			// and paste-marker matches are arrival evidence only. A failed read,
 			// foreign addition, collapsed paste or partial rendering gets no Enter.
-			if codexComposerWasClear && !structuralRefused && !recoveryAttempted && normalizedMessage != "" {
+			if codexComposerWasClear && !structuralRefused && recoveryActions < 2 && normalizedMessage != "" {
 				draft, visible := codexFrame.Prompt(capture)
 				if !visible {
 					structuralRefused = true
 				}
-				if visible && !time.Now().Before(recoveryEligibleAt) && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft) && !opts.hookBusyNow() {
+				attributable := visible && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft)
+				press := recoveryActions == 0 && !time.Now().Before(recoveryEligibleAt) && attributable
+				if recoveryActions == 1 {
+					if !opts.codexFenceUnchanged() || !attributable {
+						structuralRefused = true
+					} else if codexFrame.PromptAddedOneTrailingNewline(firstRecoveryCapture, capture) {
+						press = true
+					} else if !codexFrame.PromptUnchanged(firstRecoveryCapture, capture) {
+						structuralRefused = true
+					}
+				}
+				if press && !structuralRefused && !opts.hookBusyNow() {
 					status, statusErr := target.GetStatus()
 					if statusErr == nil && (status == "waiting" || status == "idle") {
 						// Acceptance may have landed while capturing the pane or
@@ -6159,7 +6171,10 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 						if opts.turnAdvanced() {
 							return deliverySubmitted, nil
 						}
-						recoveryAttempted = true
+						if recoveryActions == 0 {
+							firstRecoveryCapture = capture
+						}
+						recoveryActions++
 						if !opts.codexFenceUnchanged() || !attrib.NudgeEnter(guardedEnterPresser{target: guardedTarget, geometry: *capture.Geometry}, capture, tmux.StripANSI) {
 							structuralRefused = true
 						}

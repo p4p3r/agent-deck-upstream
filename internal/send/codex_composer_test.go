@@ -89,3 +89,47 @@ func TestCodexComposerFrame_StableAttachedViewer(t *testing.T) {
 		t.Fatalf("attachment changes do not alter the composer frame: draft=%q visible=%v", draft, visible)
 	}
 }
+
+func TestCodexComposerFrame_ExactTrailingNewlineTransition(t *testing.T) {
+	const message = "inspect the synthetic fixture"
+	const footer = "  ? for shortcuts"
+	frame, clear := CaptureClearCodexComposerFrame(codexFrameCapture("Ask Codex to do anything", footer))
+	if !clear {
+		t.Fatal("fixture must establish a clear composer frame")
+	}
+	before := codexFrameCapture(message, footer)
+	for _, tc := range []struct {
+		name      string
+		after     PaneCapture
+		unchanged bool
+		addedOne  bool
+	}{
+		{"unchanged", codexFrameCapture(message, footer), true, false},
+		{"one trailing newline", codexFrameCapture(message+"\n", footer), false, true},
+		{"two trailing newlines", codexFrameCapture(message+"\n\n", footer), false, false},
+		{"foreign prefix", codexFrameCapture("foreign "+message+"\n", footer), false, false},
+		{"foreign suffix", codexFrameCapture(message+" foreign\n", footer), false, false},
+		{"foreign line", codexFrameCapture(message+"\nforeign", footer), false, false},
+		{"unreadable", PaneCapture{}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frame.PromptUnchanged(before, tc.after); got != tc.unchanged {
+				t.Fatalf("PromptUnchanged()=%v, want %v", got, tc.unchanged)
+			}
+			if got := frame.PromptAddedOneTrailingNewline(before, tc.after); got != tc.addedOne {
+				t.Fatalf("PromptAddedOneTrailingNewline()=%v, want %v", got, tc.addedOne)
+			}
+		})
+	}
+
+	changedGeometry := codexFrameCapture(message+"\n", footer)
+	changedGeometry.Geometry.Width++
+	if frame.PromptAddedOneTrailingNewline(before, changedGeometry) {
+		t.Fatal("changed target geometry must not prove a trailing-newline transition")
+	}
+	changedSession := codexFrameCapture(message+"\n", footer)
+	changedSession.Geometry.SessionID = "$4"
+	if frame.PromptAddedOneTrailingNewline(before, changedSession) {
+		t.Fatal("changed target session must not prove a trailing-newline transition")
+	}
+}

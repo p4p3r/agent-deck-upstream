@@ -61,16 +61,44 @@ func CaptureClearCodexComposerFrame(c PaneCapture) (CodexComposerFrame, bool) {
 // Prompt reads only rows above the baseline footer boundary. A footer copy
 // inside that range remains draft text, even when it matches every footer byte.
 func (f CodexComposerFrame) Prompt(c PaneCapture) (string, bool) {
+	rows, ok := f.promptRows(c)
+	if !ok {
+		return "", false
+	}
+	return NormalizePromptText(strings.Join(rows, "\n")), true
+}
+
+// PromptUnchanged reports whether two complete captures show the same exact
+// composer rows inside this frame.
+func (f CodexComposerFrame) PromptUnchanged(before, after PaneCapture) bool {
+	beforeRows, beforeOK := f.promptRows(before)
+	afterRows, afterOK := f.promptRows(after)
+	return beforeOK && afterOK && equalCodexPromptRows(beforeRows, afterRows)
+}
+
+// PromptAddedOneTrailingNewline requires the second capture to contain the
+// exact prior composer plus one blank continuation row.
+func (f CodexComposerFrame) PromptAddedOneTrailingNewline(before, after PaneCapture) bool {
+	beforeRows, beforeOK := f.promptRows(before)
+	afterRows, afterOK := f.promptRows(after)
+	if !beforeOK || !afterOK || len(beforeRows) == 0 || len(afterRows) != len(beforeRows)+1 ||
+		strings.TrimSpace(beforeRows[len(beforeRows)-1]) == "" || strings.TrimSpace(afterRows[len(afterRows)-1]) != "" {
+		return false
+	}
+	return equalCodexPromptRows(beforeRows, afterRows[:len(beforeRows)])
+}
+
+func (f CodexComposerFrame) promptRows(c PaneCapture) ([]string, bool) {
 	rows, ok := codexViewportRows(c)
 	if !ok || len(f.footerRows) == 0 || c.Geometry.PaneID != f.geometry.PaneID ||
 		c.Geometry.SessionID != f.geometry.SessionID ||
 		c.Geometry.ServerPID != f.geometry.ServerPID ||
 		c.Geometry.Width != f.geometry.Width || c.Geometry.Height != f.geometry.Height {
-		return "", false
+		return nil, false
 	}
 	for i, row := range f.footerRows {
 		if rows[f.boundary+i] != row {
-			return "", false
+			return nil, false
 		}
 	}
 	body := make([]string, f.boundary)
@@ -79,9 +107,21 @@ func (f CodexComposerFrame) Prompt(c PaneCapture) (string, bool) {
 	}
 	composer := codexComposerLine(body)
 	if composer < 0 || c.Geometry.CursorY < composer || c.Geometry.CursorY >= f.boundary || c.Geometry.CursorX < 2 {
-		return "", false
+		return nil, false
 	}
-	return codexComposerBody(body)
+	return codexComposerRows(body)
+}
+
+func equalCodexPromptRows(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func codexViewportRows(c PaneCapture) ([]string, bool) {
@@ -100,17 +140,17 @@ func codexComposerLine(lines []string) int {
 	return -1
 }
 
-func codexComposerBody(lines []string) (string, bool) {
+func codexComposerRows(lines []string) ([]string, bool) {
 	composer := codexComposerLine(lines)
 	if composer < 0 {
-		return "", false
+		return nil, false
 	}
 	body := []string{strings.TrimPrefix(lines[composer], "›")}
 	for _, line := range lines[composer+1:] {
 		if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "  ") {
-			return "", false
+			return nil, false
 		}
 		body = append(body, line)
 	}
-	return NormalizePromptText(strings.Join(body, "\n")), true
+	return body, true
 }

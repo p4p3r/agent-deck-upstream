@@ -26,6 +26,7 @@ type codexEnterRecoveryTarget struct {
 	acceptRetry     bool
 	accept          func()
 	acceptAfter     int32
+	newlineAfter    int32
 	acceptedTurns   int
 	staleComposer   bool
 	baselineFrame   string
@@ -37,6 +38,8 @@ type codexEnterRecoveryTarget struct {
 	snapshotAdjust  func(*tmux.PaneSnapshot)
 	snapshotErr     error
 	guardErr        error
+	enterErr        error
+	afterEnter      func(int32)
 	guardCalls      int
 	attachedClients int
 	acceptCaptures  int
@@ -124,15 +127,21 @@ func (m *codexEnterRecoveryTarget) SendKeysAndEnter(message string) error {
 }
 
 func (m *codexEnterRecoveryTarget) SendEnter() error {
-	atomic.AddInt32(&m.sendEnterCalls, 1)
-	if m.acceptRetry && m.sendEnterCalls >= m.acceptAfter {
+	calls := atomic.AddInt32(&m.sendEnterCalls, 1)
+	if m.newlineAfter > 0 && calls == m.newlineAfter {
+		m.body += "\n"
+	}
+	if m.afterEnter != nil {
+		m.afterEnter(calls)
+	}
+	if m.acceptRetry && calls >= m.acceptAfter {
 		if m.acceptCaptures > 0 {
 			m.acceptPending = true
 		} else {
 			m.acceptTurn()
 		}
 	}
-	return nil
+	return m.enterErr
 }
 
 func (m *codexEnterRecoveryTarget) SendEnterIfStable(_ tmux.PaneGeometry) error {
@@ -297,6 +306,141 @@ func TestCodexEnterRecovery_SwallowedInitialEnter(t *testing.T) {
 	}
 	if receipt := waitForAcceptedCodexTurn(inst, res.delivery, time.Now(), fence); receipt == nil || receipt.TurnGeneration != inst.CodexSessionID+":recovery-turn" {
 		t.Fatalf("recovery must produce the fenced accepted-turn receipt: %#v", receipt)
+	}
+}
+
+func TestCodexEnterRecovery_OneTrailingNewlineGetsSecondGuardedEnter(t *testing.T) {
+	inst, fence, accept := codexRecoveryFence(t)
+	const message = "Reply with exactly: recovered-pong"
+	target := &codexEnterRecoveryTarget{
+		acceptRetry: true, acceptAfter: 2, newlineAfter: 1, accept: accept,
+	}
+	target.statuses = []string{"waiting"}
+	res, err := executeSend(target, "codex", message, false, sendExecTuning{
+		retry: codexRecoveryOptions(inst, fence, 5),
+	})
+	if err != nil || res.delivery != deliverySubmitted {
+		t.Fatalf("one-newline recovery: delivery=%q err=%v target=%#v", res.delivery, err, target)
+	}
+	if target.sendKeysCalls != 1 || target.guardCalls != 2 || target.sendEnterCalls != 2 || target.acceptedTurns != 1 ||
+		target.sendCtrlCCalls != 0 || target.sendChunkedCalls != 0 {
+		t.Fatalf("one-newline recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d Ctrl-C=%d resends=%d",
+			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns,
+			target.sendCtrlCCalls, target.sendChunkedCalls)
+	}
+}
+
+func TestCodexEnterRecovery_SecondEnterRequiresExactFreshState(t *testing.T) {
+	const message = "Reply with exactly: recovered-pong"
+	for _, tc := range []struct {
+		name          string
+		setup         func(*codexEnterRecoveryTarget, *sendRetryOptions)
+		wantSubmitted bool
+		wantAccepted  int
+	}{
+		{
+			name: "turn advanced",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.acceptAfter = 1
+			},
+			wantSubmitted: true,
+			wantAccepted:  1,
+		},
+		{
+			name: "pane geometry changed",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.snapshotAdjust = func(snapshot *tmux.PaneSnapshot) {
+					if atomic.LoadInt32(&target.sendEnterCalls) > 0 {
+						snapshot.Geometry.Width++
+					}
+				}
+			},
+		},
+		{
+			name: "session changed",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.snapshotAdjust = func(snapshot *tmux.PaneSnapshot) {
+					if atomic.LoadInt32(&target.sendEnterCalls) > 0 {
+						snapshot.Geometry.SessionID = "$4"
+					}
+				}
+			},
+		},
+		{
+			name: "rollout fence changed",
+			setup: func(target *codexEnterRecoveryTarget, opts *sendRetryOptions) {
+				unchanged := opts.codexFenceUnchanged
+				opts.codexFenceUnchanged = func() bool {
+					return atomic.LoadInt32(&target.sendEnterCalls) == 0 && unchanged()
+				}
+			},
+		},
+		{
+			name: "capture unreadable",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.snapshotErr = errors.New("capture unavailable") }
+			},
+		},
+		{
+			name: "body mismatch",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.body = "different body\n" }
+			},
+		},
+		{
+			name: "foreign prefix",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.body = "foreign " + message + "\n" }
+			},
+		},
+		{
+			name: "foreign suffix",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.body = message + " foreign\n" }
+			},
+		},
+		{
+			name: "additional non-whitespace line",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.body = message + "\nforeign" }
+			},
+		},
+		{
+			name: "two trailing newlines",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.afterEnter = func(int32) { target.body += "\n" }
+			},
+		},
+		{
+			name: "first Enter result ambiguous",
+			setup: func(target *codexEnterRecoveryTarget, _ *sendRetryOptions) {
+				target.enterErr = errors.New("guarded Enter result unavailable")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst, fence, accept := codexRecoveryFence(t)
+			target := &codexEnterRecoveryTarget{
+				acceptRetry: true, acceptAfter: 2, newlineAfter: 1, accept: accept,
+			}
+			target.statuses = []string{"waiting"}
+			opts := codexRecoveryOptions(inst, fence, 5)
+			tc.setup(target, &opts)
+			res, err := executeSend(target, "codex", message, false, sendExecTuning{retry: opts})
+			if tc.wantSubmitted {
+				if err != nil || res.delivery != deliverySubmitted {
+					t.Fatalf("advanced turn: delivery=%q err=%v target=%#v", res.delivery, err, target)
+				}
+			} else if err == nil || res.delivery != deliveryTypedNotSubmitted {
+				t.Fatalf("ambiguous state authorized a second Enter: delivery=%q err=%v target=%#v", res.delivery, err, target)
+			}
+			if target.sendKeysCalls != 1 || target.guardCalls != 1 || target.sendEnterCalls != 1 || target.acceptedTurns != tc.wantAccepted ||
+				target.sendCtrlCCalls != 0 || target.sendChunkedCalls != 0 {
+				t.Fatalf("unexpected transport counts: bodies=%d guards=%d Enters=%d accepted=%d Ctrl-C=%d resends=%d",
+					target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns,
+					target.sendCtrlCCalls, target.sendChunkedCalls)
+			}
+		})
 	}
 }
 
