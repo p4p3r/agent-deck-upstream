@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -128,6 +129,79 @@ func TestSessionShowPublishesOpaqueRowBindingToken(t *testing.T) {
 		if rawIdentity != "" && strings.Contains(token, rawIdentity) {
 			t.Fatalf("row binding exposes raw identity %q: %q", rawIdentity, token)
 		}
+	}
+}
+
+func TestSessionShowBindingMatchesCorrelatedAdmissionAcrossCallerRefresh(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	home := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write codex fixture: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	extraEnv := []string{}
+	if tmuxDir := os.Getenv("TMUX_TMPDIR"); tmuxDir != "" {
+		extraEnv = append(extraEnv, "TMUX_TMPDIR="+tmuxDir)
+	}
+	run := func(stdin string, args ...string) (string, string, int) {
+		t.Helper()
+		return runAgentDeckEnv(t, home, stdin, extraEnv, args...)
+	}
+	id := addStoppedRow(t, home, "caller-refresh-row", "codex")
+	stdout, stderr, code := run("", "session", "start", id, "--json")
+	if code != 0 {
+		t.Fatalf("start row: exit=%d stdout=%q stderr=%q", code, compactCLIOutput(stdout), compactCLIOutput(stderr))
+	}
+
+	stdout, stderr, code = run("", "session", "show", id, "--json")
+	if code != 0 {
+		t.Fatalf("initial session show: exit=%d stdout=%q stderr=%q", code, compactCLIOutput(stdout), compactCLIOutput(stderr))
+	}
+	var initial map[string]any
+	if err := json.Unmarshal([]byte(stdout), &initial); err != nil {
+		t.Fatalf("decode initial session show: %v\n%s", err, stdout)
+	}
+	tmuxName, _ := initial["tmux_session"].(string)
+	if tmuxName == "" {
+		t.Fatalf("initial session show omitted tmux session: %v", initial)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "kill-session", "-t", tmuxName).Run()
+	})
+
+	const callerNativeID = "019f6f45-cd2a-7d21-a36f-20b44ce509f1"
+	if output, err := exec.Command("tmux", "set-environment", "-t", tmuxName, "CODEX_SESSION_ID", callerNativeID).CombinedOutput(); err != nil {
+		t.Fatalf("set caller-local Codex identity: %v: %s", err, output)
+	}
+	stdout, stderr, code = run("", "session", "show", id, "--json")
+	if code != 0 {
+		t.Fatalf("refreshed session show: exit=%d stdout=%q stderr=%q", code, compactCLIOutput(stdout), compactCLIOutput(stderr))
+	}
+	var shown map[string]any
+	if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+		t.Fatalf("decode refreshed session show: %v\n%s", err, stdout)
+	}
+	if shown["codex_session_id"] != callerNativeID {
+		t.Fatalf("session show did not observe caller-local Codex identity: %v", shown)
+	}
+	binding, _ := shown["row_binding_token"].(string)
+	if binding == "" {
+		t.Fatalf("refreshed session show omitted row binding: %v", shown)
+	}
+
+	// Remove the caller-local live state without running agent-deck's stop path,
+	// which would intentionally persist the observed native identity.
+	if output, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+		t.Fatalf("remove caller-local tmux session: %v: %s", err, output)
+	}
+	response, stdout, stderr, code := submitCorrelated(t, home, id, binding, syntheticRequestKey, syntheticCorrelatedBody)
+	assertBodyFree(t, syntheticCorrelatedBody, stdout, stderr)
+	if code != 0 || response["success"] != true || response["row_binding_token"] != binding {
+		t.Fatalf("correlated admission disagreed with session show: exit=%d response=%v stdout=%q stderr=%q", code, response, compactCLIOutput(stdout), compactCLIOutput(stderr))
 	}
 }
 
