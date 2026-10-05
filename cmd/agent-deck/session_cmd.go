@@ -3541,14 +3541,10 @@ func handleSessionSend(profile string, args []string) {
 		turnQuery := session.TurnQuery{Path: turnPath, Prompt: message, Cursor: turnCursor}
 		tun.retry.turnAdvanced = func() bool { return session.TurnAdvanced(turnQuery) }
 	}
-	if *acceptanceOnly {
-		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
-		tun.retry.codexFenceUnchanged = func() bool { return validateCodexAcceptanceFence(inst, acceptanceFence) == nil }
-	}
 	if acceptanceGuard != nil {
 		// Codex's counterpart: a new turn in the exact rollout past the
 		// acceptance fence, the evidence the accepted-turn receipt rests on.
-		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
+		configureCodexAcceptanceRetry(&tun.retry, inst, acceptanceFence)
 		if *correlatedOperation != "" {
 			_, freshInstances, _, loadErr := loadSessionData(profile)
 			freshInstance := instanceByID(freshInstances, inst.ID)
@@ -4962,6 +4958,11 @@ func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFen
 	generation, err := inst.LatestCodexTurnGeneration()
 	return err == nil && generation != "" && generation != fence.priorTurnGeneration &&
 		strings.HasPrefix(generation, fence.codexSessionID+":")
+}
+
+func configureCodexAcceptanceRetry(opts *sendRetryOptions, inst *session.Instance, fence codexAcceptanceFence) {
+	opts.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, fence) }
+	opts.codexFenceUnchanged = func() bool { return validateCodexAcceptanceFence(inst, fence) == nil }
 }
 
 func requireStructuredCodexAcceptedTurn(

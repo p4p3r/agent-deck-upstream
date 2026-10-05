@@ -72,7 +72,10 @@ func (m *codexEnterRecoveryTarget) CapturePaneFresh() (string, error) {
 	return raw, nil
 }
 
-const codexFixtureHeight = 24
+const (
+	codexFixtureWidth  = 240
+	codexFixtureHeight = 24
+)
 
 // Synthetic rendering keeps the footer at a fixed absolute row. Explicit
 // postFrame captures retain their supplied extent, including partial captures.
@@ -110,7 +113,7 @@ func (m *codexEnterRecoveryTarget) CapturePaneSnapshot() (tmux.PaneSnapshot, err
 		cursorY += strings.Count(m.body, "\n")
 	}
 	snapshot := tmux.PaneSnapshot{Raw: raw, Geometry: tmux.PaneGeometry{
-		PaneID: "%7", SessionID: "$3", ServerPID: 12345, AttachedClients: m.attachedClients, Width: 100, Height: codexFixtureHeight, CursorX: 2, CursorY: cursorY,
+		PaneID: "%7", SessionID: "$3", ServerPID: 12345, AttachedClients: m.attachedClients, Width: codexFixtureWidth, Height: codexFixtureHeight, CursorX: 2, CursorY: cursorY,
 	}}
 	if m.snapshotAdjust != nil {
 		m.snapshotAdjust(&snapshot)
@@ -493,6 +496,27 @@ func TestCodexEnterRecovery_QueuedWorkerKeepsPostRecoveryWindow(t *testing.T) {
 	}
 	if target.sendKeysCalls != 1 || target.guardCalls != 1 || target.sendEnterCalls != 1 || target.acceptedTurns != 1 {
 		t.Fatalf("queued recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d",
+			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns)
+	}
+}
+
+func TestCodexEnterRecovery_CorrelatedWorkerUsesFencedRecovery(t *testing.T) {
+	inst, fence, accept := codexRecoveryFence(t)
+	message := strings.Repeat("synthetic ordinary text ", 6) + "for guarded recovery"
+	if len(message) != 164 {
+		t.Fatalf("synthetic fixture is %d bytes, want 164", len(message))
+	}
+	target := &codexEnterRecoveryTarget{acceptRetry: true, accept: accept}
+	target.statuses = []string{"waiting"}
+	tun := sessionSendTuning(false, true, "codex")
+	configureCodexAcceptanceRetry(&tun.retry, inst, fence)
+
+	res, err := executeSend(target, "codex", message, false, tun)
+	if err != nil || res.delivery != deliverySubmitted {
+		t.Fatalf("correlated recovery: delivery=%q err=%v target=%#v", res.delivery, err, target)
+	}
+	if target.sendKeysCalls != 1 || target.guardCalls != 1 || target.sendEnterCalls != 1 || target.acceptedTurns != 1 {
+		t.Fatalf("correlated recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d",
 			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns)
 	}
 }
