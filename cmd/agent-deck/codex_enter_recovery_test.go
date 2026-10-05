@@ -37,6 +37,7 @@ type codexEnterRecoveryTarget struct {
 	onCapture       func()
 	snapshotAdjust  func(*tmux.PaneSnapshot)
 	snapshotErr     error
+	captureFails    int
 	guardErr        error
 	enterErr        error
 	afterEnter      func(int32)
@@ -88,6 +89,10 @@ func codexViewportFrame(raw string) string {
 }
 
 func (m *codexEnterRecoveryTarget) CapturePaneSnapshot() (tmux.PaneSnapshot, error) {
+	if atomic.LoadInt32(&m.sendEnterCalls) > 0 && m.captureFails > 0 {
+		m.captureFails--
+		return tmux.PaneSnapshot{}, errors.New("transient snapshot failure")
+	}
 	raw, err := m.CapturePaneFresh()
 	if err != nil {
 		return tmux.PaneSnapshot{}, err
@@ -325,6 +330,28 @@ func TestCodexEnterRecovery_OneTrailingNewlineGetsSecondGuardedEnter(t *testing.
 	if target.sendKeysCalls != 1 || target.guardCalls != 2 || target.sendEnterCalls != 2 || target.acceptedTurns != 1 ||
 		target.sendCtrlCCalls != 0 || target.sendChunkedCalls != 0 {
 		t.Fatalf("one-newline recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d Ctrl-C=%d resends=%d",
+			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns,
+			target.sendCtrlCCalls, target.sendChunkedCalls)
+	}
+}
+
+func TestCodexEnterRecovery_TransientPostEnterCaptureStillRecovers(t *testing.T) {
+	inst, fence, accept := codexRecoveryFence(t)
+	const message = "Reply with exactly: recovered-pong"
+	target := &codexEnterRecoveryTarget{
+		acceptRetry: true, acceptAfter: 2, newlineAfter: 1, accept: accept,
+		captureFails: 1,
+	}
+	target.statuses = []string{"waiting"}
+	res, err := executeSend(target, "codex", message, false, sendExecTuning{
+		retry: codexRecoveryOptions(inst, fence, 5),
+	})
+	if err != nil || res.delivery != deliverySubmitted {
+		t.Fatalf("transient post-Enter capture: delivery=%q err=%v target=%#v", res.delivery, err, target)
+	}
+	if target.sendKeysCalls != 1 || target.guardCalls != 2 || target.sendEnterCalls != 2 || target.acceptedTurns != 1 ||
+		target.sendCtrlCCalls != 0 || target.sendChunkedCalls != 0 {
+		t.Fatalf("transient capture recovery duplicated transport: bodies=%d guards=%d Enters=%d accepted=%d Ctrl-C=%d resends=%d",
 			target.sendKeysCalls, target.guardCalls, target.sendEnterCalls, target.acceptedTurns,
 			target.sendCtrlCCalls, target.sendChunkedCalls)
 	}

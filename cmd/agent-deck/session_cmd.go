@@ -6148,8 +6148,13 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 			// foreign addition, collapsed paste or partial rendering gets no Enter.
 			if codexComposerWasClear && !structuralRefused && recoveryActions < 2 && normalizedMessage != "" {
 				draft, visible := codexFrame.Prompt(capture)
+				// An unreadable capture withholds this iteration; a readable
+				// structural mismatch permanently refuses recovery.
 				if !visible {
-					structuralRefused = true
+					if capture.OK {
+						structuralRefused = true
+					}
+					continue
 				}
 				attributable := visible && draft == normalizedMessage && !send.ComposerBodyIsSuggestion(raw) && !send.HasUnsentPastedPrompt(draft)
 				press := recoveryActions == 0 && !time.Now().Before(recoveryEligibleAt) && attributable
