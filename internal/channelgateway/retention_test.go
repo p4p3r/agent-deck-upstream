@@ -2,10 +2,103 @@ package channelgateway
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
+
+func TestSealRollbackRemovesUnreferencedRecord(t *testing.T) {
+	s, path := testStore(t, ChannelStream)
+	ctx := context.Background()
+	_, err := s.db.Exec(`CREATE TRIGGER fail_inbound BEFORE INSERT ON inbound_events BEGIN SELECT RAISE(ABORT, 'forced insertion failure'); END`)
+	require.NoError(t, err)
+	_, err = s.Ingest(ctx, inbound("rolled-back", "message", "", false))
+	require.ErrorIs(t, err, ErrStorage)
+	alias := s.alias("event", "rolled-back")
+	_, err = os.Stat(filepath.Join(filepath.Dir(path), "spool", "inbound-"+alias))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	var count int
+	require.NoError(t, s.db.QueryRow(`SELECT count(*) FROM inbound_events WHERE event_id=?`, alias).Scan(&count))
+	require.Zero(t, count)
+}
+
+func TestPruneRecoversInterruptedSealsAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "gateway.sqlite")
+	key := makeSyntheticKey()
+	s, err := Open(path, key)
+	require.NoError(t, err)
+	require.NoError(t, s.CreateConversation(context.Background(), Conversation{
+		ID: "conversation", ChannelID: "channel", ConductorID: "conductor", RowInstanceID: "row", RowBinding: "binding", Mode: ChannelStream,
+		AllowedSenders: []string{"alice"},
+	}))
+	_, err = s.Ingest(context.Background(), inbound("committed", "message", "", false))
+	require.NoError(t, err)
+	committed := s.alias("event", "committed")
+	orphan := s.alias("event", "interrupted")
+	require.NoError(t, s.spool.WriteImmutable("inbound", orphan, []byte("orphan private body")))
+	outboxAlias := s.alias("outbox", "interrupted-outbox")
+	require.NoError(t, s.spool.WriteImmutable("outbound", outboxAlias, []byte("orphan reply")))
+	require.NoError(t, s.spool.WriteImmutable("provider", outboxAlias, []byte("orphan provider")))
+	threadAlias := s.alias("thread", "interrupted-thread")
+	require.NoError(t, s.spool.WriteImmutable("thread", threadAlias, []byte("interrupted-thread")))
+	bindingAlias := s.alias("conversation", "interrupted-conversation")
+	require.NoError(t, s.saveBinding(nil, "interrupted-conversation", "channel"))
+	legacyBindingAlias := s.alias("conversation", "legacy-interrupted-conversation")
+	require.NoError(t, s.spool.WriteImmutable("binding", legacyBindingAlias, []byte(`{"channel_id":"channel"}`)))
+	require.NoError(t, s.Close())
+
+	s, err = Open(path, key)
+	require.NoError(t, err)
+	defer s.Close()
+	removed := 0
+	for i := 0; i < 3; i++ {
+		result, err := s.Prune(context.Background(), RetentionPolicy{}, 8)
+		require.NoError(t, err)
+		removed += result.OrphansDeleted
+		if removed == 6 {
+			break
+		}
+	}
+	require.Equal(t, 6, removed)
+	for _, record := range []struct{ domain, alias string }{
+		{"inbound", orphan}, {"outbound", outboxAlias}, {"provider", outboxAlias}, {"thread", threadAlias}, {"binding", bindingAlias}, {"binding", legacyBindingAlias},
+	} {
+		_, err = s.spool.Read(record.domain, record.alias)
+		require.Error(t, err, record.domain)
+	}
+	body, err := s.spool.Read("inbound", committed)
+	require.NoError(t, err)
+	require.Equal(t, "body-committed", string(body))
+	_, err = s.channelID("conversation")
+	require.NoError(t, err)
+}
+
+func TestLegacySealedBindingRemainsUsable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.sqlite")
+	s, err := Open(path, makeSyntheticKey())
+	require.NoError(t, err)
+	defer s.Close()
+	old := []byte(`{"channel_id":"channel"}`)
+	alias := s.alias("conversation", "conversation")
+	require.NoError(t, s.spool.WriteImmutable("binding", alias, old))
+	require.NoError(t, s.CreateConversation(context.Background(), Conversation{
+		ID: "conversation", ChannelID: "channel", ConductorID: "conductor", RowInstanceID: "row", RowBinding: "binding", Mode: ChannelStream,
+		AllowedSenders: []string{"alice"},
+	}))
+	got, err := s.spool.Read("binding", alias)
+	require.NoError(t, err)
+	require.Equal(t, old, got)
+	_, err = s.Prune(context.Background(), RetentionPolicy{}, 8)
+	require.NoError(t, err)
+	got, err = s.spool.Read("binding", alias)
+	require.NoError(t, err)
+	require.Equal(t, old, got)
+}
 
 func TestRetentionExpiresDeliveredContentThenMetadata(t *testing.T) {
 	s, _ := testStore(t, ChannelStream)

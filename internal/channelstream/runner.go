@@ -97,6 +97,7 @@ type Runner struct {
 	BackoffMin   time.Duration
 	BackoffMax   time.Duration
 	Clock        Clock
+	Retention    channelgateway.RetentionPolicy
 
 	mu            sync.Mutex
 	running       bool
@@ -194,7 +195,7 @@ func (r *Runner) valid() bool {
 		seen[id] = true
 	}
 	_, _, _, _, ok := r.timings()
-	return ok
+	return ok && r.Retention.Valid()
 }
 
 func signal(ch chan<- struct{}) {
@@ -248,7 +249,7 @@ func (r *Runner) drain(ctx context.Context, wake chan<- struct{}) error {
 
 func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
 	if time.Since(r.lastRetention) >= retentionInterval {
-		result, err := r.Handler.Store.Prune(ctx, channelgateway.RetentionPolicy{}, retentionBatch)
+		result, err := r.Handler.Store.Prune(ctx, r.Retention, retentionBatch)
 		if err != nil {
 			if fatalDependency(err) {
 				r.setError(ErrorConfig, true)
@@ -257,7 +258,7 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
 			r.setError(ErrorWork, false)
 			return nil
 		}
-		if result.ContentDeleted+result.MetadataDeleted+result.OrphansDeleted < retentionBatch {
+		if result.ContentDeleted+result.MetadataDeleted+result.OrphansDeleted < retentionBatch && !result.ScanPending {
 			r.lastRetention = time.Now()
 		}
 	}

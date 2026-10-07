@@ -307,12 +307,32 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	spoolErr := s.spool.Close()
+	dbErr := s.db.Close()
+	if spoolErr != nil || dbErr != nil {
+		return ErrStorage
+	}
+	return nil
 }
 
 type writeTx struct {
-	ctx  context.Context
-	conn *sql.Conn
+	ctx    context.Context
+	conn   *sql.Conn
+	spool  *channelspool.Store
+	sealed []sealedRecord
+}
+
+type sealedRecord struct{ domain, alias string }
+
+func (tx *writeTx) seal(domain, alias string, plain []byte) error {
+	created, err := tx.spool.WriteImmutableTracked(domain, alias, plain)
+	if err != nil {
+		return ErrStorage
+	}
+	if created {
+		tx.sealed = append(tx.sealed, sealedRecord{domain, alias})
+	}
+	return nil
 }
 
 func (s *Store) write(ctx context.Context, fn func(*writeTx) error) error {
@@ -325,7 +345,18 @@ func (s *Store) write(ctx context.Context, fn func(*writeTx) error) error {
 		return ErrStorage
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
-	if err := fn(&writeTx{ctx: ctx, conn: conn}); err != nil {
+	tx := &writeTx{ctx: ctx, conn: conn, spool: s.spool}
+	if err := fn(tx); err != nil {
+		// Only a confirmed rollback permits immediate unlink. A failed COMMIT
+		// has an unknown outcome and is left for reference-aware recovery.
+		if _, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK"); rollbackErr != nil {
+			return ErrStorage
+		}
+		for _, record := range tx.sealed {
+			if s.spool.Remove(record.domain, record.alias) != nil {
+				return ErrStorage
+			}
+		}
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -465,13 +496,13 @@ func (s *Store) CreateConversation(ctx context.Context, c Conversation) error {
 	if !validConversation(c) {
 		return ErrInvalid
 	}
-	if err := s.saveBinding(c.ID, c.ChannelID); err != nil {
-		return err
-	}
 	channelAlias := s.alias("channel", c.ChannelID)
 	rowAlias := s.alias("row", c.RowInstanceID)
 	bindingAlias := s.alias("rowbinding", c.RowBinding)
 	return s.write(ctx, func(tx *writeTx) error {
+		if err := s.saveBinding(tx, c.ID, c.ChannelID); err != nil {
+			return err
+		}
 		var channel, conductor, rowInstance, rowBinding, mode string
 		err := tx.row(`SELECT channel_id, conductor_id, row_instance_id, row_binding_token, mode FROM conversations WHERE id=?`, c.ID).
 			Scan(&channel, &conductor, &rowInstance, &rowBinding, &mode)

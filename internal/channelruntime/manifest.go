@@ -21,6 +21,8 @@ const (
 	phaseReady      = "ready"
 )
 
+var migrateGatewayV4 = channelgateway.MigrateV4
+
 type runtimePaths struct {
 	manifest string
 	ledger   string
@@ -100,6 +102,9 @@ func migrateV4Runtime(r Request, c Config, identity struct{ TeamID, BotUserID st
 	archiveManifest := filepath.Join(channelgateway.V4ArchiveDir(paths.ledger), "manifest.json")
 	live, err := loadManifest(paths.manifest)
 	if err != nil {
+		if errors.Is(err, channelgateway.ErrStorage) {
+			return storeFailure(err)
+		}
 		return &Error{Kind: KindManifest}
 	}
 	if live != nil && live.Version != 2 {
@@ -112,6 +117,9 @@ func migrateV4Runtime(r Request, c Config, identity struct{ TeamID, BotUserID st
 		}
 		old, err = loadManifest(archiveManifest)
 		if err != nil {
+			if errors.Is(err, channelgateway.ErrStorage) {
+				return storeFailure(err)
+			}
 			return &Error{Kind: KindManifest}
 		}
 	}
@@ -127,33 +135,41 @@ func migrateV4Runtime(r Request, c Config, identity struct{ TeamID, BotUserID st
 				Mode: channelgateway.ChannelStream, AllowedSenders: c.AllowedUserIDs,
 			},
 		}
-		if channelgateway.MigrateV4(context.Background(), paths.ledger, binding, c.SpoolKey) != nil {
-			return &Error{Kind: KindStore}
+		if err := migrateGatewayV4(context.Background(), paths.ledger, binding, c.SpoolKey); err != nil {
+			return storeFailure(err)
 		}
 		if _, err := os.Lstat(archiveManifest); err == nil {
 			return &Error{Kind: KindManifest}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return &Error{Kind: KindManifest}
+			return storeFailure(channelgateway.ErrStorage)
 		}
 		if os.Rename(paths.manifest, archiveManifest) != nil {
-			return &Error{Kind: KindManifest}
+			return storeFailure(channelgateway.ErrStorage)
 		}
 		if err := syncManifestDir(filepath.Dir(paths.manifest)); err != nil {
-			return &Error{Kind: KindManifest}
+			return storeFailure(channelgateway.ErrStorage)
 		}
 		if err := syncManifestDir(filepath.Dir(archiveManifest)); err != nil {
-			return &Error{Kind: KindManifest}
+			return storeFailure(channelgateway.ErrStorage)
 		}
 	} else {
 		// The old manifest was already moved; only a committed v5 ledger may
 		// authorize reconstruction of its aliased successor.
 		store, err := channelgateway.Open(paths.ledger, c.SpoolKey)
 		if err != nil {
-			return &Error{Kind: KindStore}
+			return storeFailure(err)
 		}
 		_ = store.Close()
 	}
-	if saveManifest(paths.manifest, newManifest(r, c, identity)) != nil {
+	if err := saveManifest(paths.manifest, newManifest(r, c, identity)); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return &Error{Kind: KindManifest}
+		}
+		var pathErr *os.PathError
+		var linkErr *os.LinkError
+		if errors.As(err, &pathErr) || errors.As(err, &linkErr) {
+			return storeFailure(channelgateway.ErrStorage)
+		}
 		return &Error{Kind: KindManifest}
 	}
 	return nil
@@ -253,17 +269,27 @@ func requirePrivateSidecars(path string) error {
 }
 
 func loadManifest(path string) (*manifest, error) {
-	if err := requireRegular(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) { // retained for custom filesystem seams
-			return nil, nil
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil, errors.New("invalid manifest")
 		}
-		if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
+		return nil, channelgateway.ErrStorage
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return nil, errors.New("invalid manifest")
 	}
 	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 || len(data) > 64<<10 {
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil, errors.New("invalid manifest")
+		}
+		return nil, channelgateway.ErrStorage
+	}
+	if len(data) == 0 || len(data) > 64<<10 {
 		return nil, errors.New("invalid manifest")
 	}
 	if err := rejectDuplicateKeys(data); err != nil {

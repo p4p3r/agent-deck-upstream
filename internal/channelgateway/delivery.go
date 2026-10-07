@@ -265,7 +265,7 @@ func (s *Store) ConfirmDelivery(ctx context.Context, itemID, attemptID, channelI
 			return ErrConflict
 		}
 		if expired == 0 {
-			if err := s.saveProviderMessage(itemID, providerMessageID); err != nil {
+			if err := s.saveProviderMessage(tx, itemID, providerMessageID); err != nil {
 				return err
 			}
 		}

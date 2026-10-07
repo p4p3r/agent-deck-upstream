@@ -50,6 +50,7 @@ type Config struct {
 	AppToken       string
 	BotToken       string
 	SpoolKey       []byte
+	Retention      channelgateway.RetentionPolicy
 
 	// These fields keep older isolated fixtures source-compatible. A nonempty
 	// value is rejected and never enters the runtime manifest or driver.
@@ -251,7 +252,8 @@ func run(ctx context.Context, request Request, d dependencies) error {
 	}
 	defer driver.Close()
 	runner := &channelstream.Runner{
-		Socket: d.socket(cfg.AppToken),
+		Retention: cfg.Retention,
+		Socket:    d.socket(cfg.AppToken),
 		Handler: slackgateway.Handler{Store: store, Config: slackgateway.Config{
 			ConversationID: cfg.ConversationID, AppID: cfg.AppID, TeamID: identity.TeamID,
 			ChannelID: cfg.ChannelID, BotUserID: identity.BotUserID,
@@ -280,7 +282,8 @@ func run(ctx context.Context, request Request, d dependencies) error {
 func validConfig(c Config) bool {
 	if c.ConversationID == "" || c.ConductorID == "" || c.Profile == "" || c.RowInstanceID == "" ||
 		c.RowBinding == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.AppToken == "" || c.BotToken == "" ||
-		len(c.AllowedUserIDs) == 0 || len(c.SpoolKey) != 32 || c.CodexExecutable != "" || c.CodexCWD != "" || c.CodexModel != "" {
+		len(c.AllowedUserIDs) == 0 || len(c.SpoolKey) != 32 || !c.Retention.Valid() ||
+		c.CodexExecutable != "" || c.CodexCWD != "" || c.CodexModel != "" {
 		return false
 	}
 	seen := make(map[string]bool, len(c.AllowedUserIDs))

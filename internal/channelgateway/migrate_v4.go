@@ -308,7 +308,7 @@ func copyV4Table(ctx context.Context, old *sql.DB, staged *Store, tx *sql.Tx, ta
 				values[i] = binding.NewConversation.ConductorID
 			case "channel_id":
 				values[i] = staged.alias("channel", value)
-				if table == "conversations" && staged.saveBinding(newConversation, value) != nil {
+				if table == "conversations" && staged.saveBinding(nil, newConversation, value) != nil {
 					return ErrStorage
 				}
 			case "sender_id":
@@ -318,7 +318,7 @@ func copyV4Table(ctx context.Context, old *sql.DB, staged *Store, tx *sql.Tx, ta
 			case "row_binding_token":
 				values[i] = staged.alias("rowbinding", value)
 			case "root_thread_id", "thread_id", "pointer_thread_id":
-				if staged.saveThreadID(value) != nil {
+				if staged.saveThreadID(nil, value) != nil {
 					return ErrStorage
 				}
 				values[i] = staged.alias("thread", value)
@@ -332,17 +332,17 @@ func copyV4Table(ctx context.Context, old *sql.DB, staged *Store, tx *sql.Tx, ta
 				values[i] = staged.alias("codexgeneration", value)
 			case "external_message_id":
 				values[i] = staged.alias("providermessage", value)
-				if value != "" && staged.saveProviderMessage(fields["id"], value) != nil {
+				if value != "" && staged.saveProviderMessage(nil, fields["id"], value) != nil {
 					return ErrStorage
 				}
 			case "body":
 				if table == "inbound_events" && fields["disposition"] == string(Accepted) {
-					if staged.saveInbound(staged.alias("event", fields["event_id"]), value) != nil {
+					if staged.saveInbound(nil, staged.alias("event", fields["event_id"]), value) != nil {
 						return ErrStorage
 					}
 					values[i] = staged.alias("event", fields["event_id"])
 				} else if table == "outbox" && fields["kind"] == "reply" {
-					if staged.saveOutbound(fields["id"], value) != nil {
+					if staged.saveOutbound(nil, fields["id"], value) != nil {
 						return ErrStorage
 					}
 					values[i] = staged.alias("outbox", fields["id"])

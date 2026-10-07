@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,6 +48,13 @@ type Store struct {
 	dir         string
 	key         []byte
 	nonceSource io.Reader
+	scanMu      sync.Mutex
+	scanDir     *os.File
+}
+
+type Record struct {
+	Domain, Alias string
+	ModTime       time.Time
 }
 
 func New(dir string, key []byte) (*Store, error) {
@@ -224,63 +232,70 @@ func (s *Store) Write(domain, alias string, plain []byte) error {
 
 // WriteImmutable never changes an existing binding or content record.
 func (s *Store) WriteImmutable(domain, alias string, plain []byte) error {
+	_, err := s.WriteImmutableTracked(domain, alias, plain)
+	return err
+}
+
+// WriteImmutableTracked reports whether this call installed a new record, so
+// a caller can undo a known SQLite rollback without deleting an older record.
+func (s *Store) WriteImmutableTracked(domain, alias string, plain []byte) (bool, error) {
 	if s == nil || !validName(domain, alias) {
-		return ErrRecord
+		return false, ErrRecord
 	}
 	if got, err := s.Read(domain, alias); err == nil {
 		if hmac.Equal(got, plain) {
-			return nil
+			return false, nil
 		}
-		return ErrRecord
+		return false, ErrRecord
 	} else if _, statErr := os.Lstat(s.path(domain, alias)); statErr == nil {
-		return ErrRecord
+		return false, ErrRecord
 	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return ErrStorage
+		return false, ErrStorage
 	}
 	sealed, err := s.Seal(domain, alias, plain)
 	if err != nil {
-		return err
+		return false, err
 	}
 	f, err := os.CreateTemp(s.tempDir(), ".sealed-*")
 	if err != nil {
-		return ErrStorage
+		return false, ErrStorage
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
 	if err := f.Chmod(0o600); err != nil {
 		f.Close()
-		return ErrStorage
+		return false, ErrStorage
 	}
 	if _, err := f.Write(sealed); err != nil {
 		f.Close()
-		return ErrStorage
+		return false, ErrStorage
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return ErrStorage
+		return false, ErrStorage
 	}
 	if err := f.Close(); err != nil {
-		return ErrStorage
+		return false, ErrStorage
 	}
 	if err := os.Link(tmp, s.path(domain, alias)); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			got, readErr := s.Read(domain, alias)
 			if readErr == nil && hmac.Equal(got, plain) {
-				return nil
+				return false, nil
 			}
-			return ErrRecord
+			return false, ErrRecord
 		}
-		return ErrStorage
+		return false, ErrStorage
 	}
 	d, err := os.Open(s.dir)
 	if err != nil {
-		return ErrStorage
+		return false, ErrStorage
 	}
 	defer d.Close()
 	if err := d.Sync(); err != nil {
-		return ErrStorage
+		return false, ErrStorage
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Store) Read(domain, alias string) ([]byte, error) {
@@ -359,4 +374,66 @@ func (s *Store) CleanupOrphans(before time.Time, limit int) (int, error) {
 		}
 	}
 	return removed, nil
+}
+
+// ScanRecords advances a bounded directory cursor. At EOF the cursor resets,
+// so later calls eventually visit records created during an earlier pass.
+func (s *Store) ScanRecords(limit int) ([]Record, bool, error) {
+	if s == nil || limit < 1 || limit > 8192 {
+		return nil, false, ErrRecord
+	}
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if s.scanDir == nil {
+		var err error
+		s.scanDir, err = os.Open(s.dir)
+		if err != nil {
+			return nil, false, ErrStorage
+		}
+	}
+	entries, err := s.scanDir.ReadDir(limit)
+	if err != nil && !errors.Is(err, io.EOF) {
+		_ = s.scanDir.Close()
+		s.scanDir = nil
+		return nil, false, ErrStorage
+	}
+	more := !errors.Is(err, io.EOF)
+	if !more {
+		_ = s.scanDir.Close()
+		s.scanDir = nil
+	}
+	records := make([]Record, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() == "tmp" && entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		separator := strings.IndexByte(name, '-')
+		if separator < 1 || !validName(name[:separator], name[separator+1:]) {
+			return nil, more, ErrStorage
+		}
+		info, infoErr := entry.Info()
+		if errors.Is(infoErr, os.ErrNotExist) {
+			continue
+		}
+		if infoErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return nil, more, ErrStorage
+		}
+		records = append(records, Record{Domain: name[:separator], Alias: name[separator+1:], ModTime: info.ModTime()})
+	}
+	return records, more, nil
+}
+
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if s.scanDir == nil {
+		return nil
+	}
+	err := s.scanDir.Close()
+	s.scanDir = nil
+	return err
 }

@@ -2,7 +2,10 @@ package channelgateway
 
 import (
 	"context"
+	"encoding/json"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 )
 
 // RetentionPolicy applies only to terminal work. Zero durations select the
@@ -29,10 +32,19 @@ func (p RetentionPolicy) normalized() (RetentionPolicy, bool) {
 	return p, p.Metadata >= p.UncertainContent && p.UncertainContent >= p.DeliveredContent
 }
 
+// Valid accepts omitted values as defaults and rejects intervals too short
+// to be represented by the ledger's second-resolution timestamps.
+func (p RetentionPolicy) Valid() bool {
+	resolved, ok := p.normalized()
+	return ok && resolved.DeliveredContent >= time.Second &&
+		resolved.UncertainContent >= time.Second && resolved.Metadata >= time.Second
+}
+
 type RetentionResult struct {
 	ContentDeleted  int
 	MetadataDeleted int
 	OrphansDeleted  int
+	ScanPending     bool
 }
 
 type expiredRecord struct {
@@ -47,10 +59,10 @@ type expiredRecord struct {
 // ownership and state even after their ciphertext has expired.
 func (s *Store) Prune(ctx context.Context, policy RetentionPolicy, maxRows int) (RetentionResult, error) {
 	var result RetentionResult
-	policy, ok := policy.normalized()
-	if s == nil || ctx == nil || !ok || maxRows < 1 || maxRows > 1024 {
+	if s == nil || ctx == nil || !policy.Valid() || maxRows < 1 || maxRows > 1024 {
 		return result, ErrInvalid
 	}
+	policy, _ = policy.normalized()
 	now := s.now().UTC().Unix()
 	deliveredCutoff := now - int64(policy.DeliveredContent/time.Second)
 	uncertainCutoff := now - int64(policy.UncertainContent/time.Second)
@@ -209,6 +221,126 @@ func (s *Store) Prune(ctx context.Context, policy RetentionPolicy, maxRows int) 
 			return result, ErrStorage
 		}
 		result.OrphansDeleted = removed
+		remaining -= removed
+	}
+	if remaining > 0 {
+		err = s.write(ctx, func(tx *writeTx) error {
+			records, more, err := s.spool.ScanRecords(remaining * 8)
+			if err != nil {
+				return ErrStorage
+			}
+			result.ScanPending = more
+			scannedRemoved := 0
+			for _, record := range records {
+				if scannedRemoved >= remaining {
+					continue
+				}
+				referenced, err := s.sealedRecordReferenced(tx, record)
+				if err != nil {
+					return err
+				}
+				if !referenced {
+					if s.spool.Remove(record.Domain, record.Alias) != nil {
+						return ErrStorage
+					}
+					result.OrphansDeleted++
+					scannedRemoved++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return result, err
+		}
 	}
 	return result, nil
+}
+
+// Called under BEGIN IMMEDIATE, which serializes the reference check and
+// unlink against every normal seal-and-insert transaction.
+func (s *Store) sealedRecordReferenced(tx *writeTx, record channelspool.Record) (bool, error) {
+	var count int
+	switch record.Domain {
+	case "control":
+		return true, nil
+	case "inbound":
+		if err := tx.row(`SELECT count(*) FROM inbound_events WHERE content_ref=? AND content_deleted_at=0`, record.Alias).Scan(&count); err != nil {
+			return false, ErrStorage
+		}
+	case "outbound":
+		if err := tx.row(`SELECT count(*) FROM outbox WHERE content_ref=? AND content_deleted_at=0`, record.Alias).Scan(&count); err != nil {
+			return false, ErrStorage
+		}
+	case "provider":
+		plain, err := s.spool.Read("provider", record.Alias)
+		if err != nil {
+			return false, ErrStorage
+		}
+		rows, err := tx.conn.QueryContext(tx.ctx, `SELECT id FROM outbox WHERE external_message_id=? AND content_deleted_at=0`, s.alias("providermessage", string(plain)))
+		if err != nil {
+			return false, ErrStorage
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) != nil {
+				return false, ErrStorage
+			}
+			if s.alias("outbox", id) == record.Alias {
+				count++
+			}
+		}
+		if rows.Err() != nil {
+			return false, ErrStorage
+		}
+	case "thread":
+		if err := tx.row(`SELECT
+			(SELECT count(*) FROM segments WHERE root_thread_id=?) +
+			(SELECT count(*) FROM inbound_events WHERE thread_id=? OR pointer_thread_id=?) +
+			(SELECT count(*) FROM outbox WHERE thread_id=?)`,
+			record.Alias, record.Alias, record.Alias, record.Alias).Scan(&count); err != nil {
+			return false, ErrStorage
+		}
+	case "binding":
+		plain, err := s.spool.Read("binding", record.Alias)
+		if err != nil {
+			return false, ErrStorage
+		}
+		var binding sealedBinding
+		if json.Unmarshal(plain, &binding) != nil || binding.ChannelID == "" {
+			// Authenticated but unrecognized payloads remain sealed.
+			return true, nil
+		}
+		if binding.ConversationID == "" {
+			// Earlier v5 bindings carry only the exact channel. Compare the
+			// keyed alias of each candidate owner before deciding it is orphaned.
+			rows, err := tx.conn.QueryContext(tx.ctx, `SELECT id FROM conversations WHERE channel_id=?`, s.alias("channel", binding.ChannelID))
+			if err != nil {
+				return false, ErrStorage
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) != nil {
+					return false, ErrStorage
+				}
+				if s.alias("conversation", id) == record.Alias {
+					count++
+				}
+			}
+			if rows.Err() != nil {
+				return false, ErrStorage
+			}
+			break
+		}
+		if s.alias("conversation", binding.ConversationID) != record.Alias {
+			return true, nil
+		}
+		if err := tx.row(`SELECT count(*) FROM conversations WHERE id=? AND channel_id=?`, binding.ConversationID, s.alias("channel", binding.ChannelID)).Scan(&count); err != nil {
+			return false, ErrStorage
+		}
+	default:
+		return true, nil
+	}
+	return count > 0, nil
 }

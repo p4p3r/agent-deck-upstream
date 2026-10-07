@@ -11,7 +11,9 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
 	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -152,6 +154,10 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 	if err != nil {
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
+	retention, err := slackV2RetentionPolicy(settings)
+	if err != nil {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
 	return channelruntime.Config{
 		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+"/channel-stream"),
 		ConductorID:    channelspool.AliasFromKey(key, "conductor", bindingID),
@@ -165,7 +171,27 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		AppToken:       settings.AppToken,
 		BotToken:       settings.BotToken,
 		SpoolKey:       key,
+		Retention:      retention,
 	}, nil
+}
+
+func slackV2RetentionPolicy(settings session.SlackV2ConductorConfig) (channelgateway.RetentionPolicy, error) {
+	const maxHours = int64((1<<63 - 1) / int64(time.Hour))
+	hours := []int64{settings.RetentionDeliveredHours, settings.RetentionUncertainHours, settings.RetentionMetadataHours}
+	for _, n := range hours {
+		if n < 0 || n > maxHours {
+			return channelgateway.RetentionPolicy{}, errSlackV2Configuration
+		}
+	}
+	policy := channelgateway.RetentionPolicy{
+		DeliveredContent: time.Duration(hours[0]) * time.Hour,
+		UncertainContent: time.Duration(hours[1]) * time.Hour,
+		Metadata:         time.Duration(hours[2]) * time.Hour,
+	}
+	if !policy.Valid() {
+		return channelgateway.RetentionPolicy{}, errSlackV2Configuration
+	}
+	return policy, nil
 }
 
 // resolveSlackV2Value accepts a literal or one exact environment reference.

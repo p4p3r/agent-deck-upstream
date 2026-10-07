@@ -22,12 +22,18 @@ channel_id = "$SLACK_CHANNEL"
 allowed_user_ids = ["${SLACK_ALLOWED_USER}"]
 row_instance_id = "$AGENT_DECK_ROW_ID"
 row_binding_token = "$AGENT_DECK_ROW_BINDING"
+# Optional, whole hours. Omitted values use 24, 168, and 2160.
+retention_delivered_hours = 24
+retention_uncertain_hours = 168
+retention_metadata_hours = 2160
 ```
 
 The token, app, team, channel, sender, row ID, and binding values may be literals or exact
 environment references. Partial expansion, recursion, missing values,
 whitespace-padded values, and duplicate senders fail closed. Secrets are loaded
 only after the per-conductor singleton lock is acquired.
+Retention overrides must be nonnegative whole hours and resolve in the order
+delivered ≤ uncertain ≤ metadata; zero selects that field's default.
 
 Set `SLACK_DECK_SPOOL_KEY` to canonical padded standard base64 encoding of
 exactly 32 high-entropy random bytes, unique to this box and separate from
@@ -94,9 +100,10 @@ encrypted records. Neither the ledger nor the manifest contains exact values.
 An existing body-bearing v4 ledger and version 2 manifest migrate under the
 conductor singleton lock. Migration first copies the original database, WAL,
 and SHM byte for byte into `migration-v4-evidence/`, stages a complete v5 ledger
-and encrypted spool, then moves the live old files and manifest into that
-owner-only evidence directory before activation. Fixed stage markers allow
-restart after each durable boundary. Accepted, active, completed,
+and encrypted spool, then retires the live old database files into that
+owner-only evidence directory and activates v5. It moves the old manifest into
+the archive only after v5 activation, then writes the aliased v3 manifest.
+Fixed stage markers allow restart after each durable boundary. Accepted, active, completed,
 delivery-pending, and uncertain ownership is retained; unsupported legacy
 routing state fails closed before activation. **The raw v4 evidence directory
 is the explicit migration exception to the no-plaintext-artifact rule.** It is
@@ -104,7 +111,9 @@ not a convenience backup: retain it for review, include it deliberately in
 privacy scans, and never publish it. Migration does not delete old evidence.
 
 The runner calls bounded `Store.Prune` at startup and then at least hourly;
-large backlogs continue in bounded batches. Defaults
+large backlogs continue in bounded batches. Each pass checks sealed records
+against ledger references under the write lock and removes unreferenced
+records left by an interrupted insert. Defaults
 are 24 hours for encrypted content and exact delivered-message resolvers after
 confirmed delivery, seven days for terminal uncertain content, and 90 days
 for ordinary delivered terminal metadata. A caller may set positive durations

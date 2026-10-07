@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelspool"
@@ -52,13 +53,21 @@ func TestPersistedLedgerAndSpoolArtifactsDoNotRevealExactValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	private := [][]byte{[]byte(channel), []byte(user), []byte(event), []byte(message), []byte(prompt), []byte(reply), []byte(provider), []byte("synthetic-binding")}
-	scan := func() {
-		if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	scan := func() (bool, int, int, error) {
+		leaked, ledgers, sealed := false, 0, 0
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
 			if entry.IsDir() {
 				return nil
+			}
+			if filepath.Base(path) == "gateway.sqlite" {
+				ledgers++
+			}
+			if strings.HasPrefix(filepath.Base(path), "inbound-") || strings.HasPrefix(filepath.Base(path), "outbound-") ||
+				strings.HasPrefix(filepath.Base(path), "provider-") {
+				sealed++
 			}
 			data, err := os.ReadFile(path)
 			if err != nil {
@@ -66,17 +75,32 @@ func TestPersistedLedgerAndSpoolArtifactsDoNotRevealExactValues(t *testing.T) {
 			}
 			for _, marker := range private {
 				if bytes.Contains(data, marker) || bytes.Contains([]byte(path), marker) {
-					t.Fatal("persisted artifact contains exact private value")
+					leaked = true
 				}
 			}
 			return nil
-		}); err != nil {
-			t.Fatal(err)
+		})
+		return leaked, ledgers, sealed, err
+	}
+	checkPrivate := func() {
+		leaked, ledgers, sealed, err := scan()
+		if err != nil || leaked || ledgers != 1 || sealed < 3 {
+			t.Fatal("privacy scan missed artifacts or found exact private data")
 		}
 	}
-	scan() // include live WAL and SHM before SQLite closes them
+	checkPrivate() // include live WAL and SHM before SQLite closes them
+	control := filepath.Join(root, "privacy-positive-control")
+	if err := os.WriteFile(control, []byte(prompt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if leaked, _, _, err := scan(); err != nil || !leaked {
+		t.Fatal("privacy scan did not detect the positive control")
+	}
+	if err := os.Remove(control); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	scan()
+	checkPrivate()
 }

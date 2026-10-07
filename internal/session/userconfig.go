@@ -1317,16 +1317,19 @@ type ConductorOverrides struct {
 
 // SlackV2ConductorConfig binds a named conductor to one immutable row and channel.
 type SlackV2ConductorConfig struct {
-	AppToken        string   `toml:"app_token,omitempty"`
-	BotToken        string   `toml:"bot_token,omitempty"`
-	AppID           string   `toml:"app_id,omitempty"`
-	TeamID          string   `toml:"team_id,omitempty"`
-	ChannelID       string   `toml:"channel_id,omitempty"`
-	AllowedUserIDs  []string `toml:"allowed_user_ids,omitempty"`
-	RowInstanceID   string   `toml:"row_instance_id,omitempty"`
-	RowBindingToken string   `toml:"row_binding_token,omitempty"`
-	CodexExecutable string   `toml:"-"`
-	CodexModel      string   `toml:"-"`
+	AppToken                string   `toml:"app_token,omitempty"`
+	BotToken                string   `toml:"bot_token,omitempty"`
+	AppID                   string   `toml:"app_id,omitempty"`
+	TeamID                  string   `toml:"team_id,omitempty"`
+	ChannelID               string   `toml:"channel_id,omitempty"`
+	AllowedUserIDs          []string `toml:"allowed_user_ids,omitempty"`
+	RowInstanceID           string   `toml:"row_instance_id,omitempty"`
+	RowBindingToken         string   `toml:"row_binding_token,omitempty"`
+	RetentionDeliveredHours int64    `toml:"retention_delivered_hours,omitempty"`
+	RetentionUncertainHours int64    `toml:"retention_uncertain_hours,omitempty"`
+	RetentionMetadataHours  int64    `toml:"retention_metadata_hours,omitempty"`
+	CodexExecutable         string   `toml:"-"`
+	CodexModel              string   `toml:"-"`
 }
 
 const (

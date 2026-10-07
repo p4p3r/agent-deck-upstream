@@ -244,7 +244,7 @@ func (s *Store) ApplyRowOperation(ctx context.Context, turnID, attemptID string,
 				Kind: kind, ThreadID: threadID, Body: body, State: PendingDelivery}
 			contentRef := ""
 			if kind == "reply" {
-				if err := s.saveOutbound(out.ID, body); err != nil {
+				if err := s.saveOutbound(tx, out.ID, body); err != nil {
 					return err
 				}
 				contentRef = s.alias("outbox", out.ID)
@@ -643,7 +643,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, turnID, attemptID, external
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
-			if err := s.saveOutbound(out.ID, replyBody); err != nil {
+			if err := s.saveOutbound(tx, out.ID, replyBody); err != nil {
 				return err
 			}
 			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,content_ref,state)

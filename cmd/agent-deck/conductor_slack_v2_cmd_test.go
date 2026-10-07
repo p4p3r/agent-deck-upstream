@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
 	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -41,8 +43,11 @@ func TestSlackV2FailureExitUsesFixedCodesOnly(t *testing.T) {
 		line     string
 	}{
 		{"config", &channelruntime.Error{Kind: channelruntime.KindConfig}, false, 78, "slack-v2: config:config\n"},
+		{"identity mismatch", &channelruntime.Error{Kind: channelruntime.KindIdentity}, false, 78, "slack-v2: identity:identity\n"},
 		{"runner protocol", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "protocol", Terminal: true}, false, 78, "slack-v2: runner:protocol\n"},
 		{"runner unknown", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "unknown", Terminal: false}, false, 75, "slack-v2: runner:unknown\n"},
+		{"migration storage", &channelruntime.Error{Kind: channelruntime.KindStore, Cause: "store_unavailable", Terminal: false}, false, 75, "slack-v2: store:store_unavailable\n"},
+		{"migration schema", &channelruntime.Error{Kind: channelruntime.KindStore, Cause: "store", Terminal: true}, false, 78, "slack-v2: store:store\n"},
 		{"lease", &channelruntime.Error{Kind: channelruntime.KindLease}, false, 75, "slack-v2: lease:lease\n"},
 		{"private injected", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "private-body-marker", Terminal: true}, false, 75, "slack-v2: runner:unknown\n"},
 		{"raw private", errors.New("private-provider-marker"), false, 75, "slack-v2: runtime_failed:unknown\n"},
@@ -54,6 +59,32 @@ func TestSlackV2FailureExitUsesFixedCodesOnly(t *testing.T) {
 				t.Fatal("incorrect fixed exit classification")
 			}
 		})
+	}
+}
+
+func TestSlackV2RetentionPolicyDefaultsOverridesAndValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settings session.SlackV2ConductorConfig
+		want     channelgateway.RetentionPolicy
+		valid    bool
+	}{
+		{"defaults", session.SlackV2ConductorConfig{}, channelgateway.RetentionPolicy{}, true},
+		{"override", session.SlackV2ConductorConfig{RetentionDeliveredHours: 48, RetentionUncertainHours: 240, RetentionMetadataHours: 2400}, channelgateway.RetentionPolicy{DeliveredContent: 48 * time.Hour, UncertainContent: 240 * time.Hour, Metadata: 2400 * time.Hour}, true},
+		{"partial invalid order", session.SlackV2ConductorConfig{RetentionDeliveredHours: 200}, channelgateway.RetentionPolicy{}, false},
+		{"negative", session.SlackV2ConductorConfig{RetentionDeliveredHours: -1}, channelgateway.RetentionPolicy{}, false},
+		{"overflow", session.SlackV2ConductorConfig{RetentionDeliveredHours: 1<<63 - 1}, channelgateway.RetentionPolicy{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := slackV2RetentionPolicy(tc.settings)
+			if (err == nil) != tc.valid || tc.valid && got != tc.want {
+				t.Fatalf("retention policy = %+v, error = %v", got, err)
+			}
+		})
+	}
+	defaults := channelgateway.RetentionPolicy{}
+	if !defaults.Valid() || !(channelgateway.RetentionPolicy{DeliveredContent: 24 * time.Hour, UncertainContent: 7 * 24 * time.Hour, Metadata: 90 * 24 * time.Hour}).Valid() {
+		t.Fatal("retention defaults rejected")
 	}
 }
 
@@ -148,6 +179,31 @@ func slackV2LiteralSettings() session.SlackV2ConductorConfig {
 		AppToken: "fixture-app", BotToken: "fixture-bot", AppID: "fixture-app-id", TeamID: "fixture-team", ChannelID: "fixture-channel",
 		AllowedUserIDs: []string{"fixture-user"}, CodexExecutable: "$CODEX_EXECUTABLE", CodexModel: "${CODEX_MODEL}",
 		RowInstanceID: "fixture-row", RowBindingToken: "fixture-binding",
+	}
+}
+
+func TestLoadConductorSlackV2RetentionOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settings session.SlackV2ConductorConfig
+		want     channelgateway.RetentionPolicy
+	}{
+		{"defaults", slackV2LiteralSettings(), channelgateway.RetentionPolicy{}},
+		{"overrides", func() session.SlackV2ConductorConfig {
+			settings := slackV2LiteralSettings()
+			settings.RetentionDeliveredHours = 48
+			settings.RetentionUncertainHours = 240
+			settings.RetentionMetadataHours = 2400
+			return settings
+		}(), channelgateway.RetentionPolicy{DeliveredContent: 48 * time.Hour, UncertainContent: 240 * time.Hour, Metadata: 2400 * time.Hour}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := slackV2LoaderFixture(t, tc.settings)
+			got, err := loadConductorSlackV2Config("default", "sample", dir, func(string) (string, bool) { return "", false })
+			if err != nil || got.Retention != tc.want {
+				t.Fatalf("loaded retention = %+v, error = %v", got.Retention, err)
+			}
+		})
 	}
 }
 

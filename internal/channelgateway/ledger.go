@@ -117,7 +117,7 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 			return ErrStorage
 		}
 		if c.mode == ThreadSegments {
-			if s.saveThreadID(messageID) != nil || s.saveThreadID(threadID) != nil {
+			if s.saveThreadID(tx, messageID) != nil || s.saveThreadID(tx, threadID) != nil {
 				return ErrStorage
 			}
 		}
@@ -192,7 +192,7 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 
 		var contentRef string
 		if out.Disposition == Accepted {
-			if err := s.saveInbound(in.EventID, body); err != nil {
+			if err := s.saveInbound(tx, in.EventID, body); err != nil {
 				return err
 			}
 			contentRef = in.EventID
@@ -418,7 +418,7 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
-			if err := s.saveOutbound(out.ID, replyBody); err != nil {
+			if err := s.saveOutbound(tx, out.ID, replyBody); err != nil {
 				return err
 			}
 			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,content_ref,state)
