@@ -34,6 +34,8 @@ func fixtureStatus() Status {
 
 func int64ptr(value int64) *int64 { return &value }
 
+func intptr(value int) *int { return &value }
+
 func startFixtureServer(t *testing.T, mutate func(*Config)) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -144,8 +146,9 @@ func TestStrictHandshakeReturnsExactBodyFreeSchema(t *testing.T) {
 }
 
 func TestStrictHandshakeRejectsMalformedFrames(t *testing.T) {
-	oversized := append([]byte(`{"version":1,"type":"hello","nonce":"`), []byte(strings.Repeat("0", MaxFrameBytes))...)
-	oversized = append(oversized, []byte(`"}`+"\n")...)
+	hello := []byte(`{"version":1,"type":"hello","nonce":"` + testNonce + `"}`)
+	oversized := append([]byte(strings.Repeat(" ", MaxFrameBytes-len(hello))), hello...)
+	oversized = append(oversized, '\n')
 	cases := map[string][]byte{
 		"invalid utf8":    append([]byte{0xff}, '\n'),
 		"oversized":       oversized,
@@ -163,6 +166,51 @@ func TestStrictHandshakeRejectsMalformedFrames(t *testing.T) {
 			conn := dialFixture(t, path)
 			writeRaw(t, conn, frame)
 			expectClosed(t, conn)
+		})
+	}
+}
+
+func TestStatusValidationRejectsInvalidWireValues(t *testing.T) {
+	if !fixtureStatus().valid() {
+		t.Fatal("valid fixture was rejected")
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Status)
+	}{
+		{"binary digest pattern", func(s *Status) { s.Identity.BinarySHA256 = strings.Repeat("a", 63) }},
+		{"config digest pattern", func(s *Status) { s.Identity.ConfigSHA256 = strings.Repeat("B", 64) }},
+		{"row binding alias pattern", func(s *Status) { s.Identity.RowBindingAlias = "invalid alias value" }},
+		{"exited code below range", func(s *Status) { s.Runner = RunnerStatus{State: "exited", ExitCode: intptr(-1)} }},
+		{"exited code above range", func(s *Status) { s.Runner = RunnerStatus{State: "exited", ExitCode: intptr(256)} }},
+		{"unknown pump state name", func(s *Status) { s.Pump.State = "warming" }},
+		{"idle pump age", func(s *Status) {
+			s.Pump = PumpStatus{State: "idle", LastProgressAgeSeconds: int64ptr(1)}
+			s.Backlog = BacklogStatus{State: "empty"}
+		}},
+		{"unknown pump age", func(s *Status) {
+			s.Pump = PumpStatus{State: "unknown", LastProgressAgeSeconds: int64ptr(1)}
+		}},
+		{"empty backlog age", func(s *Status) {
+			s.Backlog = BacklogStatus{State: "empty", OldestAgeSeconds: int64ptr(1)}
+		}},
+		{"unknown backlog age", func(s *Status) {
+			s.Backlog = BacklogStatus{State: "unknown", OldestAgeSeconds: int64ptr(1)}
+		}},
+		{"idle conductor age", func(s *Status) {
+			s.Conductor = ConductorStatus{State: "idle", TurnAgeSeconds: int64ptr(1)}
+		}},
+		{"unknown conductor age", func(s *Status) {
+			s.Conductor = ConductorStatus{State: "unknown", TurnAgeSeconds: int64ptr(1)}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status := fixtureStatus()
+			tc.mutate(&status)
+			if status.valid() {
+				t.Fatal("invalid wire status was accepted")
+			}
 		})
 	}
 }

@@ -325,6 +325,7 @@ type fakeSender struct {
 	posts     int
 	texts     []string
 	failFirst bool
+	failAll   bool
 	posted    chan int
 }
 
@@ -334,7 +335,7 @@ func (s *fakeSender) PostTopLevel(_ context.Context, channel, text string) (slac
 	s.posts++
 	n := s.posts
 	s.texts = append(s.texts, text)
-	fail := s.failFirst && n == 1
+	fail := s.failAll || s.failFirst && n == 1
 	s.mu.Unlock()
 	s.posted <- n
 	if fail {
@@ -889,6 +890,48 @@ func TestRunnerUncertainDeliveryDoesNotBlockLaterPendingItem(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, channelgateway.DeliveredDelivery, second.State)
 	require.Equal(t, 2, f.sender.count())
+}
+
+func TestRunnerDeliveryFailureDoesNotStarveInboundWork(t *testing.T) {
+	f := newRunnerFixture(t)
+	ctx := context.Background()
+	_, err := f.store.Ingest(ctx, channelgateway.Inbound{
+		ConversationID: runConversation, EventID: "outbox-event", MessageID: "outbox-message",
+		ChannelID: runChannel, SenderID: runUser, Body: "outbox-body",
+	})
+	require.NoError(t, err)
+	result, err := f.runner.Worker.RunOne(ctx, runConversation)
+	require.NoError(t, err)
+	require.Equal(t, channelreconcile.Completed, result.State)
+
+	items, err := f.store.PendingOutbox(ctx, runConversation, 10)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	_, err = f.store.Ingest(ctx, channelgateway.Inbound{
+		ConversationID: runConversation, EventID: "inbound-event", MessageID: "inbound-message",
+		ChannelID: runChannel, SenderID: runUser, Body: "inbound-body",
+	})
+	require.NoError(t, err)
+
+	f.sender.failAll = true
+	progressed, err := f.runner.step(ctx, make(chan struct{}, 1))
+	require.NoError(t, err)
+	starts, _ := f.driver.counts()
+	require.Equal(t, 2, starts, "later inbound agent turn did not start")
+	require.True(t, progressed)
+	require.Equal(t, 2, f.sender.count())
+
+	items, err = f.store.PendingOutbox(ctx, runConversation, 10)
+	require.NoError(t, err)
+	require.Empty(t, items, "uncertain deliveries must not be retried")
+	db, err := sql.Open("sqlite", f.path)
+	require.NoError(t, err)
+	defer db.Close()
+	var uncertain int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT count(*) FROM outbox WHERE conversation_id=? AND state=?`,
+		runConversation, channelgateway.UncertainDelivery).Scan(&uncertain))
+	require.Equal(t, 2, uncertain)
 }
 
 func TestRunnerCancelWhileAgentWorkerIsBlocked(t *testing.T) {

@@ -309,11 +309,12 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) (bool, error) {
 			r.lastRetention = time.Now()
 		}
 	}
-	if progressed, err := r.drain(ctx, wake); err != nil || !progressed {
-		return progressed, err
+	progressed, err := r.drain(ctx, wake)
+	if err != nil {
+		return false, err
 	}
 	if r.Status().Degraded {
-		return true, nil
+		return progressed, nil
 	}
 	for i := 0; i < workBatch; i++ {
 		result, err := r.Worker.RunOne(ctx, r.Handler.Config.ConversationID)
@@ -328,11 +329,12 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) (bool, error) {
 		r.update(func(s *Status) { s.Work = result.State })
 		switch result.State {
 		case channelreconcile.Completed:
-			if progressed, err := r.drain(ctx, wake); err != nil || !progressed {
-				return progressed, err
+			if _, err := r.drain(ctx, wake); err != nil {
+				return false, err
 			}
+			progressed = true
 		case channelreconcile.Idle, channelreconcile.InProgress:
-			return true, nil
+			return progressed, nil
 		case channelreconcile.NeedsReconciliation:
 			r.update(func(s *Status) { s.Degraded = true })
 			return true, nil
