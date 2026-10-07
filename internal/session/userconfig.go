@@ -1328,6 +1328,7 @@ type SlackV2ConductorConfig struct {
 	RetentionDeliveredHours int64    `toml:"retention_delivered_hours,omitempty"`
 	RetentionUncertainHours int64    `toml:"retention_uncertain_hours,omitempty"`
 	RetentionMetadataHours  int64    `toml:"retention_metadata_hours,omitempty"`
+	ControlSocket           string   `toml:"control_socket,omitempty"`
 	CodexExecutable         string   `toml:"-"`
 	CodexModel              string   `toml:"-"`
 }

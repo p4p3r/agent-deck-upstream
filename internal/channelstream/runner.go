@@ -23,6 +23,8 @@ const (
 	workBatch           = 32
 	retentionBatch      = 64
 	retentionInterval   = time.Hour
+	pumpFreshWindow     = 10 * time.Second
+	pumpStalledAfter    = 30 * time.Second
 )
 
 var (
@@ -103,8 +105,53 @@ type Runner struct {
 	running       bool
 	terminal      bool
 	status        Status
+	lastProgress  time.Time
+	progressKnown bool
 	progress      atomic.Uint64
 	lastRetention time.Time // pump goroutine only
+}
+
+type PumpHealth struct {
+	State                  string
+	LastProgressAgeSeconds *int64
+}
+
+// PumpHealth classifies only in-memory pump evidence. Durable backlog evidence
+// is supplied by the caller and unknown input always remains unknown.
+func (r *Runner) PumpHealth(now time.Time, backlogKnown, backlogPending bool) PumpHealth {
+	if r == nil || now.IsZero() || !backlogKnown {
+		return PumpHealth{State: "unknown"}
+	}
+	if !backlogPending {
+		return PumpHealth{State: "idle"}
+	}
+	r.mu.Lock()
+	last, known := r.lastProgress, r.progressKnown
+	r.mu.Unlock()
+	if !known || now.Before(last) {
+		return PumpHealth{State: "unknown"}
+	}
+	ageDuration := now.Sub(last)
+	age := int64(ageDuration / time.Second)
+	if age > 315_360_000 {
+		age = 315_360_000
+	}
+	state := "fresh"
+	if ageDuration >= pumpStalledAfter {
+		state = "stalled"
+	} else if ageDuration >= pumpFreshWindow {
+		state = "stale"
+	}
+	return PumpHealth{State: state, LastProgressAgeSeconds: &age}
+}
+
+func (r *Runner) recordPumpProgress(now time.Time) {
+	if r == nil || now.IsZero() {
+		return
+	}
+	r.mu.Lock()
+	r.lastProgress, r.progressKnown = now, true
+	r.mu.Unlock()
 }
 
 // TerminalCause returns a fixed code only when this run ended in a known
@@ -228,74 +275,74 @@ func fatalDependency(err error) bool {
 		errors.Is(err, slackgateway.ErrConfig) || errors.Is(err, slacknetwork.ErrConfig)
 }
 
-func (r *Runner) drain(ctx context.Context, wake chan<- struct{}) error {
+func (r *Runner) drain(ctx context.Context, wake chan<- struct{}) (bool, error) {
 	for batch := 0; batch < workBatch; batch++ {
 		results, err := r.Delivery.DrainPending(ctx, drainBatch)
 		if err != nil {
 			if fatalDependency(err) {
 				r.setError(ErrorConfig, true)
-				return ErrFatal
+				return false, ErrFatal
 			}
 			r.setError(ErrorDelivery, false)
-			return nil // ambiguous sends are uncertain; later pending work survives
+			return false, nil // ambiguous sends are uncertain; later pending work survives
 		}
 		if len(results) < drainBatch {
-			return nil
+			return true, nil
 		}
 	}
 	signal(wake) // bounded batch yields before further durable work
-	return nil
+	return true, nil
 }
 
-func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
+func (r *Runner) step(ctx context.Context, wake chan<- struct{}) (bool, error) {
 	if time.Since(r.lastRetention) >= retentionInterval {
 		result, err := r.Handler.Store.Prune(ctx, r.Retention, retentionBatch)
 		if err != nil {
 			if fatalDependency(err) {
 				r.setError(ErrorConfig, true)
-				return ErrFatal
+				return false, ErrFatal
 			}
 			r.setError(ErrorWork, false)
-			return nil
+			return false, nil
 		}
 		if result.ContentDeleted+result.MetadataDeleted+result.OrphansDeleted < retentionBatch && !result.ScanPending {
 			r.lastRetention = time.Now()
 		}
 	}
-	if err := r.drain(ctx, wake); err != nil {
-		return err
+	if progressed, err := r.drain(ctx, wake); err != nil || !progressed {
+		return progressed, err
 	}
 	if r.Status().Degraded {
-		return nil
+		return true, nil
 	}
 	for i := 0; i < workBatch; i++ {
 		result, err := r.Worker.RunOne(ctx, r.Handler.Config.ConversationID)
 		if err != nil {
 			if fatalDependency(err) {
 				r.setError(ErrorConfig, true)
-				return ErrFatal
+				return false, ErrFatal
 			}
 			r.setError(ErrorWork, false)
-			return nil
+			return false, nil
 		}
 		r.update(func(s *Status) { s.Work = result.State })
 		switch result.State {
 		case channelreconcile.Completed:
-			if err := r.drain(ctx, wake); err != nil {
-				return err
+			if progressed, err := r.drain(ctx, wake); err != nil || !progressed {
+				return progressed, err
 			}
 		case channelreconcile.Idle, channelreconcile.InProgress:
-			return nil
+			return true, nil
 		case channelreconcile.NeedsReconciliation:
 			r.update(func(s *Status) { s.Degraded = true })
-			return nil
+			return true, nil
 		default:
 			r.setError(ErrorProtocol, true)
-			return ErrFatal
+			return false, ErrFatal
 		}
 	}
 	signal(wake) // do not monopolize the work pump on a large backlog
-	return nil
+	return true, nil
 }
 
 func (r *Runner) pump(ctx context.Context, wake chan struct{}, poll time.Duration, clock Clock, fatal chan<- error) {
@@ -303,12 +350,16 @@ func (r *Runner) pump(ctx context.Context, wake chan struct{}, poll time.Duratio
 		if ctx.Err() != nil {
 			return
 		}
-		if err := r.step(ctx, wake); err != nil {
+		progressed, err := r.step(ctx, wake)
+		if err != nil {
 			select {
 			case fatal <- err:
 			default:
 			}
 			return
+		}
+		if progressed {
+			r.recordPumpProgress(time.Now())
 		}
 		if !wait(ctx, clock, poll, wake) {
 			return
@@ -402,6 +453,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.running = true
 	r.terminal = false
 	r.status = Status{Phase: PhaseStartup, Work: channelreconcile.Idle, LastError: ErrorNone}
+	r.lastProgress = time.Time{}
+	r.progressKnown = false
 	r.progress.Store(0)
 	r.lastRetention = time.Time{}
 	r.mu.Unlock()

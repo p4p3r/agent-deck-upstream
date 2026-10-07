@@ -3,10 +3,13 @@ package channelruntime
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelreconcile"
@@ -38,19 +41,23 @@ type Request struct {
 // Config binds one Slack route to one immutable Agent Deck row. Tokens are
 // never written to the manifest or returned in an error.
 type Config struct {
-	ConversationID string
-	ConductorID    string
-	Profile        string
-	RowInstanceID  string
-	RowBinding     string
-	AppID          string
-	TeamID         string
-	ChannelID      string
-	AllowedUserIDs []string
-	AppToken       string
-	BotToken       string
-	SpoolKey       []byte
-	Retention      channelgateway.RetentionPolicy
+	ConversationID  string
+	ConductorID     string
+	Profile         string
+	RowInstanceID   string
+	RowBinding      string
+	AppID           string
+	TeamID          string
+	ChannelID       string
+	AllowedUserIDs  []string
+	AppToken        string
+	BotToken        string
+	SpoolKey        []byte
+	Retention       channelgateway.RetentionPolicy
+	ControlSocket   string
+	BinarySHA256    string
+	ConfigSHA256    string
+	RowBindingAlias string
 
 	// These fields keep older isolated fixtures source-compatible. A nonempty
 	// value is rejected and never enters the runtime manifest or driver.
@@ -142,6 +149,8 @@ type dependencies struct {
 	socket    func(string) channelstream.Socket
 	sender    func(string) slackgateway.Sender
 	run       func(context.Context, *channelstream.Runner) error
+	control   func(controlSpec) (controlServer, error)
+	after     func(time.Duration) <-chan time.Time
 
 	// Compatibility-only seam ignored by run.
 	driver func(Config) agentDriver
@@ -163,9 +172,11 @@ func productionDependencies() dependencies {
 				SessionID: c.RowInstanceID, RowBinding: c.RowBinding,
 			})
 		},
-		socket: func(token string) channelstream.Socket { return slacknetwork.NewSocketClient(token) },
-		sender: func(token string) slackgateway.Sender { return slacknetwork.NewSender(token) },
-		run:    func(ctx context.Context, r *channelstream.Runner) error { return r.Run(ctx) },
+		socket:  func(token string) channelstream.Socket { return slacknetwork.NewSocketClient(token) },
+		sender:  func(token string) slackgateway.Sender { return slacknetwork.NewSender(token) },
+		run:     func(ctx context.Context, r *channelstream.Runner) error { return r.Run(ctx) },
+		control: startControl,
+		after:   time.After,
 	}
 }
 
@@ -263,20 +274,13 @@ func run(ctx context.Context, request Request, d dependencies) error {
 		Delivery: &slackgateway.DeliveryWorker{Store: store, Sender: d.sender(cfg.BotToken),
 			ConversationID: cfg.ConversationID, ChannelID: cfg.ChannelID},
 	}
-	if err := d.run(ctx, runner); err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil
+	if cfg.ControlSocket != "" {
+		if d.control == nil {
+			return &Error{Kind: KindConfig}
 		}
-		cause, terminal := runner.TerminalCause()
-		if errors.Is(err, channelstream.ErrConfig) || errors.Is(err, channelstream.ErrRunning) {
-			cause, terminal = channelstream.ErrorConfig, true
-		}
-		if terminal {
-			return &Error{Kind: KindRunner, Cause: string(cause), Terminal: true}
-		}
-		return &Error{Kind: KindRunner, Cause: "unknown", Terminal: false}
+		return runWithControl(ctx, cfg, store, runner, d)
 	}
-	return nil
+	return runnerResult(ctx, runner, d.run(ctx, runner))
 }
 
 func validConfig(c Config) bool {
@@ -286,12 +290,38 @@ func validConfig(c Config) bool {
 		c.CodexExecutable != "" || c.CodexCWD != "" || c.CodexModel != "" {
 		return false
 	}
+	if c.ControlSocket == "" {
+		if c.BinarySHA256 != "" || c.ConfigSHA256 != "" || c.RowBindingAlias != "" {
+			return false
+		}
+	} else if !filepath.IsAbs(c.ControlSocket) || filepath.Clean(c.ControlSocket) != c.ControlSocket ||
+		!validLowerHex(c.BinarySHA256) || !validLowerHex(c.ConfigSHA256) || !validOpaqueAlias(c.RowBindingAlias) {
+		return false
+	}
 	seen := make(map[string]bool, len(c.AllowedUserIDs))
 	for _, id := range c.AllowedUserIDs {
 		if id == "" || seen[id] {
 			return false
 		}
 		seen[id] = true
+	}
+	return true
+}
+
+func validLowerHex(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32 && strings.ToLower(value) == value
+}
+
+func validOpaqueAlias(value string) bool {
+	if len(value) < 16 || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' {
+			continue
+		}
+		return false
 	}
 	return true
 }

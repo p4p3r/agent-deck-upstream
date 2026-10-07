@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -335,6 +338,81 @@ func TestLoadConductorSlackV2ConfigRejectsDuplicateUsers(t *testing.T) {
 			})
 			if !errors.Is(err, errSlackV2Configuration) || !reflect.DeepEqual(got, channelruntime.Config{}) {
 				t.Fatal("invalid allowlist did not fail closed")
+			}
+		})
+	}
+}
+
+func TestLoadConductorSlackV2ControlIdentityIsExactAndDisabledByDefault(t *testing.T) {
+	disabled := slackV2LiteralSettings()
+	dir := slackV2LoaderFixture(t, disabled)
+	got, err := loadConductorSlackV2Config("default", "sample", dir, func(string) (string, bool) { return "", false })
+	if err != nil || got.ControlSocket != "" || got.BinarySHA256 != "" || got.ConfigSHA256 != "" || got.RowBindingAlias != "" {
+		t.Fatal("control socket was not disabled by default")
+	}
+
+	t.Run("enabled", func(t *testing.T) {
+		settings := slackV2LiteralSettings()
+		settings.ControlSocket = filepath.Join(t.TempDir(), "control.sock")
+		dir := slackV2LoaderFixture(t, settings)
+		got, err := loadConductorSlackV2Config("default", "sample", dir, func(string) (string, bool) { return "", false })
+		if err != nil {
+			t.Fatal(err)
+		}
+		binary, err := os.Open("/proc/self/exe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.New()
+		_, copyErr := io.Copy(hash, binary)
+		closeErr := binary.Close()
+		if copyErr != nil || closeErr != nil {
+			t.Fatal("could not hash running test binary")
+		}
+		if got.BinarySHA256 != hex.EncodeToString(hash.Sum(nil)) {
+			t.Fatal("binary digest does not pin the running image")
+		}
+		key, _ := channelspool.KeyFromEnv()
+		if got.RowBindingAlias != channelspool.AliasFromKey(key, "rowbinding", settings.RowBindingToken) ||
+			len(got.ConfigSHA256) != 64 || got.ControlSocket != settings.ControlSocket {
+			t.Fatal("control identity mismatch")
+		}
+		raw, err := session.ConductorSlackV2Config("sample")
+		if err != nil || raw.ControlSocket != settings.ControlSocket {
+			t.Fatal("control socket did not survive configuration round trip")
+		}
+		recomputed, err := effectiveSlackV2ConfigSHA256(got)
+		if err != nil || recomputed != got.ConfigSHA256 {
+			t.Fatal("effective configuration digest is not deterministic")
+		}
+		changed := got
+		changed.BotToken = "fixture-bot-changed"
+		changedDigest, _ := effectiveSlackV2ConfigSHA256(changed)
+		if changedDigest == got.ConfigSHA256 {
+			t.Fatal("effective configuration change retained the same digest")
+		}
+		for _, private := range []string{settings.BotToken, settings.AppToken, settings.RowBindingToken, settings.ChannelID} {
+			if strings.Contains(got.ConfigSHA256+got.RowBindingAlias, private) {
+				t.Fatal("control identity exposed effective configuration")
+			}
+		}
+	})
+}
+
+func TestLoadConductorSlackV2ControlSocketFailsClosed(t *testing.T) {
+	for name, path := range map[string]string{
+		"relative": "control.sock",
+		"unclean":  "/tmp/../control.sock",
+		"padded":   " /tmp/control.sock",
+		"nul":      "/tmp/control\x00.sock",
+	} {
+		t.Run(name, func(t *testing.T) {
+			settings := slackV2LiteralSettings()
+			settings.ControlSocket = path
+			dir := slackV2LoaderFixture(t, settings)
+			got, err := loadConductorSlackV2Config("default", "sample", dir, func(string) (string, bool) { return "", false })
+			if !errors.Is(err, errSlackV2Configuration) || !reflect.DeepEqual(got, channelruntime.Config{}) {
+				t.Fatal("unsafe control path accepted")
 			}
 		})
 	}

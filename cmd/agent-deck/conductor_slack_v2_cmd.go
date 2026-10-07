@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -137,6 +142,13 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		}
 		*value = resolved
 	}
+	if settings.ControlSocket != "" {
+		resolved, err := resolveSlackV2Value(settings.ControlSocket, lookupEnv)
+		if err != nil || !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved || strings.ContainsRune(resolved, '\x00') {
+			return channelruntime.Config{}, errSlackV2Configuration
+		}
+		settings.ControlSocket = resolved
+	}
 	if len(settings.AllowedUserIDs) == 0 {
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
@@ -158,7 +170,7 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 	if err != nil {
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
-	return channelruntime.Config{
+	config := channelruntime.Config{
 		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+"/channel-stream"),
 		ConductorID:    channelspool.AliasFromKey(key, "conductor", bindingID),
 		Profile:        selectedProfile,
@@ -172,7 +184,66 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		BotToken:       settings.BotToken,
 		SpoolKey:       key,
 		Retention:      retention,
-	}, nil
+		ControlSocket:  settings.ControlSocket,
+	}
+	if config.ControlSocket != "" {
+		config.BinarySHA256, err = runningBinarySHA256()
+		if err != nil {
+			return channelruntime.Config{}, errSlackV2Configuration
+		}
+		config.RowBindingAlias = channelspool.AliasFromKey(key, "rowbinding", config.RowBinding)
+		config.ConfigSHA256, err = effectiveSlackV2ConfigSHA256(config)
+		if err != nil {
+			return channelruntime.Config{}, errSlackV2Configuration
+		}
+	}
+	return config, nil
+}
+
+func effectiveSlackV2ConfigSHA256(config channelruntime.Config) (string, error) {
+	users := slices.Clone(config.AllowedUserIDs)
+	slices.Sort(users)
+	delivered, uncertain, metadata := config.Retention.DeliveredContent, config.Retention.UncertainContent, config.Retention.Metadata
+	if delivered == 0 {
+		delivered = 24 * time.Hour
+	}
+	if uncertain == 0 {
+		uncertain = 7 * 24 * time.Hour
+	}
+	if metadata == 0 {
+		metadata = 90 * 24 * time.Hour
+	}
+	payload := struct {
+		Version          int      `json:"version"`
+		ConversationID   string   `json:"conversation_id"`
+		ConductorID      string   `json:"conductor_id"`
+		Profile          string   `json:"profile"`
+		RowInstanceID    string   `json:"row_instance_id"`
+		RowBinding       string   `json:"row_binding"`
+		AppID            string   `json:"app_id"`
+		TeamID           string   `json:"team_id"`
+		ChannelID        string   `json:"channel_id"`
+		AllowedUserIDs   []string `json:"allowed_user_ids"`
+		AppToken         string   `json:"app_token"`
+		BotToken         string   `json:"bot_token"`
+		SpoolKey         []byte   `json:"spool_key"`
+		DeliveredSeconds int64    `json:"retention_delivered_seconds"`
+		UncertainSeconds int64    `json:"retention_uncertain_seconds"`
+		MetadataSeconds  int64    `json:"retention_metadata_seconds"`
+		ControlSocket    string   `json:"control_socket"`
+	}{
+		Version: 1, ConversationID: config.ConversationID, ConductorID: config.ConductorID, Profile: config.Profile,
+		RowInstanceID: config.RowInstanceID, RowBinding: config.RowBinding, AppID: config.AppID, TeamID: config.TeamID,
+		ChannelID: config.ChannelID, AllowedUserIDs: users, AppToken: config.AppToken, BotToken: config.BotToken,
+		SpoolKey: config.SpoolKey, DeliveredSeconds: int64(delivered / time.Second), UncertainSeconds: int64(uncertain / time.Second),
+		MetadataSeconds: int64(metadata / time.Second), ControlSocket: config.ControlSocket,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("agent-deck/slack-v2/effective-config/v1\x00"), encoded...))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func slackV2RetentionPolicy(settings session.SlackV2ConductorConfig) (channelgateway.RetentionPolicy, error) {
