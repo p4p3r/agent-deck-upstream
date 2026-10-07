@@ -21,6 +21,8 @@ const (
 	defaultBackoffMax   = 30 * time.Second
 	drainBatch          = 32
 	workBatch           = 32
+	retentionBatch      = 64
+	retentionInterval   = time.Hour
 )
 
 var (
@@ -96,11 +98,23 @@ type Runner struct {
 	BackoffMax   time.Duration
 	Clock        Clock
 
-	mu       sync.Mutex
-	running  bool
-	terminal bool
-	status   Status
-	progress atomic.Uint64
+	mu            sync.Mutex
+	running       bool
+	terminal      bool
+	status        Status
+	progress      atomic.Uint64
+	lastRetention time.Time // pump goroutine only
+}
+
+// TerminalCause returns a fixed code only when this run ended in a known
+// terminal safety failure. LastError alone may describe a transient outage.
+func (r *Runner) TerminalCause() (ErrorClass, bool) {
+	if r == nil {
+		return ErrorConfig, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status.LastError, r.terminal
 }
 
 func (r *Runner) Status() Status {
@@ -167,7 +181,7 @@ func (r *Runner) valid() bool {
 		return false
 	}
 	c := r.Handler.Config
-	if c.ConversationID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 ||
+	if c.ConversationID == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 ||
 		r.Worker.Store != r.Handler.Store || r.Delivery.Store != r.Handler.Store ||
 		r.Delivery.ConversationID != c.ConversationID || r.Delivery.ChannelID != c.ChannelID {
 		return false
@@ -233,6 +247,20 @@ func (r *Runner) drain(ctx context.Context, wake chan<- struct{}) error {
 }
 
 func (r *Runner) step(ctx context.Context, wake chan<- struct{}) error {
+	if time.Since(r.lastRetention) >= retentionInterval {
+		result, err := r.Handler.Store.Prune(ctx, channelgateway.RetentionPolicy{}, retentionBatch)
+		if err != nil {
+			if fatalDependency(err) {
+				r.setError(ErrorConfig, true)
+				return ErrFatal
+			}
+			r.setError(ErrorWork, false)
+			return nil
+		}
+		if result.ContentDeleted+result.MetadataDeleted+result.OrphansDeleted < retentionBatch {
+			r.lastRetention = time.Now()
+		}
+	}
 	if err := r.drain(ctx, wake); err != nil {
 		return err
 	}
@@ -350,6 +378,13 @@ func (r *Runner) socketFailure(err, callbackErr error) (terminal bool, result er
 	return true, ErrFatal, ErrorProtocol, false
 }
 
+func contextResult(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // Run serves one conversation until cancellation or a terminal condition.
 // It never replays a callback, agent attempt, or ambiguous Slack post locally.
 // Reconnect creates only one socket at a time and uses capped backoff. A
@@ -367,6 +402,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.terminal = false
 	r.status = Status{Phase: PhaseStartup, Work: channelreconcile.Idle, LastError: ErrorNone}
 	r.progress.Store(0)
+	r.lastRetention = time.Time{}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -404,7 +440,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return callbackErr
 		})
 		if ctx.Err() != nil {
-			return nil
+			return contextResult(ctx)
 		}
 		if runCtx.Err() != nil {
 			select {
@@ -437,13 +473,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.update(func(s *Status) { s.Phase = PhaseBackoff })
 		if !wait(runCtx, clock, delay, nil) {
 			if ctx.Err() != nil {
-				return nil
+				return contextResult(ctx)
 			}
 			return ErrFatal
 		}
 	}
 	if ctx.Err() != nil {
-		return nil
+		return contextResult(ctx)
 	}
 	select {
 	case pumpErr := <-fatal:

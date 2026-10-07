@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -28,6 +29,31 @@ func TestConductorSlackV2EarlyDispatch(t *testing.T) {
 		if got := isConductorSlackV2Command(tc.args); got != tc.want {
 			t.Errorf("early dispatch for %v = %v, want %v", tc.args, got, tc.want)
 		}
+	}
+}
+
+func TestSlackV2FailureExitUsesFixedCodesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		canceled bool
+		code     int
+		line     string
+	}{
+		{"config", &channelruntime.Error{Kind: channelruntime.KindConfig}, false, 78, "slack-v2: config:config\n"},
+		{"runner protocol", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "protocol", Terminal: true}, false, 78, "slack-v2: runner:protocol\n"},
+		{"runner unknown", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "unknown", Terminal: false}, false, 75, "slack-v2: runner:unknown\n"},
+		{"lease", &channelruntime.Error{Kind: channelruntime.KindLease}, false, 75, "slack-v2: lease:lease\n"},
+		{"private injected", &channelruntime.Error{Kind: channelruntime.KindRunner, Cause: "private-body-marker", Terminal: true}, false, 75, "slack-v2: runner:unknown\n"},
+		{"raw private", errors.New("private-provider-marker"), false, 75, "slack-v2: runtime_failed:unknown\n"},
+		{"cancel", errors.New("private-provider-marker"), true, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if got := slackV2FailureExit(tc.err, tc.canceled, &stderr); got != tc.code || stderr.String() != tc.line {
+				t.Fatal("incorrect fixed exit classification")
+			}
+		})
 	}
 }
 
@@ -85,7 +111,7 @@ func TestConductorSlackV2RunRequiresSelectedBackendBeforeNetwork(t *testing.T) {
 	}
 	var out, errOut bytes.Buffer
 	code := runConductorSlackV2Command("", []string{"run", "sample"}, &out, &errOut)
-	if code != 1 || !strings.Contains(errOut.String(), "config") || out.Len() != 0 {
+	if code != 78 || !strings.Contains(errOut.String(), "config") || out.Len() != 0 {
 		t.Fatalf("unselected backend result: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 	}
 }
@@ -119,7 +145,7 @@ func slackV2LoaderFixture(t *testing.T, settings session.SlackV2ConductorConfig)
 
 func slackV2LiteralSettings() session.SlackV2ConductorConfig {
 	return session.SlackV2ConductorConfig{
-		AppToken: "fixture-app", BotToken: "fixture-bot", ChannelID: "fixture-channel",
+		AppToken: "fixture-app", BotToken: "fixture-bot", AppID: "fixture-app-id", TeamID: "fixture-team", ChannelID: "fixture-channel",
 		AllowedUserIDs: []string{"fixture-user"}, CodexExecutable: "$CODEX_EXECUTABLE", CodexModel: "${CODEX_MODEL}",
 		RowInstanceID: "fixture-row", RowBindingToken: "fixture-binding",
 	}
@@ -172,8 +198,14 @@ func TestLoadConductorSlackV2ConfigValues(t *testing.T) {
 				got.RowBinding != settings.RowBindingToken || !slices.Equal(got.AllowedUserIDs, wantUsers) || lookups != wantLookups {
 				t.Fatal("Slack configuration mismatch")
 			}
+			key, keyErr := channelspool.KeyFromEnv()
+			if keyErr != nil {
+				t.Fatal("synthetic key unavailable")
+			}
 			if got.CodexExecutable != "" || got.CodexModel != "" || got.CodexCWD != "" ||
-				got.ConductorID != "default/sample" || got.ConversationID != "default/sample/channel-stream" {
+				got.AppID != settings.AppID || got.TeamID != settings.TeamID ||
+				got.ConductorID != channelspool.AliasFromKey(key, "conductor", "default/sample") ||
+				got.ConversationID != channelspool.AliasFromKey(key, "conversation", "default/sample/channel-stream") {
 				t.Fatal("runtime configuration mismatch")
 			}
 			raw, err := session.ConductorSlackV2Config("sample")

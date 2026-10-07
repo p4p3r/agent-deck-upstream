@@ -156,6 +156,8 @@ func (s *Store) ApplyRowOperation(ctx context.Context, turnID, attemptID string,
 	} else if next.TerminalError != "" {
 		return nil, ErrInvalid
 	}
+	next.AcceptedCodexSession = s.alias("codexsession", next.AcceptedCodexSession)
+	next.AcceptedGeneration = s.alias("codexgeneration", next.AcceptedGeneration)
 	var out *OutboxItem
 	err := s.write(ctx, func(tx *writeTx) error {
 		var conversationID, status, storedAttempt, mode, root string
@@ -192,8 +194,15 @@ func (s *Store) ApplyRowOperation(ctx context.Context, turnID, attemptID string,
 				return err
 			}
 			if next.State == RowCompleted {
-				if out == nil && next.Content != "" || out != nil && (out.Kind != "reply" || out.Body != next.Content) {
+				if out == nil && next.Content != "" {
 					return ErrConflict
+				}
+				if out != nil {
+					body, err := s.outboundBody(out.ID)
+					if err != nil || out.Kind != "reply" || body != next.Content {
+						return ErrConflict
+					}
+					out.Body = body
 				}
 			} else if out == nil || out.Kind != "status" || out.Body != "" {
 				return ErrConflict
@@ -219,7 +228,7 @@ func (s *Store) ApplyRowOperation(ctx context.Context, turnID, attemptID string,
 		if !rowTerminal(next.State) {
 			return nil
 		}
-		if _, err := tx.exec(`UPDATE turns SET status='completed' WHERE id=?`, turnID); err != nil {
+		if _, err := tx.exec(`UPDATE turns SET status='completed',completed_at=? WHERE id=?`, s.now().Unix(), turnID); err != nil {
 			return err
 		}
 		kind, body := "status", ""
@@ -233,8 +242,15 @@ func (s *Store) ApplyRowOperation(ctx context.Context, turnID, attemptID string,
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: kind, ThreadID: threadID, Body: body, State: PendingDelivery}
-			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,body,state)
-				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, kind, threadID, body); err != nil {
+			contentRef := ""
+			if kind == "reply" {
+				if err := s.saveOutbound(out.ID, body); err != nil {
+					return err
+				}
+				contentRef = s.alias("outbox", out.ID)
+			}
+			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,content_ref,state)
+				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, kind, threadID, contentRef); err != nil {
 				return err
 			}
 		}
@@ -602,15 +618,22 @@ func (s *Store) CompleteAttempt(ctx context.Context, turnID, attemptID, external
 			if err != nil {
 				return err
 			}
-			if out == nil && replyBody != "" || out != nil && out.Body != replyBody {
+			if out == nil && replyBody != "" {
 				return ErrConflict
+			}
+			if out != nil {
+				body, err := s.outboundBody(out.ID)
+				if err != nil || body != replyBody {
+					return ErrConflict
+				}
+				out.Body = body
 			}
 			return nil
 		}
 		if status != "active" || state != AttemptAccepted || baseline != cursor {
 			return ErrConflict
 		}
-		if _, err := tx.exec(`UPDATE turns SET status='completed',attempt_state='completed' WHERE id=?`, turnID); err != nil {
+		if _, err := tx.exec(`UPDATE turns SET status='completed',attempt_state='completed',completed_at=? WHERE id=?`, s.now().Unix(), turnID); err != nil {
 			return err
 		}
 		if replyBody != "" {
@@ -620,8 +643,11 @@ func (s *Store) CompleteAttempt(ctx context.Context, turnID, attemptID, external
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
-			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,body,state)
-				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, out.Body); err != nil {
+			if err := s.saveOutbound(out.ID, replyBody); err != nil {
+				return err
+			}
+			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,content_ref,state)
+				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, s.alias("outbox", out.ID)); err != nil {
 				return err
 			}
 		}

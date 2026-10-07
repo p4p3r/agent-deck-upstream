@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -31,25 +32,31 @@ func TestConductorSlackV2RowRunHasNoThreadBootstrapFlags(t *testing.T) {
 
 func TestLoadConductorSlackV2RowBindingConfig(t *testing.T) {
 	settings := session.SlackV2ConductorConfig{
-		AppToken: "$APP_TOKEN", BotToken: "$BOT_TOKEN", ChannelID: "$CHANNEL_ID",
+		AppToken: "$APP_TOKEN", BotToken: "$BOT_TOKEN", AppID: "$APP_ID", TeamID: "$TEAM_ID", ChannelID: "$CHANNEL_ID",
 		AllowedUserIDs: []string{"$ALLOWED_USER"}, RowInstanceID: "$ROW_ID", RowBindingToken: "$ROW_BINDING",
 	}
 	dir := slackV2LoaderFixture(t, settings)
 	env := map[string]string{
-		"APP_TOKEN": "fixture-app", "BOT_TOKEN": "fixture-bot", "CHANNEL_ID": "fixture-channel",
+		"APP_TOKEN": "fixture-app", "BOT_TOKEN": "fixture-bot", "APP_ID": "fixture-app-id", "TEAM_ID": "fixture-team", "CHANNEL_ID": "fixture-channel",
 		"ALLOWED_USER": "fixture-user", "ROW_ID": "immutable-row", "ROW_BINDING": "opaque-binding",
 	}
 	got, err := loadConductorSlackV2Config("default", "sample", dir, func(name string) (string, bool) {
 		value, ok := env[name]
 		return value, ok
 	})
+	key, keyErr := channelspool.KeyFromEnv()
+	if keyErr != nil {
+		t.Fatal("synthetic spool key unavailable")
+	}
 	want := channelruntime.Config{
-		ConversationID: "default/sample/channel-stream", ConductorID: "default/sample", Profile: "default",
+		ConversationID: channelspool.AliasFromKey(key, "conversation", "default/sample/channel-stream"),
+		ConductorID:    channelspool.AliasFromKey(key, "conductor", "default/sample"), Profile: "default",
 		RowInstanceID: "immutable-row", RowBinding: "opaque-binding", ChannelID: "fixture-channel",
+		AppID: "fixture-app-id", TeamID: "fixture-team", SpoolKey: key,
 		AllowedUserIDs: []string{"fixture-user"}, AppToken: "fixture-app", BotToken: "fixture-bot",
 	}
 	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("config=%+v err=%v want=%+v", got, err, want)
+		t.Fatal("Slack v2 row binding configuration mismatch")
 	}
 }
 
@@ -61,6 +68,6 @@ func TestLoadConductorSlackV2RejectsMissingRowIdentity(t *testing.T) {
 	dir := slackV2LoaderFixture(t, settings)
 	got, err := loadConductorSlackV2Config("default", "sample", dir, func(string) (string, bool) { return "", false })
 	if err == nil || !reflect.DeepEqual(got, channelruntime.Config{}) {
-		t.Fatalf("missing row binding accepted: config=%+v err=%v", got, err)
+		t.Fatal("missing row binding accepted")
 	}
 }

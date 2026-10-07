@@ -41,25 +41,56 @@ func (s *Store) ConversationRoute(ctx context.Context, conversationID string) (M
 	if err != nil {
 		return "", "", ErrStorage
 	}
-	return mode, channelID, nil
+	exact, err := s.channelID(conversationID)
+	if err != nil || channelID != s.alias("channel", exact) {
+		return "", "", ErrStorage
+	}
+	return mode, exact, nil
 }
 
 // OutboxRecord reads an item without claiming it, so a transport can reject
 // an incompatible route before altering delivery state.
 func (s *Store) OutboxRecord(ctx context.Context, itemID string) (OutboxItem, error) {
 	var o OutboxItem
+	var expired int64
 	if itemID == "" {
 		return o, ErrInvalid
 	}
-	err := s.db.QueryRowContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,body,state,delivery_attempt_id,external_message_id
+	err := s.db.QueryRowContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,content_ref,state,delivery_attempt_id,external_message_id,content_expired_at
 		FROM outbox WHERE id=?`, itemID).
 		Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body,
-			&o.State, &o.DeliveryAttemptID, &o.ExternalMessageID)
+			&o.State, &o.DeliveryAttemptID, &o.ExternalMessageID, &expired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
 	if err != nil {
 		return o, ErrStorage
+	}
+	if expired > 0 {
+		o.Body = ""
+	} else if o.Kind == "reply" {
+		o.Body, err = s.outboundBody(o.ID)
+		if err != nil {
+			return OutboxItem{}, err
+		}
+	} else {
+		o.Body = ""
+	}
+	if o.State == DeliveredDelivery && expired == 0 {
+		exact, err := s.providerMessage(o.ID)
+		if err != nil || o.ExternalMessageID != s.alias("providermessage", exact) {
+			return OutboxItem{}, ErrStorage
+		}
+		o.ExternalMessageID = exact
+	}
+	if expired > 0 {
+		o.ExternalMessageID = ""
+	}
+	if o.ThreadID != "" {
+		o.ThreadID, err = s.exactThread(o.ThreadID)
+		if err != nil {
+			return OutboxItem{}, err
+		}
 	}
 	return o, nil
 }
@@ -73,12 +104,13 @@ func (s *Store) PrepareDelivery(ctx context.Context, itemID string) (DeliveryAtt
 		return a, false, ErrInvalid
 	}
 	created := false
+	var expired int64
 	err := s.write(ctx, func(tx *writeTx) error {
-		err := tx.row(`SELECT o.id,o.conversation_id,o.turn_id,o.kind,o.thread_id,o.body,
-			o.state,o.delivery_attempt_id,o.external_message_id,c.channel_id
+		err := tx.row(`SELECT o.id,o.conversation_id,o.turn_id,o.kind,o.thread_id,o.content_ref,
+			o.state,o.delivery_attempt_id,o.external_message_id,c.channel_id,o.content_expired_at
 			FROM outbox o JOIN conversations c ON c.id=o.conversation_id WHERE o.id=?`, itemID).
 			Scan(&a.Item.ID, &a.Item.ConversationID, &a.Item.TurnID, &a.Item.Kind, &a.Item.ThreadID,
-				&a.Item.Body, &a.Item.State, &a.Item.DeliveryAttemptID, &a.Item.ExternalMessageID, &a.ChannelID)
+				&a.Item.Body, &a.Item.State, &a.Item.DeliveryAttemptID, &a.Item.ExternalMessageID, &a.ChannelID, &expired)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -101,7 +133,41 @@ func (s *Store) PrepareDelivery(ctx context.Context, itemID string) (DeliveryAtt
 		a.State = a.Item.State
 		return nil
 	})
-	return a, created, err
+	if err != nil {
+		return a, created, err
+	}
+	exact, err := s.channelID(a.Item.ConversationID)
+	if err != nil || a.ChannelID != s.alias("channel", exact) {
+		return DeliveryAttempt{}, false, ErrStorage
+	}
+	a.ChannelID = exact
+	if expired > 0 {
+		a.Item.Body = ""
+	} else if a.Item.Kind == "reply" {
+		a.Item.Body, err = s.outboundBody(a.Item.ID)
+		if err != nil {
+			return DeliveryAttempt{}, false, err
+		}
+	} else {
+		a.Item.Body = ""
+	}
+	if a.Item.State == DeliveredDelivery && expired == 0 {
+		exactID, err := s.providerMessage(a.Item.ID)
+		if err != nil || a.Item.ExternalMessageID != s.alias("providermessage", exactID) {
+			return DeliveryAttempt{}, false, ErrStorage
+		}
+		a.Item.ExternalMessageID = exactID
+	}
+	if expired > 0 {
+		a.Item.ExternalMessageID = ""
+	}
+	if a.Item.ThreadID != "" {
+		a.Item.ThreadID, err = s.exactThread(a.Item.ThreadID)
+		if err != nil {
+			return DeliveryAttempt{}, false, err
+		}
+	}
+	return a, created, nil
 }
 
 // RecoverInFlight records crash/overlap uncertainty before a drain selects
@@ -115,7 +181,7 @@ func (s *Store) RecoverInFlight(ctx context.Context, conversationID string) (int
 		if _, err := loadConversation(tx, conversationID); err != nil {
 			return err
 		}
-		r, err := tx.exec(`UPDATE outbox SET state='uncertain' WHERE conversation_id=? AND state='sending'`, conversationID)
+		r, err := tx.exec(`UPDATE outbox SET state='uncertain',uncertain_at=? WHERE conversation_id=? AND state='sending'`, s.now().Unix(), conversationID)
 		if err != nil {
 			return err
 		}
@@ -153,7 +219,7 @@ func (s *Store) MarkDeliveryUncertain(ctx context.Context, itemID, attemptID str
 		if state != SendingDelivery {
 			return ErrConflict
 		}
-		_, err = tx.exec(`UPDATE outbox SET state='uncertain' WHERE id=?`, itemID)
+		_, err = tx.exec(`UPDATE outbox SET state='uncertain',uncertain_at=? WHERE id=?`, s.now().Unix(), itemID)
 		return err
 	})
 }
@@ -166,21 +232,23 @@ func (s *Store) ConfirmDelivery(ctx context.Context, itemID, attemptID, channelI
 	}
 	return s.write(ctx, func(tx *writeTx) error {
 		var state DeliveryState
-		var id, existing, boundChannel string
-		err := tx.row(`SELECT o.state,o.delivery_attempt_id,o.external_message_id,c.channel_id
+		var id, existing, boundChannel, conversationID string
+		var expired int64
+		err := tx.row(`SELECT o.state,o.delivery_attempt_id,o.external_message_id,c.channel_id,o.conversation_id,o.content_expired_at
 			FROM outbox o JOIN conversations c ON c.id=o.conversation_id WHERE o.id=?`, itemID).
-			Scan(&state, &id, &existing, &boundChannel)
+			Scan(&state, &id, &existing, &boundChannel, &conversationID, &expired)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return ErrStorage
 		}
-		if id != attemptID || channelID != boundChannel {
+		exactChannel, bindingErr := s.channelID(conversationID)
+		if bindingErr != nil || id != attemptID || channelID != exactChannel || s.alias("channel", channelID) != boundChannel {
 			return ErrConflict
 		}
 		if state == DeliveredDelivery {
-			if existing == providerMessageID {
+			if existing == s.alias("providermessage", providerMessageID) {
 				return nil
 			}
 			return ErrConflict
@@ -190,13 +258,18 @@ func (s *Store) ConfirmDelivery(ctx context.Context, itemID, attemptID, channelI
 		}
 		var duplicate int
 		if err := tx.row(`SELECT count(*) FROM outbox WHERE conversation_id=(SELECT conversation_id FROM outbox WHERE id=?)
-			AND external_message_id=? AND id<>?`, itemID, providerMessageID, itemID).Scan(&duplicate); err != nil {
+			AND external_message_id=? AND id<>?`, itemID, s.alias("providermessage", providerMessageID), itemID).Scan(&duplicate); err != nil {
 			return ErrStorage
 		}
 		if duplicate != 0 {
 			return ErrConflict
 		}
-		if _, err := tx.exec(`UPDATE outbox SET state='delivered',external_message_id=? WHERE id=?`, providerMessageID, itemID); err != nil {
+		if expired == 0 {
+			if err := s.saveProviderMessage(itemID, providerMessageID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.exec(`UPDATE outbox SET state='delivered',external_message_id=?,delivered_at=? WHERE id=?`, s.alias("providermessage", providerMessageID), s.now().Unix(), itemID); err != nil {
 			return err
 		}
 		return nil

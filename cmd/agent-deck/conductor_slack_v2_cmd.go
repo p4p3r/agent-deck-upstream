@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -75,7 +76,7 @@ func runConductorSlackV2Command(profile string, args []string, stdout, stderr io
 	dir, err := session.ConductorNameDir(parsed.name)
 	if err != nil {
 		fmt.Fprintln(stderr, "slack-v2: configuration")
-		return 1
+		return 78
 	}
 	req := channelruntime.Request{
 		Name:         parsed.name,
@@ -88,13 +89,21 @@ func runConductorSlackV2Command(profile string, args []string, stdout, stderr io
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := channelruntime.Run(ctx, req); err != nil {
-		if ctx.Err() != nil {
-			return 0
-		}
-		fmt.Fprintln(stderr, "slack-v2:", channelruntime.KindOf(err))
-		return 1
+		return slackV2FailureExit(err, errors.Is(ctx.Err(), context.Canceled), stderr)
 	}
 	return 0
+}
+
+func slackV2FailureExit(err error, canceled bool, stderr io.Writer) int {
+	if canceled {
+		return 0
+	}
+	cause, terminal := channelruntime.Classification(err)
+	fmt.Fprintln(stderr, "slack-v2:", channelruntime.KindOf(err)+":"+cause)
+	if terminal {
+		return 78
+	}
+	return 75
 }
 
 // loadConductorSlackV2Config is invoked only by the runtime's LoadConfig callback,
@@ -118,7 +127,7 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 	if err != nil {
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
-	for _, value := range []*string{&settings.AppToken, &settings.BotToken, &settings.ChannelID,
+	for _, value := range []*string{&settings.AppToken, &settings.BotToken, &settings.AppID, &settings.TeamID, &settings.ChannelID,
 		&settings.RowInstanceID, &settings.RowBindingToken} {
 		resolved, err := resolveSlackV2Value(*value, lookupEnv)
 		if err != nil {
@@ -139,16 +148,23 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		settings.AllowedUserIDs[i] = resolved
 	}
 	bindingID := selectedProfile + "/" + name
+	key, err := channelspool.KeyFromEnv()
+	if err != nil {
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
 	return channelruntime.Config{
-		ConversationID: bindingID + "/channel-stream",
-		ConductorID:    bindingID,
+		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+"/channel-stream"),
+		ConductorID:    channelspool.AliasFromKey(key, "conductor", bindingID),
 		Profile:        selectedProfile,
 		RowInstanceID:  settings.RowInstanceID,
 		RowBinding:     settings.RowBindingToken,
 		ChannelID:      settings.ChannelID,
+		AppID:          settings.AppID,
+		TeamID:         settings.TeamID,
 		AllowedUserIDs: settings.AllowedUserIDs,
 		AppToken:       settings.AppToken,
 		BotToken:       settings.BotToken,
+		SpoolKey:       key,
 	}, nil
 }
 

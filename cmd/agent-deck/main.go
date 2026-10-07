@@ -338,6 +338,11 @@ func acceptanceOnlyCommandRequested(args []string) bool {
 }
 
 func main() {
+	// The long-running channel runtime does not need CLI telemetry, events, or tmux setup.
+	if profile, args := extractProfileFlag(os.Args[1:]); isConductorSlackV2Command(args) {
+		applyProfileFlag(profile)
+		os.Exit(runConductorSlackV2Command(profile, args[2:], os.Stdout, os.Stderr))
+	}
 	// Establish the body-free diagnostic boundary before any startup probe can
 	// write a warning. The send parser repeats the same narrow raw-argv check so
 	// even malformed values for this opt-in flag receive only the safe result.

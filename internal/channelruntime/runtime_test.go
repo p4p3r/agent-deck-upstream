@@ -7,8 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelreconcile/rowdriver"
@@ -112,6 +112,44 @@ func TestHeldLockStopsBeforeConfigOrAnyRuntimeEffect(t *testing.T) {
 	require.Equal(t, "channelruntime: lease", err.Error())
 }
 
+func TestIdentityOutageIsRetryableButBindingMismatchIsTerminal(t *testing.T) {
+	cfg := rowConfig()
+	r := testRowRequest(t, cfg)
+	d, _ := testRowDeps(&testRowDriver{}, func(context.Context, *channelstream.Runner) error { return nil })
+	d.identity = func(context.Context, string) (slacknetwork.Identity, error) {
+		return slacknetwork.Identity{}, slacknetwork.ErrIdentityUnavailable
+	}
+	err := run(context.Background(), r, d)
+	cause, terminal := Classification(err)
+	if KindOf(err) != string(KindIdentity) || cause != "identity_unavailable" || terminal {
+		t.Fatal("identity outage was classified as terminal")
+	}
+	d.identity = func(context.Context, string) (slacknetwork.Identity, error) {
+		return slacknetwork.Identity{TeamID: "other-team", BotUserID: "bot-user"}, nil
+	}
+	err = run(context.Background(), r, d)
+	cause, terminal = Classification(err)
+	if KindOf(err) != string(KindIdentity) || cause != string(KindIdentity) || !terminal {
+		t.Fatal("identity mismatch was retryable")
+	}
+}
+
+func TestIdentityDeadlineIsRetryable(t *testing.T) {
+	cfg := rowConfig()
+	r := testRowRequest(t, cfg)
+	d, _ := testRowDeps(&testRowDriver{}, func(context.Context, *channelstream.Runner) error { return nil })
+	d.identity = func(context.Context, string) (slacknetwork.Identity, error) {
+		return slacknetwork.Identity{}, context.DeadlineExceeded
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	err := run(ctx, r, d)
+	cause, terminal := Classification(err)
+	if cause != "identity_unavailable" || terminal {
+		t.Fatal("deadline was classified as cancellation or terminal")
+	}
+}
+
 func TestConfigLoadFailureStopsBeforeProvidersAndRuntime(t *testing.T) {
 	cfg := rowConfig()
 	r := testRowRequest(t, cfg)
@@ -170,10 +208,9 @@ func TestRunnerCancellationReapsRowDriverAndReleasesLock(t *testing.T) {
 		return ctx.Err()
 	})
 	err := run(ctx, r, d)
-	require.Equal(t, string(KindRunner), KindOf(err))
+	require.NoError(t, err)
 	require.Equal(t, 1, driver.closed)
 	require.Equal(t, 1, *closed)
-	require.False(t, strings.Contains(err.Error(), cfg.BotToken))
 }
 
 func TestRuntimeRefusesSymlinkedStateDirectoryBeforeReadingManifest(t *testing.T) {

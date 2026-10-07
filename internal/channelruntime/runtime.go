@@ -43,10 +43,13 @@ type Config struct {
 	Profile        string
 	RowInstanceID  string
 	RowBinding     string
+	AppID          string
+	TeamID         string
 	ChannelID      string
 	AllowedUserIDs []string
 	AppToken       string
 	BotToken       string
+	SpoolKey       []byte
 
 	// These fields keep older isolated fixtures source-compatible. A nonempty
 	// value is rejected and never enters the runtime manifest or driver.
@@ -68,16 +71,58 @@ const (
 	KindRunner    Kind = "runner"
 )
 
-type Error struct{ Kind Kind }
+type Error struct {
+	Kind     Kind
+	Cause    string
+	Terminal bool
+}
 
-func (e *Error) Error() string { return "channelruntime: " + string(e.Kind) }
+func (e *Error) Error() string { return "channelruntime: " + fixedKind(e.Kind) }
+
+func fixedKind(kind Kind) string {
+	switch kind {
+	case KindConfig, KindLease, KindIdentity, KindManifest, KindStore, KindAgent, KindUncertain, KindRunner:
+		return string(kind)
+	default:
+		return "runtime_failed"
+	}
+}
 
 func KindOf(err error) string {
 	var e *Error
 	if errors.As(err, &e) {
-		return string(e.Kind)
+		return fixedKind(e.Kind)
 	}
 	return "runtime_failed"
+}
+
+// Classification exposes only fixed, body-free process policy information.
+func Classification(err error) (cause string, terminal bool) {
+	var e *Error
+	if errors.As(err, &e) {
+		if e.Cause != "" {
+			switch e.Cause {
+			case "identity_unavailable", "identity", "store_unavailable", "store", "unknown", "config", "protocol", "link_disabled", "socket", "work", "delivery":
+				return e.Cause, e.Terminal
+			default:
+				return "unknown", false
+			}
+		}
+		switch e.Kind {
+		case KindLease, KindUncertain:
+			return fixedKind(e.Kind), false
+		default:
+			return fixedKind(e.Kind), true
+		}
+	}
+	return "unknown", false
+}
+
+func storeFailure(err error) *Error {
+	if errors.Is(err, channelgateway.ErrStorage) {
+		return &Error{Kind: KindStore, Cause: "store_unavailable", Terminal: false}
+	}
+	return &Error{Kind: KindStore, Cause: "store", Terminal: true}
 }
 
 // agentDriver keeps isolated legacy fixtures source-compatible. Production
@@ -129,55 +174,67 @@ func Run(ctx context.Context, request Request) error {
 
 func run(ctx context.Context, request Request, d dependencies) error {
 	if ctx == nil || request.Name == "" || request.ConductorDir == "" || d.acquire == nil {
-		return &Error{KindConfig}
+		return &Error{Kind: KindConfig}
 	}
 	lease, err := d.acquire(request.Name, request.ConductorDir)
 	if err != nil {
-		return &Error{KindLease}
+		return &Error{Kind: KindLease}
 	}
 	defer lease.Close()
 	if request.LoadConfig == nil || request.Mode != "" && request.Mode != ModeRow || request.ResumeThreadID != "" {
-		return &Error{KindConfig}
+		return &Error{Kind: KindConfig}
 	}
 	cfg, err := request.LoadConfig()
 	if err != nil || !validConfig(cfg) || d.identity == nil || d.rowDriver == nil ||
 		d.run == nil || d.socket == nil || d.sender == nil {
-		return &Error{KindConfig}
+		return &Error{Kind: KindConfig}
 	}
 	identity, err := d.identity(ctx, cfg.BotToken)
-	if err != nil || identity.TeamID == "" || identity.BotUserID == "" {
-		return &Error{KindIdentity}
+	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil
+		}
+		if errors.Is(err, slacknetwork.ErrIdentityUnavailable) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return &Error{Kind: KindIdentity, Cause: "identity_unavailable", Terminal: false}
+		}
+		return &Error{Kind: KindIdentity, Cause: "identity", Terminal: true}
+	}
+	if identity.TeamID == "" || identity.BotUserID == "" || identity.TeamID != cfg.TeamID {
+		return &Error{Kind: KindIdentity}
 	}
 	for _, id := range cfg.AllowedUserIDs {
 		if id == identity.BotUserID {
-			return &Error{KindConfig}
+			return &Error{Kind: KindConfig}
 		}
 	}
 	paths := pathsFor(request.ConductorDir)
 	if err := ensurePrivateDir(filepath.Dir(paths.manifest)); err != nil {
-		return &Error{KindManifest}
+		return &Error{Kind: KindManifest}
+	}
+	if err := migrateV4Runtime(request, cfg, identity, paths); err != nil {
+		return err
 	}
 	manifest, err := loadManifest(paths.manifest)
 	if err != nil {
-		return &Error{KindManifest}
+		return &Error{Kind: KindManifest}
 	}
 	if manifest == nil {
 		manifest = newManifest(request, cfg, identity)
 		if err := saveManifest(paths.manifest, manifest); err != nil {
-			return &Error{KindManifest}
+			return &Error{Kind: KindManifest}
 		}
 	} else if err := manifest.match(request, cfg, identity); err != nil {
-		return &Error{KindManifest}
+		return &Error{Kind: KindManifest}
 	}
 	if err := requireAbsentOrRegular(paths.ledger); err != nil {
-		return &Error{KindStore}
+		return &Error{Kind: KindStore}
 	}
 	if err := requirePrivateSidecars(paths.ledger); err != nil {
-		return &Error{KindStore}
+		return &Error{Kind: KindStore}
 	}
-	store, err := channelgateway.Open(paths.ledger)
+	store, err := channelgateway.Open(paths.ledger, cfg.SpoolKey)
 	if err != nil {
-		return &Error{KindStore}
+		return storeFailure(err)
 	}
 	defer store.Close()
 	conversation := channelgateway.Conversation{
@@ -186,17 +243,17 @@ func run(ctx context.Context, request Request, d dependencies) error {
 		Mode: channelgateway.ChannelStream, AllowedSenders: cfg.AllowedUserIDs,
 	}
 	if err := store.CreateConversation(ctx, conversation); err != nil {
-		return &Error{KindStore}
+		return storeFailure(err)
 	}
 	driver, err := d.rowDriver(cfg)
 	if err != nil || driver == nil {
-		return &Error{KindAgent}
+		return &Error{Kind: KindAgent}
 	}
 	defer driver.Close()
 	runner := &channelstream.Runner{
 		Socket: d.socket(cfg.AppToken),
 		Handler: slackgateway.Handler{Store: store, Config: slackgateway.Config{
-			ConversationID: cfg.ConversationID, TeamID: identity.TeamID,
+			ConversationID: cfg.ConversationID, AppID: cfg.AppID, TeamID: identity.TeamID,
 			ChannelID: cfg.ChannelID, BotUserID: identity.BotUserID,
 			AllowedUserIDs: cfg.AllowedUserIDs,
 		}},
@@ -205,15 +262,25 @@ func run(ctx context.Context, request Request, d dependencies) error {
 			ConversationID: cfg.ConversationID, ChannelID: cfg.ChannelID},
 	}
 	if err := d.run(ctx, runner); err != nil {
-		return &Error{KindRunner}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil
+		}
+		cause, terminal := runner.TerminalCause()
+		if errors.Is(err, channelstream.ErrConfig) || errors.Is(err, channelstream.ErrRunning) {
+			cause, terminal = channelstream.ErrorConfig, true
+		}
+		if terminal {
+			return &Error{Kind: KindRunner, Cause: string(cause), Terminal: true}
+		}
+		return &Error{Kind: KindRunner, Cause: "unknown", Terminal: false}
 	}
 	return nil
 }
 
 func validConfig(c Config) bool {
 	if c.ConversationID == "" || c.ConductorID == "" || c.Profile == "" || c.RowInstanceID == "" ||
-		c.RowBinding == "" || c.ChannelID == "" || c.AppToken == "" || c.BotToken == "" ||
-		len(c.AllowedUserIDs) == 0 || c.CodexExecutable != "" || c.CodexCWD != "" || c.CodexModel != "" {
+		c.RowBinding == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.AppToken == "" || c.BotToken == "" ||
+		len(c.AllowedUserIDs) == 0 || len(c.SpoolKey) != 32 || c.CodexExecutable != "" || c.CodexCWD != "" || c.CodexModel != "" {
 		return false
 	}
 	seen := make(map[string]bool, len(c.AllowedUserIDs))

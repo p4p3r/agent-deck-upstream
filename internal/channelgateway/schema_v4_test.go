@@ -146,7 +146,7 @@ func TestGatewayV4ArchivesOnlyPristineV3(t *testing.T) {
 		t.Fatal("v3 archive bytes changed")
 	}
 	var version int
-	if err := s.db.QueryRow(`SELECT version FROM channelgateway_schema`).Scan(&version); err != nil || version != 4 {
+	if err := s.db.QueryRow(`SELECT version FROM channelgateway_schema`).Scan(&version); err != nil || version != 5 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }

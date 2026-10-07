@@ -76,9 +76,17 @@ func promotePending(tx *writeTx, conversationID string) error {
 // The adapter should acknowledge delivery only after this call succeeds.
 func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 	var out IntakeResult
-	if in.ConversationID == "" || in.EventID == "" || in.MessageID == "" || in.ChannelID == "" || in.SenderID == "" {
+	if in.ConversationID == "" || in.EventID == "" || in.MessageID == "" || in.ChannelID == "" || in.SenderID == "" || len(in.Body) > 32<<10 {
 		return out, ErrInvalid
 	}
+	body := in.Body
+	messageID := in.MessageID
+	threadID := in.ThreadID
+	in.EventID = s.alias("event", in.EventID)
+	in.MessageID = s.alias("message", in.MessageID)
+	in.ThreadID = s.alias("thread", in.ThreadID)
+	in.ChannelID = s.alias("channel", in.ChannelID)
+	in.SenderID = s.alias("sender", in.SenderID)
 	err := s.write(ctx, func(tx *writeTx) error {
 		c, err := loadConversation(tx, in.ConversationID)
 		if err != nil {
@@ -108,6 +116,11 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return ErrStorage
 		}
+		if c.mode == ThreadSegments {
+			if s.saveThreadID(messageID) != nil || s.saveThreadID(threadID) != nil {
+				return ErrStorage
+			}
+		}
 
 		out.Disposition = Ignored
 		if c.mode == ChannelStream {
@@ -119,7 +132,7 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 			// happens to equal an existing segment's root thread ID.
 			root := in.ThreadID
 			if root == "" {
-				root = in.MessageID
+				root = s.alias("thread", messageID)
 			}
 			var segmentID, state string
 			err = tx.row(`SELECT id,state FROM segments WHERE conversation_id=? AND root_thread_id=?`, in.ConversationID, root).
@@ -177,16 +190,19 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 			}
 		}
 
-		var body any
+		var contentRef string
 		if out.Disposition == Accepted {
-			body = in.Body
+			if err := s.saveInbound(in.EventID, body); err != nil {
+				return err
+			}
+			contentRef = in.EventID
 		}
 		var sid any
 		if out.SegmentID != "" {
 			sid = out.SegmentID
 		}
-		if _, err := tx.exec(`INSERT INTO inbound_events(conversation_id,event_id,message_id,thread_id,segment_id,body,disposition,pointer_thread_id)
-			VALUES(?,?,?,?,?,?,?,?)`, in.ConversationID, in.EventID, in.MessageID, in.ThreadID, sid, body, out.Disposition, out.PointerThreadID); err != nil {
+		if _, err := tx.exec(`INSERT INTO inbound_events(conversation_id,event_id,message_id,thread_id,segment_id,content_ref,disposition,pointer_thread_id,seen_at)
+			VALUES(?,?,?,?,?,?,?,?,?)`, in.ConversationID, in.EventID, in.MessageID, in.ThreadID, sid, contentRef, out.Disposition, out.PointerThreadID, s.now().Unix()); err != nil {
 			return err
 		}
 		if err := promotePending(tx, in.ConversationID); err != nil {
@@ -199,12 +215,15 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 		}
 		return nil
 	})
+	if err == nil && out.PointerThreadID != "" {
+		out.PointerThreadID, err = s.exactThread(out.PointerThreadID)
+	}
 	return out, err
 }
 
 func loadActiveTurn(tx *writeTx, conversationID string) (*Turn, error) {
 	var t Turn
-	err := tx.row(`SELECT t.id,t.conversation_id,t.number,t.segment_id,e.event_id,e.message_id,e.thread_id,e.body,
+	err := tx.row(`SELECT t.id,t.conversation_id,t.number,t.segment_id,e.event_id,e.message_id,e.thread_id,e.content_ref,
 		t.acceptance_id,t.attempt_id,t.attempt_state,t.baseline_turn_id,t.external_turn_id,
 		t.row_operation_id,t.operation_state,t.accepted_codex_session_id,t.accepted_turn_generation,t.terminal_error
 		FROM turns t JOIN inbound_events e ON e.ordinal=t.event_ordinal
@@ -247,7 +266,7 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 		}
 		var ordinal int64
 		var t Turn
-		err = tx.row(`SELECT ordinal,event_id,message_id,thread_id,body FROM inbound_events
+		err = tx.row(`SELECT ordinal,event_id,message_id,thread_id,content_ref FROM inbound_events
 			WHERE conversation_id=? AND segment_id=? AND disposition='accepted' AND turn_id IS NULL
 			ORDER BY ordinal LIMIT 1`, conversationID, c.active).
 			Scan(&ordinal, &t.EventID, &t.MessageID, &t.ThreadID, &t.Body)
@@ -275,7 +294,24 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 		out = &t
 		return nil
 	})
-	return out, err
+	if err != nil || out == nil {
+		return out, err
+	}
+	if out.Body == "" {
+		return nil, ErrStorage
+	}
+	body, err := s.inboundBody(out.Body)
+	if err != nil {
+		return nil, err
+	}
+	out.Body = body
+	if out.ThreadID != "" {
+		out.ThreadID, err = s.exactThread(out.ThreadID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // AcceptTurn records the driver's stable external acceptance ID. A different
@@ -314,7 +350,7 @@ func (s *Store) AcceptTurn(ctx context.Context, turnID, acceptanceID string) err
 
 func loadTurnOutbox(tx *writeTx, turnID string) (*OutboxItem, error) {
 	var o OutboxItem
-	err := tx.row(`SELECT id,conversation_id,turn_id,kind,thread_id,body,state,delivery_attempt_id,external_message_id FROM outbox WHERE turn_id=?`, turnID).
+	err := tx.row(`SELECT id,conversation_id,turn_id,kind,thread_id,content_ref,state,delivery_attempt_id,external_message_id FROM outbox WHERE turn_id=?`, turnID).
 		Scan(&o.ID, &o.ConversationID, &o.TurnID, &o.Kind, &o.ThreadID, &o.Body, &o.State, &o.DeliveryAttemptID, &o.ExternalMessageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -357,15 +393,22 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 			if err != nil {
 				return err
 			}
-			if out == nil && replyBody != "" || out != nil && out.Body != replyBody {
+			if out == nil && replyBody != "" {
 				return ErrConflict
+			}
+			if out != nil {
+				got, err := s.outboundBody(out.ID)
+				if err != nil || got != replyBody {
+					return ErrConflict
+				}
+				out.Body = got
 			}
 			return nil
 		}
 		if status != "active" {
 			return ErrConflict
 		}
-		if _, err := tx.exec(`UPDATE turns SET status='completed' WHERE id=?`, turnID); err != nil {
+		if _, err := tx.exec(`UPDATE turns SET status='completed',completed_at=? WHERE id=?`, s.now().Unix(), turnID); err != nil {
 			return err
 		}
 		if replyBody != "" {
@@ -375,13 +418,19 @@ func (s *Store) CompleteTurn(ctx context.Context, turnID, acceptanceID, replyBod
 			}
 			out = &OutboxItem{ID: uuid.NewString(), ConversationID: conversationID, TurnID: turnID,
 				Kind: "reply", ThreadID: threadID, Body: replyBody, State: PendingDelivery}
-			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,body,state)
-				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, out.Body); err != nil {
+			if err := s.saveOutbound(out.ID, replyBody); err != nil {
+				return err
+			}
+			if _, err := tx.exec(`INSERT INTO outbox(id,conversation_id,turn_id,kind,thread_id,content_ref,state)
+				VALUES(?,?,?,?,?,?,'pending')`, out.ID, conversationID, turnID, out.Kind, out.ThreadID, s.alias("outbox", out.ID)); err != nil {
 				return err
 			}
 		}
 		return promotePending(tx, conversationID)
 	})
+	if err == nil && out != nil && out.ThreadID != "" {
+		out.ThreadID, err = s.exactThread(out.ThreadID)
+	}
 	return out, err
 }
 
@@ -391,7 +440,7 @@ func (s *Store) PendingOutbox(ctx context.Context, conversationID string, limit 
 	if conversationID == "" || limit <= 0 {
 		return nil, ErrInvalid
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,body,state,delivery_attempt_id,external_message_id
+	rows, err := s.db.QueryContext(ctx, `SELECT id,conversation_id,turn_id,kind,thread_id,content_ref,state,delivery_attempt_id,external_message_id
 		FROM outbox WHERE conversation_id=? AND state='pending' ORDER BY ordinal LIMIT ?`, conversationID, limit)
 	if err != nil {
 		return nil, ErrStorage
@@ -407,6 +456,23 @@ func (s *Store) PendingOutbox(ctx context.Context, conversationID string, limit 
 	}
 	if rows.Err() != nil {
 		return nil, ErrStorage
+	}
+	for i := range items {
+		if items[i].Kind == "reply" {
+			body, err := s.outboundBody(items[i].ID)
+			if err != nil {
+				return nil, err
+			}
+			items[i].Body = body
+		} else {
+			items[i].Body = ""
+		}
+		if items[i].ThreadID != "" {
+			items[i].ThreadID, err = s.exactThread(items[i].ThreadID)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return items, nil
 }
@@ -427,7 +493,7 @@ func (s *Store) MarkDelivered(ctx context.Context, itemID, externalMessageID str
 			return ErrStorage
 		}
 		if state == "delivered" {
-			if existing == externalMessageID {
+			if existing == s.alias("providermessage", externalMessageID) {
 				return nil
 			}
 			return ErrConflict

@@ -26,21 +26,22 @@ const (
 )
 
 var (
-	ErrConfig        = errors.New("slacknetwork: invalid configuration")
-	ErrOpen          = errors.New("slacknetwork: connection open failed")
-	ErrPost          = errors.New("slacknetwork: post outcome uncertain")
-	ErrProtocol      = errors.New("slacknetwork: invalid socket protocol")
-	ErrDisconnected  = errors.New("slacknetwork: socket disconnected")
-	ErrReconnect     = errors.New("slacknetwork: new socket connection required")
-	ErrCanceled      = errors.New("slacknetwork: operation canceled")
-	ErrCallback      = errors.New("slacknetwork: envelope callback failed")
-	ErrAck           = errors.New("slacknetwork: acknowledgment failed")
-	ErrIdentity      = errors.New("slacknetwork: bot identity verification failed")
-	ErrOpenTransient = openFailure("transient")
-	ErrOpenAuth      = openFailure("authentication denied")
-	ErrOpenConfig    = openFailure("configuration denied")
-	ErrOpenProtocol  = openFailure("invalid response")
-	ErrOpenUnknown   = openFailure("unknown provider denial")
+	ErrConfig              = errors.New("slacknetwork: invalid configuration")
+	ErrOpen                = errors.New("slacknetwork: connection open failed")
+	ErrPost                = errors.New("slacknetwork: post outcome uncertain")
+	ErrProtocol            = errors.New("slacknetwork: invalid socket protocol")
+	ErrDisconnected        = errors.New("slacknetwork: socket disconnected")
+	ErrReconnect           = errors.New("slacknetwork: new socket connection required")
+	ErrCanceled            = errors.New("slacknetwork: operation canceled")
+	ErrCallback            = errors.New("slacknetwork: envelope callback failed")
+	ErrAck                 = errors.New("slacknetwork: acknowledgment failed")
+	ErrIdentity            = errors.New("slacknetwork: bot identity verification failed")
+	ErrIdentityUnavailable = errors.New("slacknetwork: bot identity temporarily unavailable")
+	ErrOpenTransient       = openFailure("transient")
+	ErrOpenAuth            = openFailure("authentication denied")
+	ErrOpenConfig          = openFailure("configuration denied")
+	ErrOpenProtocol        = openFailure("invalid response")
+	ErrOpenUnknown         = openFailure("unknown provider denial")
 )
 
 // Open failures carry only a fixed classification. Every specific class also
@@ -209,6 +210,16 @@ func (s *Sender) VerifyBotIdentity(ctx context.Context) (Identity, error) {
 	status, obj, err := requestLimitedJSON(ctx, s.httpClient, endpoint, s.botToken)
 	if errors.Is(err, ErrCanceled) {
 		return zero, ErrCanceled
+	}
+	if err != nil && !errors.Is(err, ErrProtocol) {
+		return zero, ErrIdentityUnavailable
+	}
+	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+		return zero, ErrIdentityUnavailable
+	}
+	switch stringField(obj, "error") {
+	case "ratelimited", "internal_error", "service_unavailable", "team_added_to_org":
+		return zero, ErrIdentityUnavailable
 	}
 	if err != nil || status != http.StatusOK || !boolField(obj, "ok") {
 		return zero, ErrIdentity

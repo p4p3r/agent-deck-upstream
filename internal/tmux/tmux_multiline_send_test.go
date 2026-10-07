@@ -51,6 +51,7 @@ import (
 // reads the payload from stdin rather than argv).
 type tmuxCall struct {
 	argv  []string
+	env   []string
 	stdin *bytes.Buffer
 }
 
@@ -66,18 +67,19 @@ func recordTransport(t *testing.T) *[]*tmuxCall {
 	var calls []*tmuxCall
 	keySenderExec = func(socketName string, args ...string) *exec.Cmd {
 		call := &tmuxCall{argv: append([]string(nil), args...), stdin: &bytes.Buffer{}}
-		mu.Lock()
-		calls = append(calls, call)
-		mu.Unlock()
+		cmd := exec.Command("true")
 		if len(args) > 0 && args[0] == "load-buffer" {
 			// cat copies the staged payload from stdin (set by pasteToTarget
 			// after we return) into our buffer. cmd.Wait waits for that copy,
 			// so the buffer is complete once runSendKeysBounded returns.
-			cmd := exec.Command("cat")
+			cmd = exec.Command("cat")
 			cmd.Stdout = call.stdin
-			return cmd
 		}
-		return exec.Command("true")
+		call.env = cmd.Environ()
+		mu.Lock()
+		calls = append(calls, call)
+		mu.Unlock()
+		return cmd
 	}
 	t.Cleanup(func() { keySenderExec = original })
 	return &calls

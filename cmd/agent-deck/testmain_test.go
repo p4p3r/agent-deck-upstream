@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -66,6 +68,7 @@ func runTestMain(m *testing.M) int {
 
 	// Force _test profile for all tests in this package
 	os.Setenv("AGENTDECK_PROFILE", "_test")
+	os.Setenv("SLACK_DECK_SPOOL_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32)))
 
 	// Run tests
 	code := m.Run()

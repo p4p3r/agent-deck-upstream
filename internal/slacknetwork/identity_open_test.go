@@ -82,7 +82,11 @@ func TestVerifyBotIdentityRejectsAmbiguousResponsesAndRedirect(t *testing.T) {
 				return fakeResponse(tc.status, tc.body, tc.header), nil
 			})}
 			identity, err := sender.VerifyBotIdentity(context.Background())
-			if !errors.Is(err, ErrIdentity) || calls != 1 || identity != (Identity{}) {
+			want := ErrIdentity
+			if tc.status == http.StatusServiceUnavailable {
+				want = ErrIdentityUnavailable
+			}
+			if !errors.Is(err, want) || calls != 1 || identity != (Identity{}) {
 				t.Fatalf("identity=%+v calls=%d error=%v; want private identity failure", identity, calls, err)
 			}
 			noSecrets(t, err)

@@ -1,10 +1,12 @@
 package slackgateway
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ const (
 	testConversation = "conversation"
 	testChannel      = "C-bound"
 	testTeam         = "T-bound"
+	testApp          = "A-bound"
 	testUser         = "U-allowed"
 	testBot          = "U-bot"
 )
@@ -37,7 +40,7 @@ func slackStore(t *testing.T, mode channelgateway.Mode) (*channelgateway.Store, 
 
 func slackHandler(s *channelgateway.Store) Handler {
 	return Handler{Store: s, Config: Config{
-		ConversationID: testConversation, TeamID: testTeam, ChannelID: testChannel,
+		ConversationID: testConversation, AppID: testApp, TeamID: testTeam, ChannelID: testChannel,
 		BotUserID: testBot, AllowedUserIDs: []string{testUser},
 	}}
 }
@@ -46,9 +49,9 @@ func eventEnvelope(envelopeID, eventID, body string) map[string]any {
 	return map[string]any{
 		"type": "events_api", "envelope_id": envelopeID, "accepts_response_payload": false,
 		"payload": map[string]any{
-			"type": "event_callback", "team_id": testTeam, "event_id": eventID,
+			"type": "event_callback", "team_id": testTeam, "api_app_id": testApp, "event_id": eventID,
 			"event": map[string]any{
-				"type": "message", "channel": testChannel, "user": testUser,
+				"type": "message", "channel_type": "group", "channel": testChannel, "user": testUser,
 				"ts": "1700000000.000001", "text": body,
 			},
 		},
@@ -134,14 +137,56 @@ func TestHandleOnlyIngestsAndNeverReservesOrStartsAgentTurn(t *testing.T) {
 	require.Empty(t, turn.AcceptanceID)
 }
 
+func TestDecodedTextAdmissionIsInclusiveAt32KiB(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		escaped bool
+		accept  bool
+	}{
+		{"exact", strings.Repeat("a", MaxBodyBytes), false, true},
+		{"escaped exact", strings.Repeat("a", MaxBodyBytes), true, true},
+		{"one byte over", strings.Repeat("a", MaxBodyBytes+1), false, false},
+		{"unicode over", strings.Repeat("a", MaxBodyBytes-1) + "é", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, path := slackStore(t, channelgateway.ChannelStream)
+			raw := encodeEnvelope(t, eventEnvelope("size-envelope", "size-event", tc.body))
+			if tc.escaped {
+				raw = bytes.Replace(raw, []byte(`"text":"`+tc.body+`"`), []byte(`"text":"`+strings.Repeat(`\u0061`, MaxBodyBytes)+`"`), 1)
+			}
+			acked := false
+			result, err := slackHandler(s).Handle(context.Background(), raw, func(context.Context, []byte) error { acked = true; return nil })
+			if tc.accept {
+				if err != nil || !acked || result.Intake.Disposition != channelgateway.Accepted {
+					t.Fatal("inclusive decoded-text boundary rejected")
+				}
+				turn, err := s.NextTurn(context.Background(), testConversation)
+				if err != nil || turn == nil || turn.Body != tc.body {
+					t.Fatal("accepted text changed")
+				}
+				ledger, err := os.ReadFile(path)
+				if err != nil || bytes.Contains(ledger, []byte(tc.body)) || bytes.Contains(ledger, []byte(testChannel)) {
+					t.Fatal("ledger disclosed accepted content or exact channel")
+				}
+			} else if !errors.Is(err, ErrEnvelope) || acked {
+				t.Fatal("oversize decoded text was accepted")
+			}
+		})
+	}
+}
+
 func TestHandleValidIneligibleEventsAreAckedWithoutIntake(t *testing.T) {
 	cases := map[string]func(map[string]any){
-		"wrong team":    func(v map[string]any) { p, _ := envelopeFields(v); p["team_id"] = "T-other" },
-		"wrong channel": func(v map[string]any) { _, e := envelopeFields(v); e["channel"] = "C-other" },
-		"wrong user":    func(v map[string]any) { _, e := envelopeFields(v); e["user"] = "U-other" },
-		"self":          func(v map[string]any) { _, e := envelopeFields(v); e["user"] = testBot },
-		"bot":           func(v map[string]any) { _, e := envelopeFields(v); e["bot_id"] = "B-bot" },
-		"bot profile":   func(v map[string]any) { _, e := envelopeFields(v); e["bot_profile"] = map[string]any{"id": "B-bot"} },
+		"wrong app":      func(v map[string]any) { p, _ := envelopeFields(v); p["api_app_id"] = "A-other" },
+		"wrong team":     func(v map[string]any) { p, _ := envelopeFields(v); p["team_id"] = "T-other" },
+		"public channel": func(v map[string]any) { _, e := envelopeFields(v); e["channel_type"] = "channel" },
+		"direct message": func(v map[string]any) { _, e := envelopeFields(v); e["channel_type"] = "im" },
+		"wrong channel":  func(v map[string]any) { _, e := envelopeFields(v); e["channel"] = "C-other" },
+		"wrong user":     func(v map[string]any) { _, e := envelopeFields(v); e["user"] = "U-other" },
+		"self":           func(v map[string]any) { _, e := envelopeFields(v); e["user"] = testBot },
+		"bot":            func(v map[string]any) { _, e := envelopeFields(v); e["bot_id"] = "B-bot" },
+		"bot profile":    func(v map[string]any) { _, e := envelopeFields(v); e["bot_profile"] = map[string]any{"id": "B-bot"} },
 		"files with text": func(v map[string]any) {
 			_, e := envelopeFields(v)
 			e["files"] = []any{map[string]any{"id": "F-private"}}
@@ -150,6 +195,8 @@ func TestHandleValidIneligibleEventsAreAckedWithoutIntake(t *testing.T) {
 			_, e := envelopeFields(v)
 			e["attachments"] = []any{map[string]any{"text": "private attachment"}}
 		},
+		"empty attachments": func(v map[string]any) { _, e := envelopeFields(v); e["attachments"] = []any{} },
+		"empty files":       func(v map[string]any) { _, e := envelopeFields(v); e["files"] = []any{} },
 		"subtype":           func(v map[string]any) { _, e := envelopeFields(v); e["subtype"] = "message_changed" },
 		"thread reply":      func(v map[string]any) { _, e := envelopeFields(v); e["thread_ts"] = "1699999999.000001" },
 		"unsupported event": func(v map[string]any) { _, e := envelopeFields(v); e["type"] = "reaction_added" },

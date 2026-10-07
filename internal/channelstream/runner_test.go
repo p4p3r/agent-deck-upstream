@@ -24,6 +24,7 @@ const (
 	runConversation = "conversation"
 	runChannel      = "C-bound"
 	runTeam         = "T-bound"
+	runApp          = "A-bound"
 	runUser         = "U-allowed"
 	runBot          = "U-bot"
 	runPrivate      = "private-prompt-marker"
@@ -373,7 +374,7 @@ func newRunnerFixture(t *testing.T, steps ...error) *runnerFixture {
 	}))
 	socket, driver, sender, clock := newFakeSocket(steps...), newFakeDriver(), newFakeSender(), newManualClock()
 	handler := slackgateway.Handler{Store: store, Config: slackgateway.Config{
-		ConversationID: runConversation, TeamID: runTeam, ChannelID: runChannel, BotUserID: runBot, AllowedUserIDs: []string{runUser},
+		ConversationID: runConversation, AppID: runApp, TeamID: runTeam, ChannelID: runChannel, BotUserID: runBot, AllowedUserIDs: []string{runUser},
 	}}
 	r := &Runner{Socket: socket, Handler: handler, Worker: &channelreconcile.Worker{Store: store, RowDriver: driver, Driver: driver},
 		Delivery:     &slackgateway.DeliveryWorker{Store: store, Sender: sender, ConversationID: runConversation, ChannelID: runChannel},
@@ -401,8 +402,8 @@ func eventFrame(t *testing.T, envelope, event, body string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"type": "events_api", "envelope_id": envelope, "accepts_response_payload": false,
-		"payload": map[string]any{"type": "event_callback", "team_id": runTeam, "event_id": event,
-			"event": map[string]any{"type": "message", "channel": runChannel, "user": runUser, "ts": event + ".000001", "text": body}},
+		"payload": map[string]any{"type": "event_callback", "team_id": runTeam, "api_app_id": runApp, "event_id": event,
+			"event": map[string]any{"type": "message", "channel_type": "group", "channel": runChannel, "user": runUser, "ts": event + ".000001", "text": body}},
 	})
 	require.NoError(t, err)
 	return raw
@@ -452,7 +453,7 @@ func TestRunnerNeverStartsBeforeDurableIngestCommit(t *testing.T) {
 	<-started
 	initial.fire()
 	var persisted int
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM inbound_events WHERE event_id='event-1'`).Scan(&persisted))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM inbound_events`).Scan(&persisted))
 	require.Zero(t, persisted, "event became visible before Ingest commit")
 	starts, _ := f.driver.counts()
 	require.Zero(t, starts, "turn started before Ingest committed")
@@ -488,7 +489,7 @@ func TestRunnerMayProcessCommittedEventWhileAckBlockedThenFails(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 	var persisted int
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM inbound_events WHERE event_id='event-1'`).Scan(&persisted))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM inbound_events`).Scan(&persisted))
 	require.Equal(t, 1, persisted, "ack callback ran before durable intake")
 	initial.fire() // polling may process the committed event before ack returns
 	f.driver.waitStart(t, 1)
@@ -652,6 +653,9 @@ func TestRunnerPumpFatalOutranksConcurrentTransientOpen(t *testing.T) {
 		require.ErrorIs(t, err, ErrFatal)
 		require.Equal(t, ErrorConfig, f.runner.Status().LastError,
 			"transient socket class must not overwrite fatal pump class")
+		cause, terminal := f.runner.TerminalCause()
+		require.True(t, terminal)
+		require.Equal(t, ErrorConfig, cause)
 		require.Equal(t, 1, f.socket.count())
 	case <-time.After(4 * time.Second):
 		t.Fatal("fatal pump did not terminate socket")
@@ -666,6 +670,27 @@ func TestRunnerTerminalStatusIsStickyAgainstTransientSocketClass(t *testing.T) {
 			f.runner.setError(ErrorSocket, false)
 			require.Equal(t, class, f.runner.Status().LastError)
 		})
+	}
+}
+
+func TestRunnerTransientStatusHasNoTerminalCause(t *testing.T) {
+	f := newRunnerFixture(t)
+	f.runner.setError(ErrorSocket, false)
+	cause, terminal := f.runner.TerminalCause()
+	require.False(t, terminal)
+	require.Equal(t, ErrorSocket, cause)
+}
+
+func TestRunnerDeadlineIsRetryable(t *testing.T) {
+	f := newRunnerFixture(t)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := f.runner.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("deadline was treated as cancellation")
+	}
+	_, terminal := f.runner.TerminalCause()
+	if terminal {
+		t.Fatal("deadline acquired a terminal safety cause")
 	}
 }
 
@@ -685,6 +710,9 @@ func TestRunnerTerminalOpenClassStopsOnce(t *testing.T) {
 			err := f.runner.Run(context.Background())
 			require.ErrorIs(t, err, ErrFatal)
 			require.Equal(t, tc.class, f.runner.Status().LastError)
+			cause, terminal := f.runner.TerminalCause()
+			require.True(t, terminal)
+			require.Equal(t, tc.class, cause)
 			require.Equal(t, 1, f.socket.count(), "terminal open class must not reconnect")
 			require.NotContains(t, err.Error(), runPrivate)
 		})

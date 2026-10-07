@@ -5046,16 +5046,6 @@ func retryAndRequireStructuredCodexAcceptedTurn(
 	return receipt, requireStructuredCodexAcceptedTurn(inst, jsonOutput, wait, receipt)
 }
 
-// codexTurnAdvancedPastFence reports whether the exact rollout has started a
-// turn after the acceptance fence was captured.
-func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFence) bool {
-	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
-		return false
-	}
-	generation, err := inst.LatestCodexTurnGeneration()
-	return err == nil && generation != "" && generation != fence.priorTurnGeneration
-}
-
 func captureCodexAcceptanceFence(inst *session.Instance) codexAcceptanceFence {
 	if inst == nil || !session.IsCodexCompatible(inst.Tool) {
 		return codexAcceptanceFence{}

@@ -107,7 +107,7 @@ func TestChannelStreamTopLevelAndSerializedTurns(t *testing.T) {
 	first, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
 	require.Equal(t, int64(1), first.Number)
-	require.Equal(t, "first", first.EventID)
+	require.Equal(t, s.alias("event", "first"), first.EventID)
 	again, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
 	require.Equal(t, first.ID, again.ID)
@@ -121,7 +121,7 @@ func TestChannelStreamTopLevelAndSerializedTurns(t *testing.T) {
 	second, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
 	require.Equal(t, int64(2), second.Number)
-	require.Equal(t, "second", second.EventID)
+	require.Equal(t, s.alias("event", "second"), second.EventID)
 	complete(t, s, second, "")
 	none, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
@@ -147,11 +147,11 @@ func TestUnmentionedTopLevelDoesNotReuseOwnedThreadRoot(t *testing.T) {
 
 	first, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
-	require.Equal(t, "mention", first.EventID)
+	require.Equal(t, s.alias("event", "mention"), first.EventID)
 	complete(t, s, first, "")
 	second, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
-	require.Equal(t, "reply", second.EventID)
+	require.Equal(t, s.alias("event", "reply"), second.EventID)
 }
 
 func TestThreadSegmentsPendingBoundaryAndSupersededPointer(t *testing.T) {
@@ -190,12 +190,12 @@ func TestThreadSegmentsPendingBoundaryAndSupersededPointer(t *testing.T) {
 	complete(t, s, first, "first-response")
 	oldQueued, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
-	require.Equal(t, "already-accepted", oldQueued.EventID)
+	require.Equal(t, s.alias("event", "already-accepted"), oldQueued.EventID)
 	require.Equal(t, int64(2), oldQueued.Number)
 	complete(t, s, oldQueued, "")
 	newTurn, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
-	require.Equal(t, "new-mention", newTurn.EventID)
+	require.Equal(t, s.alias("event", "new-mention"), newTurn.EventID)
 	require.Equal(t, int64(3), newTurn.Number)
 	require.Equal(t, newSegment, newTurn.SegmentID)
 
@@ -210,7 +210,7 @@ func TestThreadSegmentsPendingBoundaryAndSupersededPointer(t *testing.T) {
 	complete(t, s, newTurn, "new-response")
 	pendingReply, err := s.NextTurn(ctx, "conversation")
 	require.NoError(t, err)
-	require.Equal(t, "pending-reply", pendingReply.EventID)
+	require.Equal(t, s.alias("event", "pending-reply"), pendingReply.EventID)
 	require.Equal(t, int64(4), pendingReply.Number)
 }
 

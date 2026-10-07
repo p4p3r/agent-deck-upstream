@@ -2,6 +2,7 @@ package channelruntime
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,10 +10,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 )
 
 const (
-	manifestVersion = 2
+	manifestVersion = 3
 	phasePrepared   = "prepared"
 	phaseReady      = "ready"
 )
@@ -37,6 +41,7 @@ type manifest struct {
 	ConversationID string   `json:"conversation_id"`
 	ConductorID    string   `json:"conductor_id"`
 	TeamID         string   `json:"team_id"`
+	AppID          string   `json:"app_id"`
 	BotUserID      string   `json:"bot_user_id"`
 	ChannelID      string   `json:"channel_id"`
 	AllowedUserIDs []string `json:"allowed_user_ids"`
@@ -49,27 +54,118 @@ type manifest struct {
 }
 
 func newManifest(r Request, c Config, identity struct{ TeamID, BotUserID string }) *manifest {
+	alias := func(domain, value string) string { return channelspool.AliasFromKey(c.SpoolKey, domain, value) }
+	users := canonicalUsers(c.AllowedUserIDs)
+	for i := range users {
+		users[i] = alias("sender", users[i])
+	}
+	slices.Sort(users)
 	return &manifest{
-		Version: manifestVersion, Profile: c.Profile, RowInstanceID: c.RowInstanceID,
-		RowBinding: c.RowBinding, ConversationID: c.ConversationID,
-		ConductorID: c.ConductorID, TeamID: identity.TeamID, BotUserID: identity.BotUserID,
-		ChannelID: c.ChannelID, AllowedUserIDs: canonicalUsers(c.AllowedUserIDs),
+		Version: manifestVersion, Profile: alias("profile", c.Profile), RowInstanceID: alias("row", c.RowInstanceID),
+		RowBinding: alias("rowbinding", c.RowBinding), ConversationID: alias("conversation", c.ConversationID),
+		ConductorID: alias("conductor", c.ConductorID), TeamID: alias("team", identity.TeamID),
+		AppID: alias("app", c.AppID), BotUserID: alias("bot", identity.BotUserID),
+		ChannelID: alias("channel", c.ChannelID), AllowedUserIDs: users,
 	}
 }
 
 func (m *manifest) match(r Request, c Config, identity struct{ TeamID, BotUserID string }) error {
-	if m == nil || m.Version != manifestVersion || m.Profile != c.Profile ||
-		m.RowInstanceID != c.RowInstanceID || m.RowBinding != c.RowBinding ||
-		m.ConversationID != c.ConversationID ||
-		m.ConductorID != c.ConductorID || m.TeamID != identity.TeamID || m.BotUserID != identity.BotUserID ||
-		m.ChannelID != c.ChannelID ||
-		!slices.Equal(m.AllowedUserIDs, canonicalUsers(c.AllowedUserIDs)) {
-		return &Error{KindManifest}
+	want := newManifest(r, c, identity)
+	if m == nil || m.Version != manifestVersion || m.Profile != want.Profile ||
+		m.RowInstanceID != want.RowInstanceID || m.RowBinding != want.RowBinding ||
+		m.ConversationID != want.ConversationID || m.ConductorID != want.ConductorID ||
+		m.TeamID != want.TeamID || m.AppID != want.AppID || m.BotUserID != want.BotUserID ||
+		m.ChannelID != want.ChannelID || !slices.Equal(m.AllowedUserIDs, want.AllowedUserIDs) {
+		return &Error{Kind: KindManifest}
 	}
 	if r.Mode != "" && r.Mode != ModeRow || r.ResumeThreadID != "" {
-		return &Error{KindManifest}
+		return &Error{Kind: KindManifest}
 	}
 	return nil
+}
+
+func (m *manifest) matchV2(r Request, c Config, identity struct{ TeamID, BotUserID string }) bool {
+	oldID := c.Profile + "/" + r.Name
+	return m != nil && m.Version == 2 && m.Profile == c.Profile &&
+		m.RowInstanceID == c.RowInstanceID && m.RowBinding == c.RowBinding &&
+		m.ConversationID == oldID+"/channel-stream" && m.ConductorID == oldID &&
+		m.TeamID == identity.TeamID && m.BotUserID == identity.BotUserID &&
+		m.ChannelID == c.ChannelID && slices.Equal(m.AllowedUserIDs, canonicalUsers(c.AllowedUserIDs))
+}
+
+// migrateV4Runtime runs under the conductor singleton lock. The archive is the
+// packet's explicit raw-evidence exception: its v4 manifest/database/sidecars
+// are byte-identical and owner-only, and must be included in privacy scans.
+func migrateV4Runtime(r Request, c Config, identity struct{ TeamID, BotUserID string }, paths runtimePaths) error {
+	archiveManifest := filepath.Join(channelgateway.V4ArchiveDir(paths.ledger), "manifest.json")
+	live, err := loadManifest(paths.manifest)
+	if err != nil {
+		return &Error{Kind: KindManifest}
+	}
+	if live != nil && live.Version != 2 {
+		return nil
+	}
+	old := live
+	if old == nil {
+		if _, err := os.Lstat(archiveManifest); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		old, err = loadManifest(archiveManifest)
+		if err != nil {
+			return &Error{Kind: KindManifest}
+		}
+	}
+	if !old.matchV2(r, c, identity) {
+		return &Error{Kind: KindManifest}
+	}
+	if live != nil {
+		binding := channelgateway.V4Binding{
+			OldConversationID: old.ConversationID, OldConductorID: old.ConductorID,
+			NewConversation: channelgateway.Conversation{
+				ID: c.ConversationID, ChannelID: c.ChannelID, ConductorID: c.ConductorID,
+				RowInstanceID: c.RowInstanceID, RowBinding: c.RowBinding,
+				Mode: channelgateway.ChannelStream, AllowedSenders: c.AllowedUserIDs,
+			},
+		}
+		if channelgateway.MigrateV4(context.Background(), paths.ledger, binding, c.SpoolKey) != nil {
+			return &Error{Kind: KindStore}
+		}
+		if _, err := os.Lstat(archiveManifest); err == nil {
+			return &Error{Kind: KindManifest}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return &Error{Kind: KindManifest}
+		}
+		if os.Rename(paths.manifest, archiveManifest) != nil {
+			return &Error{Kind: KindManifest}
+		}
+		if err := syncManifestDir(filepath.Dir(paths.manifest)); err != nil {
+			return &Error{Kind: KindManifest}
+		}
+		if err := syncManifestDir(filepath.Dir(archiveManifest)); err != nil {
+			return &Error{Kind: KindManifest}
+		}
+	} else {
+		// The old manifest was already moved; only a committed v5 ledger may
+		// authorize reconstruction of its aliased successor.
+		store, err := channelgateway.Open(paths.ledger, c.SpoolKey)
+		if err != nil {
+			return &Error{Kind: KindStore}
+		}
+		_ = store.Close()
+	}
+	if saveManifest(paths.manifest, newManifest(r, c, identity)) != nil {
+		return &Error{Kind: KindManifest}
+	}
+	return nil
+}
+
+func syncManifestDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func canonicalUsers(in []string) []string {

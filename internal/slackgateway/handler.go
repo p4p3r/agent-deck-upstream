@@ -15,7 +15,7 @@ import (
 
 const (
 	MaxEnvelopeBytes = 256 << 10
-	MaxBodyBytes     = 64 << 10
+	MaxBodyBytes     = 32 << 10
 	maxJSONDepth     = 32
 )
 
@@ -28,6 +28,7 @@ var (
 // Config contains opaque Slack IDs, never display names or credentials.
 type Config struct {
 	ConversationID string
+	AppID          string
 	TeamID         string
 	ChannelID      string
 	BotUserID      string
@@ -45,7 +46,7 @@ type HandleResult struct {
 }
 
 func validConfig(c Config) bool {
-	if c.ConversationID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 {
+	if c.ConversationID == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 {
 		return false
 	}
 	seen := make(map[string]bool, len(c.AllowedUserIDs))
@@ -164,6 +165,7 @@ func populatedArray(obj map[string]json.RawMessage, key string) (bool, error) {
 
 type parsed struct {
 	envelopeID string
+	appID      string
 	eventID    string
 	teamID     string
 	channelID  string
@@ -232,6 +234,9 @@ func parse(raw []byte) (parsed, error) {
 	if p.eventID, _, err = field(payload, "event_id", true); err != nil {
 		return p, err
 	}
+	if p.appID, _, err = field(payload, "api_app_id", true); err != nil {
+		return p, err
+	}
 	// A callback must identify its workspace somewhere. Every represented
 	// team ID, including authorization entries, must agree.
 	event, err := object(payload["event"])
@@ -275,6 +280,14 @@ func parse(raw []byte) (parsed, error) {
 		p.ignored = true
 		return p, nil
 	}
+	channelType, _, err := field(event, "channel_type", true)
+	if err != nil {
+		return p, err
+	}
+	if channelType != "group" {
+		p.ignored = true
+		return p, nil
+	}
 	for _, key := range []string{"subtype", "bot_id", "bot_profile", "thread_ts"} {
 		if _, present := event[key]; present {
 			p.ignored = true
@@ -295,7 +308,7 @@ func parse(raw []byte) (parsed, error) {
 		if err != nil {
 			return p, err
 		}
-		if populated {
+		if populated || event[key] != nil {
 			p.ignored = true
 			return p, nil
 		}
@@ -328,7 +341,7 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 			break
 		}
 	}
-	if p.ignored || p.teamID != h.Config.TeamID || p.channelID != h.Config.ChannelID || p.userID == h.Config.BotUserID || !allowed {
+	if p.ignored || p.appID != h.Config.AppID || p.teamID != h.Config.TeamID || p.channelID != h.Config.ChannelID || p.userID == h.Config.BotUserID || !allowed {
 		result.Ignored = true
 	} else {
 		mode, boundChannel, err := h.Store.ConversationRoute(ctx, h.Config.ConversationID)

@@ -1,6 +1,7 @@
 package channelruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,12 +31,16 @@ func rowConfig() Config {
 	return Config{
 		ConversationID: "conversation", ConductorID: "conductor", Profile: "fixture",
 		RowInstanceID: "immutable-row", RowBinding: "opaque-binding", ChannelID: "channel",
+		AppID: "app", TeamID: "team", SpoolKey: bytes.Repeat([]byte{0x42}, 32),
 		AllowedUserIDs: []string{"allowed-user"}, AppToken: "app-secret", BotToken: "bot-secret",
 	}
 }
 
 func TestRowRuntimeManifestV2ContainsOnlyRowAndSlackBinding(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(dir, "manifest.json")
 	cfg := rowConfig()
 	identity := struct{ TeamID, BotUserID string }{"team", "bot-user"}
@@ -54,7 +59,7 @@ func TestRowRuntimeManifestV2ContainsOnlyRowAndSlackBinding(t *testing.T) {
 	wantKeys := map[string]bool{
 		"version": true, "profile": true, "row_instance_id": true, "row_binding_token": true,
 		"conversation_id": true, "conductor_id": true, "team_id": true, "bot_user_id": true,
-		"channel_id": true, "allowed_user_ids": true,
+		"channel_id": true, "allowed_user_ids": true, "app_id": true,
 	}
 	if len(fields) != len(wantKeys) {
 		t.Fatalf("manifest fields=%v", fields)

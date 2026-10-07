@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	_ "modernc.org/sqlite"
 )
 
@@ -107,9 +109,13 @@ type OutboxItem struct {
 	ExternalMessageID string
 }
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db    *sql.DB
+	spool *channelspool.Store
+	now   func() time.Time
+}
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const v3ArchiveSuffix = ".v3-archive"
 
@@ -235,8 +241,18 @@ func inspectGatewaySchema(path string) (version int, pristine bool, resultErr er
 
 // Open creates a private SQLite file or opens an existing compatible ledger.
 // Existing files with an unknown schema are never deleted or migrated.
-func Open(path string) (*Store, error) {
-	if path == "" {
+func Open(path string, keys ...[]byte) (*Store, error) {
+	var key []byte
+	if len(keys) == 0 {
+		var err error
+		key, err = channelspool.KeyFromEnv()
+		if err != nil {
+			return nil, ErrInvalid
+		}
+	} else if len(keys) == 1 {
+		key = keys[0]
+	}
+	if path == "" || len(key) != 32 {
 		return nil, ErrInvalid
 	}
 	abs, err := filepath.Abs(path)
@@ -244,6 +260,13 @@ func Open(path string) (*Store, error) {
 		return nil, ErrStorage
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return nil, ErrStorage
+	}
+	spool, err := channelspool.New(filepath.Join(filepath.Dir(abs), "spool"), key)
+	if err != nil {
+		if errors.Is(err, channelspool.ErrKey) || errors.Is(err, channelspool.ErrRecord) {
+			return nil, ErrSchema
+		}
 		return nil, ErrStorage
 	}
 	if err := archivePristineV3(abs); err != nil {
@@ -266,7 +289,7 @@ func Open(path string) (*Store, error) {
 		return nil, ErrStorage
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, spool: spool, now: time.Now}
 	if err := s.initSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -372,8 +395,9 @@ var schemaDDL = []string{
 		ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
 		conversation_id TEXT NOT NULL REFERENCES conversations(id), event_id TEXT NOT NULL,
 		message_id TEXT NOT NULL, thread_id TEXT NOT NULL, segment_id TEXT REFERENCES segments(id),
-		body TEXT, disposition TEXT NOT NULL, pointer_thread_id TEXT NOT NULL DEFAULT '',
-		turn_id TEXT,
+		content_ref TEXT NOT NULL DEFAULT '', disposition TEXT NOT NULL, pointer_thread_id TEXT NOT NULL DEFAULT '',
+		turn_id TEXT, seen_at INTEGER NOT NULL DEFAULT 0, content_expired_at INTEGER NOT NULL DEFAULT 0,
+		content_deleted_at INTEGER NOT NULL DEFAULT 0,
 		UNIQUE (conversation_id, event_id)
 	)`,
 	`CREATE INDEX inbound_queued ON inbound_events(conversation_id, segment_id, ordinal)
@@ -388,6 +412,7 @@ var schemaDDL = []string{
 		row_operation_id TEXT NOT NULL DEFAULT '', operation_state TEXT NOT NULL DEFAULT '',
 		accepted_codex_session_id TEXT NOT NULL DEFAULT '', accepted_turn_generation TEXT NOT NULL DEFAULT '',
 		terminal_error TEXT NOT NULL DEFAULT '',
+		completed_at INTEGER NOT NULL DEFAULT 0,
 		attempt_state TEXT NOT NULL DEFAULT 'unprepared'
 			CHECK (attempt_state IN ('unprepared','prepared','accepted','needs_reconciliation','completed')),
 		CHECK (operation_state IN ('','queued','preparing','accepted','completed','refused',
@@ -403,7 +428,9 @@ var schemaDDL = []string{
 		ordinal INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
 		conversation_id TEXT NOT NULL REFERENCES conversations(id),
 		turn_id TEXT NOT NULL REFERENCES turns(id), kind TEXT NOT NULL,
-		thread_id TEXT NOT NULL, body TEXT NOT NULL,
+		thread_id TEXT NOT NULL, content_ref TEXT NOT NULL DEFAULT '',
+		delivered_at INTEGER NOT NULL DEFAULT 0, uncertain_at INTEGER NOT NULL DEFAULT 0,
+		content_expired_at INTEGER NOT NULL DEFAULT 0, content_deleted_at INTEGER NOT NULL DEFAULT 0,
 		state TEXT NOT NULL CHECK (state IN ('pending','sending','uncertain','delivered')),
 		delivery_attempt_id TEXT NOT NULL DEFAULT '',
 		external_message_id TEXT NOT NULL DEFAULT '',
@@ -438,13 +465,19 @@ func (s *Store) CreateConversation(ctx context.Context, c Conversation) error {
 	if !validConversation(c) {
 		return ErrInvalid
 	}
+	if err := s.saveBinding(c.ID, c.ChannelID); err != nil {
+		return err
+	}
+	channelAlias := s.alias("channel", c.ChannelID)
+	rowAlias := s.alias("row", c.RowInstanceID)
+	bindingAlias := s.alias("rowbinding", c.RowBinding)
 	return s.write(ctx, func(tx *writeTx) error {
 		var channel, conductor, rowInstance, rowBinding, mode string
 		err := tx.row(`SELECT channel_id, conductor_id, row_instance_id, row_binding_token, mode FROM conversations WHERE id=?`, c.ID).
 			Scan(&channel, &conductor, &rowInstance, &rowBinding, &mode)
 		if err == nil {
-			if channel != c.ChannelID || conductor != c.ConductorID || rowInstance != c.RowInstanceID ||
-				rowBinding != c.RowBinding || Mode(mode) != c.Mode {
+			if channel != channelAlias || conductor != c.ConductorID || rowInstance != rowAlias ||
+				rowBinding != bindingAlias || Mode(mode) != c.Mode {
 				return ErrConflict
 			}
 			rows, err := tx.conn.QueryContext(ctx, `SELECT sender_id FROM allowed_senders WHERE conversation_id=? ORDER BY sender_id`, c.ID)
@@ -466,6 +499,9 @@ func (s *Store) CreateConversation(ctx context.Context, c Conversation) error {
 				return ErrStorage
 			}
 			want := slices.Clone(c.AllowedSenders)
+			for i := range want {
+				want[i] = s.alias("sender", want[i])
+			}
 			slices.Sort(want)
 			if !slices.Equal(got, want) {
 				return ErrConflict
@@ -476,11 +512,11 @@ func (s *Store) CreateConversation(ctx context.Context, c Conversation) error {
 			return ErrStorage
 		}
 		if _, err := tx.exec(`INSERT INTO conversations(id,channel_id,conductor_id,mode,row_instance_id,row_binding_token)
-			VALUES(?,?,?,?,?,?)`, c.ID, c.ChannelID, c.ConductorID, c.Mode, c.RowInstanceID, c.RowBinding); err != nil {
+			VALUES(?,?,?,?,?,?)`, c.ID, channelAlias, c.ConductorID, c.Mode, rowAlias, bindingAlias); err != nil {
 			return err
 		}
 		for _, sender := range c.AllowedSenders {
-			if _, err := tx.exec(`INSERT INTO allowed_senders(conversation_id,sender_id) VALUES(?,?)`, c.ID, sender); err != nil {
+			if _, err := tx.exec(`INSERT INTO allowed_senders(conversation_id,sender_id) VALUES(?,?)`, c.ID, s.alias("sender", sender)); err != nil {
 				return err
 			}
 		}
