@@ -576,6 +576,61 @@ func TestSocketCallbackAndAckFailuresArePrivate(t *testing.T) {
 	}
 }
 
+func TestSocketUnknownDisconnectReasonIsReconnectable(t *testing.T) {
+	// too_many_websockets is backpressure Slack documents and sends. Treating
+	// it as terminal stopped a production conductor for 100 minutes: the
+	// process exited, the unit is Restart=no, and nothing retried.
+	for _, reason := range []string{"too_many_websockets", "something_new"} {
+		dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
+			_ = conn.WriteMessage(websocket.TextMessage,
+				[]byte(`{"type":"disconnect","reason":"`+reason+`"}`))
+			time.Sleep(50 * time.Millisecond)
+		}))
+		client := socketClientWithTicket(dialer, testWSSURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := client.Run(ctx, func(context.Context, []byte, func(context.Context, []byte) error) error { return nil })
+		cancel()
+		var disconnect *DisconnectError
+		if !errors.As(err, &disconnect) {
+			t.Fatalf("%s: expected a DisconnectError carrying the reason, got %v", reason, err)
+		}
+		if string(disconnect.Reason) != reason {
+			t.Fatalf("%s: reason was discarded, got %q", reason, disconnect.Reason)
+		}
+		if !errors.Is(err, ErrReconnect) {
+			t.Fatalf("%s: must invite a reconnect", reason)
+		}
+	}
+}
+
+func TestSocketLinkDisabledStaysTerminal(t *testing.T) {
+	// The one reason no retry can fix.
+	dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
+		_ = conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"type":"disconnect","reason":"link_disabled"}`))
+		time.Sleep(50 * time.Millisecond)
+	}))
+	client := socketClientWithTicket(dialer, testWSSURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := client.Run(ctx, func(context.Context, []byte, func(context.Context, []byte) error) error { return nil })
+	if errors.Is(err, ErrReconnect) {
+		t.Fatalf("link_disabled must not invite a reconnect, got %v", err)
+	}
+}
+
 func TestSocketSilentServerTripsDeadman(t *testing.T) {
 	// The production failure: the server answers our PINGs, so the read
 	// deadline is refreshed forever, while it delivers no events at all. The

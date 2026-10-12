@@ -41,15 +41,22 @@ const (
 	DisconnectLinkDisabled     DisconnectReason = "link_disabled"
 )
 
-// DisconnectError is a classified Socket Mode control message. A warning or
-// refresh request asks the caller to establish a new session; link_disabled
-// does not invite an automatic reconnect. It never includes provider fields.
+// DisconnectError is a classified Socket Mode control message. Slack sends
+// these routinely and expects a client to reopen, so every reason invites a
+// reconnect except link_disabled, which is an authorization decision no retry
+// can change. Reasons we do not recognise -- too_many_websockets is one Slack
+// documents and sends -- are backpressure, not protocol violations: collapsing
+// them into a terminal error stopped a conductor permanently in production.
+// It never includes provider fields.
 type DisconnectError struct{ Reason DisconnectReason }
 
 func (*DisconnectError) Error() string { return ErrDisconnected.Error() }
 
 func (e *DisconnectError) Is(target error) bool {
-	return target == ErrDisconnected || (target == ErrReconnect && (e.Reason == DisconnectWarning || e.Reason == DisconnectRefreshRequested))
+	if target == ErrDisconnected {
+		return true
+	}
+	return target == ErrReconnect && e.Reason != DisconnectLinkDisabled
 }
 
 // SocketClient holds only an app-level token. A Run call opens one temporary
@@ -279,12 +286,9 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 				return ErrProtocol
 			}
 			reason := DisconnectReason(stringField(obj, "reason"))
-			switch reason {
-			case DisconnectWarning, DisconnectRefreshRequested, DisconnectLinkDisabled:
-				return &DisconnectError{Reason: reason}
-			default:
-				return ErrDisconnected
-			}
+			// Every reason is carried through. The runner decides which are
+			// terminal; the transport does not get to discard the reason.
+			return &DisconnectError{Reason: reason}
 		default:
 			if !seenHello || typ == "" || stringField(obj, "envelope_id") == "" {
 				return ErrProtocol

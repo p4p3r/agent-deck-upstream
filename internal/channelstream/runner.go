@@ -396,9 +396,15 @@ func (r *Runner) socketFailure(err, callbackErr error) (terminal bool, result er
 		if disconnect.Reason == slacknetwork.DisconnectLinkDisabled {
 			return true, ErrLinkDisabled, ErrorLinkDisabled, false
 		}
+		// Slack disconnects Socket Mode clients as a matter of course, and a
+		// reason we do not recognise is still a reason to reopen. An announced
+		// rotation may reconnect at once; anything else backs off, because the
+		// reason we most often will not recognise is too_many_websockets,
+		// where reconnecting immediately is what caused the refusal.
 		if disconnect.Reason == slacknetwork.DisconnectWarning || disconnect.Reason == slacknetwork.DisconnectRefreshRequested {
 			return false, nil, ErrorSocket, true
 		}
+		return false, nil, ErrorSocket, false
 	}
 	if errors.Is(err, slacknetwork.ErrCallback) {
 		if fatalDependency(callbackErr) {
