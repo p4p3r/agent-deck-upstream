@@ -181,7 +181,23 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 		}
 		return ErrReconnect
 	}
-	defer conn.Close()
+	// Slack keeps counting a connection it was never told about. Dropping the
+	// TCP socket leaves the server holding a session it still considers live
+	// and still routes events to, and an event is delivered to exactly one of
+	// an app's connections: every abandoned socket is a share of inbound
+	// messages silently lost. One restart cycle left three connections open
+	// for one running process. Close is announced on every exit path, not just
+	// shutdown, because a reconnect abandons a socket exactly as a stop does.
+	var closeOnce sync.Once
+	shutdown := func() {
+		closeOnce.Do(func() {
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				time.Now().Add(writeTimeout))
+			_ = conn.Close()
+		})
+	}
+	defer shutdown()
 
 	pingEvery, readExpiry, serverPingExpiry := c.timings()
 	conn.SetReadLimit(slackgateway.MaxEnvelopeBytes)
@@ -213,7 +229,7 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close()
+			shutdown()
 		case <-done:
 		}
 	}()
@@ -226,7 +242,7 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 				return
 			case <-ticker.C:
 				if writeControl(websocket.PingMessage, nil) != nil {
-					conn.Close()
+					shutdown()
 					return
 				}
 			}
@@ -248,7 +264,7 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 			case now := <-ticker.C:
 				last := time.Unix(0, lastServerPing.Load())
 				if now.Sub(last) > serverPingExpiry {
-					conn.Close()
+					shutdown()
 					return
 				}
 			}
