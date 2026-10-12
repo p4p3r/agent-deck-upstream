@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -20,6 +21,10 @@ const (
 	dialTimeout       = 10 * time.Second
 	defaultPingEvery  = 20 * time.Second
 	defaultReadExpiry = 60 * time.Second
+	// Slack sends a WebSocket PING to every Socket Mode client at least every
+	// 30 seconds. Silence from the server for twice that is a connection it is
+	// no longer servicing, whatever the transport believes.
+	defaultServerPingExpiry = 60 * time.Second
 )
 
 // EnvelopeHandler receives one authenticated Socket Mode events_api frame.
@@ -57,6 +62,8 @@ type SocketClient struct {
 
 	pingEvery  time.Duration // same-package timer test seam
 	readExpiry time.Duration // same-package timer test seam
+	// Deadline on PINGs arriving FROM Slack, as opposed to replies to ours.
+	serverPingExpiry time.Duration // same-package timer test seam
 }
 
 func NewSocketClient(appToken string) *SocketClient {
@@ -122,15 +129,18 @@ func (c *SocketClient) ticket(ctx context.Context) (string, error) {
 	return url, nil
 }
 
-func (c *SocketClient) timings() (time.Duration, time.Duration) {
-	ping, expiry := c.pingEvery, c.readExpiry
+func (c *SocketClient) timings() (time.Duration, time.Duration, time.Duration) {
+	ping, expiry, serverPing := c.pingEvery, c.readExpiry, c.serverPingExpiry
 	if ping <= 0 {
 		ping = defaultPingEvery
 	}
 	if expiry <= 0 {
 		expiry = defaultReadExpiry
 	}
-	return ping, expiry
+	if serverPing <= 0 {
+		serverPing = defaultServerPingExpiry
+	}
+	return ping, expiry, serverPing
 }
 
 // Run obtains a ticket and runs one connection. It does not retry a failed
@@ -166,7 +176,7 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 	}
 	defer conn.Close()
 
-	pingEvery, readExpiry := c.timings()
+	pingEvery, readExpiry, serverPingExpiry := c.timings()
 	conn.SetReadLimit(slackgateway.MaxEnvelopeBytes)
 	if conn.SetReadDeadline(time.Now().Add(readExpiry)) != nil {
 		return ErrReconnect
@@ -178,7 +188,13 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 		defer writeMu.Unlock()
 		return conn.WriteControl(frameType, payload, time.Now().Add(writeTimeout))
 	}
+	// A PING from Slack is the only evidence that the server is still
+	// servicing this connection. Record it, and treat it as liveness.
+	var lastServerPing atomic.Int64
+	lastServerPing.Store(time.Now().UnixNano())
 	conn.SetPingHandler(func(message string) error {
+		lastServerPing.Store(time.Now().UnixNano())
+		_ = conn.SetReadDeadline(time.Now().Add(readExpiry))
 		return writeControl(websocket.PongMessage, []byte(message))
 	})
 	conn.SetPongHandler(func(string) error {
@@ -203,6 +219,28 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 				return
 			case <-ticker.C:
 				if writeControl(websocket.PingMessage, nil) != nil {
+					conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	// The deadman. Our own PING/PONG exchange cannot prove the connection is
+	// being serviced: a server that answers pings while delivering no events
+	// keeps the read deadline refreshed forever, which is exactly how a silent
+	// Socket Mode connection survived 30 minutes in production while every
+	// message sent to it was lost. Only Slack's own PING proves delivery is
+	// still attached to this socket.
+	go func() {
+		ticker := time.NewTicker(serverPingExpiry / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				last := time.Unix(0, lastServerPing.Load())
+				if now.Sub(last) > serverPingExpiry {
 					conn.Close()
 					return
 				}

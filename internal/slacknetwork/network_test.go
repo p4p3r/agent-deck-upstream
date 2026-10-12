@@ -576,6 +576,86 @@ func TestSocketCallbackAndAckFailuresArePrivate(t *testing.T) {
 	}
 }
 
+func TestSocketSilentServerTripsDeadman(t *testing.T) {
+	// The production failure: the server answers our PINGs, so the read
+	// deadline is refreshed forever, while it delivers no events at all. The
+	// connection must not be allowed to survive that.
+	dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
+		// Answer every PING, send none of our own, deliver nothing.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+	}))
+	client := socketClientWithTicket(dialer, testWSSURL)
+	client.pingEvery = 10 * time.Millisecond
+	client.readExpiry = 2 * time.Second
+	client.serverPingExpiry = 150 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := client.Run(ctx, func(context.Context, []byte, func(context.Context, []byte) error) error { return nil })
+	if !errors.Is(err, ErrReconnect) {
+		t.Fatalf("silent server: expected ErrReconnect, got %v after %s", err, time.Since(start))
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("silent server: deadman took %s, too slow", time.Since(start))
+	}
+}
+
+func TestSocketServerPingKeepsConnectionAlive(t *testing.T) {
+	// The converse: a server that PINGs us is being serviced, and an idle
+	// channel must not be torn down just because nobody is talking.
+	dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		deadline := time.Now().Add(400 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil {
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}))
+	client := socketClientWithTicket(dialer, testWSSURL)
+	client.pingEvery = 10 * time.Millisecond
+	client.readExpiry = 2 * time.Second
+	client.serverPingExpiry = 150 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_ = client.Run(ctx, func(context.Context, []byte, func(context.Context, []byte) error) error { return nil })
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("server pings should have kept an idle connection alive, torn down after %s", elapsed)
+	}
+}
+
 func TestSocketDeadPeerHeartbeat(t *testing.T) {
 	dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
