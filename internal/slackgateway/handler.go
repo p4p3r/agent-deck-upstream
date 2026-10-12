@@ -16,7 +16,9 @@ import (
 const (
 	MaxEnvelopeBytes = 256 << 10
 	MaxBodyBytes     = 32 << 10
-	maxJSONDepth     = 32
+	// Headroom the store reserves for the provenance line below.
+	MaxProvenanceBytes = 1 << 10
+	maxJSONDepth       = 32
 )
 
 var (
@@ -320,6 +322,19 @@ func parse(raw []byte) (parsed, error) {
 	return p, nil
 }
 
+// provenance prefixes an inbound body with the origin a conductor needs to
+// attribute it. Kept to one line so it costs nothing in a prompt, and always
+// present so its absence is meaningful rather than ambiguous.
+func provenance(p parsed) string {
+	line := "[slack channel=" + p.channelID + " sender=" + p.userID + " ts=" + p.messageID + "]\n"
+	if len(line) > MaxProvenanceBytes {
+		// Identifiers are short and fixed-shape; an oversized one is a
+		// malformed envelope, and a body is never truncated to fit a header.
+		return "[slack]\n"
+	}
+	return line
+}
+
 // Handle processes one already-authenticated Socket Mode frame. The caller's
 // ack callback is invoked only after a deterministic filter or committed
 // gateway intake. On malformed input or storage failure it is never invoked.
@@ -351,9 +366,17 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 		if mode != channelgateway.ChannelStream || boundChannel != h.Config.ChannelID {
 			return result, ErrConfig
 		}
+		// The agent is told where this came from. Everything reaching this
+		// point has already passed the app, team, channel, bot and allowlist
+		// checks above, so the header is provenance for a reader, not a
+		// credential: a conductor that cannot see it has no way to tell an
+		// operator's Slack message from text pasted into its pane, and
+		// correctly refuses to treat it as instruction. The gateway aliases
+		// these identifiers before storing them, so they are composed here,
+		// where the real ones still exist.
 		result.Intake, err = h.Store.Ingest(ctx, channelgateway.Inbound{
 			ConversationID: h.Config.ConversationID, EventID: p.eventID, MessageID: p.messageID,
-			ChannelID: p.channelID, SenderID: p.userID, Body: p.text,
+			ChannelID: p.channelID, SenderID: p.userID, Body: provenance(p) + p.text,
 		})
 		if err != nil {
 			return result, err

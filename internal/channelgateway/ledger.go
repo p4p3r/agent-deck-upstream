@@ -76,7 +76,7 @@ func promotePending(tx *writeTx, conversationID string) error {
 // The adapter should acknowledge delivery only after this call succeeds.
 func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 	var out IntakeResult
-	if in.ConversationID == "" || in.EventID == "" || in.MessageID == "" || in.ChannelID == "" || in.SenderID == "" || len(in.Body) > 32<<10 {
+	if in.ConversationID == "" || in.EventID == "" || in.MessageID == "" || in.ChannelID == "" || in.SenderID == "" || len(in.Body) > MaxStoredBodyBytes {
 		return out, ErrInvalid
 	}
 	body := in.Body

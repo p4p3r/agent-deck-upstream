@@ -93,7 +93,7 @@ func TestHandleCommitsBeforeAckAndAckFailureRedeliveryDeduplicates(t *testing.T)
 		turn, e := s.NextTurn(ctx, testConversation)
 		require.NoError(t, e)
 		require.NotNil(t, turn)
-		require.Equal(t, secret, turn.Body)
+		require.Equal(t, secret, textOf(turn.Body))
 		return errors.New("ack failed with private credential-marker-2")
 	})
 	require.Error(t, err)
@@ -112,7 +112,7 @@ func TestHandleCommitsBeforeAckAndAckFailureRedeliveryDeduplicates(t *testing.T)
 	require.Equal(t, 2, ackCalls)
 	turn, err := s.NextTurn(ctx, testConversation)
 	require.NoError(t, err)
-	require.Equal(t, secret, turn.Body)
+	require.Equal(t, secret, textOf(turn.Body))
 }
 
 func TestHandleOnlyIngestsAndNeverReservesOrStartsAgentTurn(t *testing.T) {
@@ -162,7 +162,7 @@ func TestDecodedTextAdmissionIsInclusiveAt32KiB(t *testing.T) {
 					t.Fatal("inclusive decoded-text boundary rejected")
 				}
 				turn, err := s.NextTurn(context.Background(), testConversation)
-				if err != nil || turn == nil || turn.Body != tc.body {
+				if err != nil || turn == nil || textOf(turn.Body) != tc.body {
 					t.Fatal("accepted text changed")
 				}
 				ledger, err := os.ReadFile(path)
@@ -562,4 +562,16 @@ func TestConcurrentDrainMarksInFlightUncertainButExactLateConfirmWins(t *testing
 	a, _, err = other.PrepareDelivery(ctx, item.ID)
 	require.NoError(t, err)
 	require.Equal(t, channelgateway.DeliveredDelivery, a.State)
+}
+
+// textOf drops the provenance line a gateway prefixes to a stored body, so a
+// test can assert on the message a user actually sent.
+func textOf(body string) string {
+	if !strings.HasPrefix(body, "[slack ") && !strings.HasPrefix(body, "[slack]") {
+		return body
+	}
+	if idx := strings.IndexByte(body, '\n'); idx >= 0 {
+		return body[idx+1:]
+	}
+	return body
 }

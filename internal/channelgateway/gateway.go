@@ -55,6 +55,12 @@ type Conversation struct {
 
 // Inbound is a transport-normalized message. ThreadID is empty for a top-level
 // message. Adapters must filter bot/self events before calling Ingest.
+// MaxStoredBodyBytes bounds a stored inbound body. It exceeds the 32 KiB of
+// message text a provider admits, because a gateway prefixes that text with a
+// short provenance line naming the channel and sender, and a full-size message
+// must still be accepted.
+const MaxStoredBodyBytes = 32<<10 + 1<<10
+
 type Inbound struct {
 	ConversationID string
 	EventID        string
