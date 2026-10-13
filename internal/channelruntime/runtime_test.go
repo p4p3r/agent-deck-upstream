@@ -33,9 +33,11 @@ func (testSender) PostTopLevel(context.Context, string, string) (slackgateway.Po
 	return slackgateway.PostResult{}, nil
 }
 
-func (testSender) SetSessionStatus(context.Context, string, string, string, string) error {
+func (testSender) SetSessionStatus(context.Context, string, string, string, string, string) error {
 	return nil
 }
+
+func (testSender) RemoveReaction(context.Context, string, string, string) error { return nil }
 
 func (testSender) AddReaction(context.Context, string, string, string) error { return nil }
 

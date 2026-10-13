@@ -54,6 +54,9 @@ type HandleResult struct {
 	// indicator; the title is honoured only when the session is created.
 	AcceptedThreadTS string
 	AcceptedTitle    string
+	// AcceptedUserID attributes the session to whoever opened it, which is
+	// what Slack shows beside the indicator.
+	AcceptedUserID string
 	// Pointer is set when the gateway parked a message rather than acting on
 	// it. Silence would be indistinguishable from a dead channel, which is the
 	// failure this whole fork exists to stop, so the caller answers in the
@@ -492,6 +495,7 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 			result.AcceptedMessageTS = p.messageID
 			result.AcceptedThreadTS = replyThread(p)
 			result.AcceptedTitle = sessionTitle(p.text)
+			result.AcceptedUserID = p.userID
 		}
 		// A duplicate is Slack retrying an event this gateway already answered,
 		// so its pointer was already posted and must not be posted twice.

@@ -352,6 +352,7 @@ type fakeSender struct {
 	permalinkErr error
 	reactions    []string
 	reactionErr  error
+	removed      []string
 	sessions     []string
 	sessionErr   error
 	calls        int
@@ -363,11 +364,18 @@ type fakeSender struct {
 	err          error
 }
 
-func (f *fakeSender) SetSessionStatus(_ context.Context, channelID, threadTS, status, title string) error {
+func (f *fakeSender) SetSessionStatus(_ context.Context, channelID, threadTS, status, title, initiator string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sessions = append(f.sessions, channelID+"/"+threadTS+"/"+status+"/"+title)
+	f.sessions = append(f.sessions, channelID+"/"+threadTS+"/"+status+"/"+title+"/"+initiator)
 	return f.sessionErr
+}
+
+func (f *fakeSender) RemoveReaction(_ context.Context, channelID, ts, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, channelID+"/"+ts+"/"+name)
+	return nil
 }
 
 func (f *fakeSender) AddReaction(_ context.Context, channelID, ts, name string) error {

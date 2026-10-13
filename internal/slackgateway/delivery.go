@@ -3,6 +3,8 @@ package slackgateway
 import (
 	"context"
 	"errors"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
@@ -64,7 +66,10 @@ type Sender interface {
 	// SetSessionStatus drives the thread's agent-session indicator. Advisory:
 	// an app not declared as an agent, or a workspace without the feature,
 	// simply has no indicator.
-	SetSessionStatus(ctx context.Context, channelID, threadTS, status, title string) error
+	SetSessionStatus(ctx context.Context, channelID, threadTS, status, title, initiatorUserID string) error
+	// RemoveReaction takes back one of this bot's own marks, so a message
+	// carries the state it is in rather than every state it has been in.
+	RemoveReaction(ctx context.Context, channelID, ts, name string) error
 }
 
 type DeliveryWorker struct {
@@ -72,6 +77,39 @@ type DeliveryWorker struct {
 	Sender         Sender
 	ConversationID string
 	ChannelID      string
+	// Clock is injectable so the advisory backoff below is testable without
+	// sleeping. Nil means time.Now.
+	Clock func() time.Time
+
+	// Advisory calls -- marks and indicators -- are suppressed for a window
+	// after one fails, so an app that has not been granted the scope, or a
+	// workspace without agent sessions, costs one call a minute rather than
+	// one per turn. Replies are never suppressed.
+	advisoryMu    sync.Mutex
+	advisoryRetry time.Time
+}
+
+const advisoryBackoff = time.Minute
+
+func (w *DeliveryWorker) now() time.Time {
+	if w.Clock != nil {
+		return w.Clock()
+	}
+	return time.Now()
+}
+
+// advisoryAllowed reports whether advisory calls are open, and records a
+// failure window when told of one.
+func (w *DeliveryWorker) advisoryAllowed() bool {
+	w.advisoryMu.Lock()
+	defer w.advisoryMu.Unlock()
+	return !w.now().Before(w.advisoryRetry)
+}
+
+func (w *DeliveryWorker) advisoryFailed() {
+	w.advisoryMu.Lock()
+	defer w.advisoryMu.Unlock()
+	w.advisoryRetry = w.now().Add(advisoryBackoff)
 }
 
 type DeliveryResult struct {
@@ -201,10 +239,29 @@ func (w *DeliveryWorker) DeliverOne(ctx context.Context, itemID string) (Deliver
 // has not been granted reactions yet, or a message too old to react to, costs
 // the mark and nothing else.
 func (w *DeliveryWorker) Mark(ctx context.Context, messageTS, reaction string) {
-	if w == nil || w.Sender == nil || messageTS == "" || reaction == "" {
+	if w == nil || w.Sender == nil || messageTS == "" || reaction == "" || !w.advisoryAllowed() {
 		return
 	}
-	_ = w.Sender.AddReaction(ctx, w.ChannelID, messageTS, reaction)
+	if w.Sender.AddReaction(ctx, w.ChannelID, messageTS, reaction) != nil {
+		w.advisoryFailed()
+	}
+}
+
+// remark replaces one mark with another, so a message shows the state it is in
+// rather than every state it has been in. The new mark is added first: if the
+// removal is the call that fails, a message carrying both is a better outcome
+// than one carrying none.
+func (w *DeliveryWorker) remark(ctx context.Context, messageTS, from, to string) {
+	if w == nil || w.Sender == nil || messageTS == "" || to == "" || !w.advisoryAllowed() {
+		return
+	}
+	if w.Sender.AddReaction(ctx, w.ChannelID, messageTS, to) != nil {
+		w.advisoryFailed()
+		return
+	}
+	if from != "" && from != to {
+		_ = w.Sender.RemoveReaction(ctx, w.ChannelID, messageTS, from)
+	}
 }
 
 // markTurn resolves a turn's opening message before marking it. A turn that
@@ -217,20 +274,25 @@ func (w *DeliveryWorker) markTurn(ctx context.Context, turnID, reaction string) 
 	if err != nil || ts == "" {
 		return
 	}
-	w.Mark(ctx, ts, reaction)
+	w.remark(ctx, ts, ReactionAccepted, reaction)
 }
 
 // Session drives the agent-session indicator for one thread. Advisory in full,
 // and meaningless outside thread_segments, where there is no thread to drive.
-func (w *DeliveryWorker) Session(ctx context.Context, threadTS, status, title string) {
+func (w *DeliveryWorker) Session(ctx context.Context, threadTS, status, title, initiator string) {
 	if w == nil || w.Sender == nil || threadTS == "" || status == "" {
+		return
+	}
+	if !w.advisoryAllowed() {
 		return
 	}
 	mode, err := w.route(ctx)
 	if err != nil || mode != channelgateway.ThreadSegments {
 		return
 	}
-	_ = w.Sender.SetSessionStatus(ctx, w.ChannelID, threadTS, status, title)
+	if w.Sender.SetSessionStatus(ctx, w.ChannelID, threadTS, status, title, initiator) != nil {
+		w.advisoryFailed()
+	}
 }
 
 // sessionIdleForTurn returns a turn's thread to its idle state once its answer
@@ -240,11 +302,18 @@ func (w *DeliveryWorker) sessionIdleForTurn(ctx context.Context, turnID string) 
 	if w == nil || w.Store == nil || turnID == "" {
 		return
 	}
+	// Another turn in the same thread may already be running: intake and
+	// delivery race by construction. Clearing the indicator here would show
+	// the thread idle while the conductor is working, which is precisely the
+	// lie this indicator exists to prevent.
+	if busy, err := w.Store.SegmentHasOpenTurn(ctx, turnID); err != nil || busy {
+		return
+	}
 	thread, err := w.Store.TurnThread(ctx, turnID)
 	if err != nil || thread == "" {
 		return
 	}
-	w.Session(ctx, thread, SessionIdle, "")
+	w.Session(ctx, thread, SessionIdle, "", "")
 }
 
 // PostPointer answers a parked message in the thread it arrived in.

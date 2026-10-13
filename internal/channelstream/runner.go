@@ -396,7 +396,7 @@ func (r *Runner) callback(ctx context.Context, raw []byte, ack func(context.Cont
 		// The thread shows it is working from here until its answer is
 		// delivered. Both ends are advisory, but the pair must stay matched:
 		// the indicator does not clear itself when the app posts.
-		r.Delivery.Session(ctx, result.AcceptedThreadTS, slackgateway.SessionWorking, result.AcceptedTitle)
+		r.Delivery.Session(ctx, result.AcceptedThreadTS, slackgateway.SessionWorking, result.AcceptedTitle, result.AcceptedUserID)
 	}
 	// A parked message is answered with an advisory pointer so that being busy
 	// never looks like being dead. It is best effort by design: it is not in

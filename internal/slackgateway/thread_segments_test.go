@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/stretchr/testify/require"
@@ -232,6 +233,8 @@ func TestDeliveryMarksTheTurnThatAsked(t *testing.T) {
 	_, err = w.DeliverOne(ctx, item.ID)
 	require.NoError(t, err)
 	require.Equal(t, []string{testChannel + "/1700000000.000001/" + ReactionDone}, sender.reactions)
+	require.Equal(t, []string{testChannel + "/1700000000.000001/" + ReactionAccepted}, sender.removed,
+		"a message shows the state it is in, not every state it has been in")
 }
 
 // A reaction is advisory everywhere: an app without the scope yet, or a
@@ -278,7 +281,7 @@ func TestSessionIndicatorOpensOnAcceptAndClosesOnDelivery(t *testing.T) {
 
 	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
 	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
-	w.Session(ctx, accepted.AcceptedThreadTS, SessionWorking, accepted.AcceptedTitle)
+	w.Session(ctx, accepted.AcceptedThreadTS, SessionWorking, accepted.AcceptedTitle, accepted.AcceptedUserID)
 
 	turn, err := s.NextTurn(ctx, testConversation)
 	require.NoError(t, err)
@@ -289,8 +292,8 @@ func TestSessionIndicatorOpensOnAcceptAndClosesOnDelivery(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []string{
-		testChannel + "/1700000000.000001/" + SessionWorking + "/sweep the packs repo",
-		testChannel + "/1700000000.000001/" + SessionIdle + "/",
+		testChannel + "/1700000000.000001/" + SessionWorking + "/sweep the packs repo/" + testUser,
+		testChannel + "/1700000000.000001/" + SessionIdle + "//",
 	}, sender.sessions)
 }
 
@@ -299,7 +302,7 @@ func TestSessionIndicatorSkippedOnChannelStream(t *testing.T) {
 	s, _ := slackStore(t, channelgateway.ChannelStream)
 	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
 	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
-	w.Session(context.Background(), "1700000000.000001", SessionWorking, "title")
+	w.Session(context.Background(), "1700000000.000001", SessionWorking, "title", testUser)
 	require.Empty(t, sender.sessions)
 }
 
@@ -330,4 +333,64 @@ func TestSessionFailureNeverFailsDelivery(t *testing.T) {
 	r, err := w.DeliverOne(ctx, item.ID)
 	require.NoError(t, err)
 	require.Equal(t, channelgateway.DeliveredDelivery, r.State)
+}
+
+// Intake and delivery race by construction. A turn finishing must not clear an
+// indicator that a newer turn in the same thread still owns.
+func TestIndicatorSurvivesAnOlderTurnFinishing(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("first"), "1700000000.000001", ""))
+	deliver(t, h, threadEnvelope("e2", "ev2", "second", "1700000000.000002", "1700000000.000001"))
+
+	first, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NoError(t, s.AcceptTurn(ctx, first.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, first.ID, "accepted-1", "first reply")
+	require.NoError(t, err)
+
+	// The second message is now the active turn in the same segment.
+	second, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID)
+
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	_, err = w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err)
+	require.Empty(t, sender.sessions, "the thread is still working; its indicator must stay")
+}
+
+// One advisory failure suppresses advisory calls briefly, so an app without
+// the scope costs a call a minute rather than one per turn. Replies are never
+// suppressed.
+func TestAdvisoryFailureIsSuppressedButRepliesAreNot(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("go"), "1700000000.000001", ""))
+	turn, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NoError(t, s.AcceptTurn(ctx, turn.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, turn.ID, "accepted-1", "private reply")
+	require.NoError(t, err)
+
+	now := time.Unix(1700000000, 0)
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}, reactionErr: ErrPost}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel,
+		Clock: func() time.Time { return now }}
+
+	w.Mark(ctx, "1700000000.000001", ReactionAccepted)
+	require.Len(t, sender.reactions, 1)
+	w.Mark(ctx, "1700000000.000001", ReactionAccepted)
+	require.Len(t, sender.reactions, 1, "suppressed inside the window")
+
+	r, err := w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err, "a reply is never suppressed by an advisory failure")
+	require.Equal(t, channelgateway.DeliveredDelivery, r.State)
+
+	now = now.Add(2 * time.Minute)
+	w.Mark(ctx, "1700000000.000001", ReactionAccepted)
+	require.Len(t, sender.reactions, 2, "allowed again after the window")
 }

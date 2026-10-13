@@ -97,6 +97,25 @@ func (s *Store) TurnThread(ctx context.Context, turnID string) (string, error) {
 	return exact, nil
 }
 
+// SegmentHasOpenTurn reports whether the segment a turn belongs to still has
+// other work in flight. A thread's indicator must not be cleared by an older
+// turn finishing while a newer one is running: delivery and intake race by
+// construction, since one runs on the socket callback and the other on the
+// delivery loop.
+func (s *Store) SegmentHasOpenTurn(ctx context.Context, turnID string) (bool, error) {
+	if turnID == "" {
+		return false, ErrInvalid
+	}
+	var open int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM turns o
+		JOIN turns t ON t.segment_id=o.segment_id
+		WHERE t.id=? AND o.id!=t.id AND o.status='active'`, turnID).Scan(&open)
+	if err != nil {
+		return false, ErrStorage
+	}
+	return open > 0, nil
+}
+
 func (s *Store) OutboxRecord(ctx context.Context, itemID string) (OutboxItem, error) {
 	var o OutboxItem
 	var expired int64

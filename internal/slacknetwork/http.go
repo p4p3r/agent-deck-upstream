@@ -23,6 +23,7 @@ const (
 	postMessageURL     = "https://slack.com/api/chat.postMessage"
 	permalinkURL       = "https://slack.com/api/chat.getPermalink"
 	reactionAddURL     = "https://slack.com/api/reactions.add"
+	reactionRemoveURL  = "https://slack.com/api/reactions.remove"
 	sessionStatusURL   = "https://slack.com/api/agents.sessions.setStatus"
 	maxResponseBytes   = 64 << 10
 	httpTimeout        = 10 * time.Second
@@ -59,20 +60,22 @@ func (e openFailure) Is(target error) bool {
 // Sender implements slackgateway.Sender. Only a bot token is held here; it
 // cannot open a Socket Mode connection.
 type Sender struct {
-	botToken     string
-	httpClient   *http.Client // same-package local-fake test seam
-	postURL      string       // same-package local-fake test seam
-	authURL      string       // same-package local-fake test seam
-	permalinkURL string       // same-package local-fake test seam
-	reactionURL  string       // same-package local-fake test seam
-	sessionURL   string       // same-package local-fake test seam
+	botToken          string
+	httpClient        *http.Client // same-package local-fake test seam
+	postURL           string       // same-package local-fake test seam
+	authURL           string       // same-package local-fake test seam
+	permalinkURL      string       // same-package local-fake test seam
+	reactionURL       string       // same-package local-fake test seam
+	reactionRemoveURL string       // same-package local-fake test seam
+	sessionURL        string       // same-package local-fake test seam
 }
 
 var _ slackgateway.Sender = (*Sender)(nil)
 
 func NewSender(botToken string) *Sender {
 	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL,
-		permalinkURL: permalinkURL, reactionURL: reactionAddURL, sessionURL: sessionStatusURL}
+		permalinkURL: permalinkURL, reactionURL: reactionAddURL,
+		reactionRemoveURL: reactionRemoveURL, sessionURL: sessionStatusURL}
 }
 
 // Identity is the minimal bot identity needed to bind an offline gateway.
@@ -415,8 +418,11 @@ func (s *Sender) Permalink(ctx context.Context, channel, ts string) (string, err
 // Several denials mean "this workspace or app is not set up for sessions yet"
 // rather than "this call failed", and are reported separately so a box
 // degrades quietly instead of logging a fault on every turn.
-func (s *Sender) SetSessionStatus(ctx context.Context, channel, threadTS, status, title string) error {
+func (s *Sender) SetSessionStatus(ctx context.Context, channel, threadTS, status, title, initiator string) error {
 	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(threadTS) {
+		return ErrConfig
+	}
+	if initiator != "" && !validOpaqueID(initiator) {
 		return ErrConfig
 	}
 	switch status {
@@ -432,11 +438,12 @@ func (s *Sender) SetSessionStatus(ctx context.Context, channel, threadTS, status
 		endpoint = sessionStatusURL
 	}
 	payload := struct {
-		Channel  string `json:"channel_id"`
-		ThreadTS string `json:"thread_ts"`
-		Status   string `json:"status"`
-		Title    string `json:"title,omitempty"`
-	}{channel, threadTS, status, title}
+		Channel   string `json:"channel_id"`
+		ThreadTS  string `json:"thread_ts"`
+		Status    string `json:"status"`
+		Title     string `json:"title,omitempty"`
+		Initiator string `json:"initiator_user_id,omitempty"`
+	}{channel, threadTS, status, title, initiator}
 	body, _ := json.Marshal(payload)
 	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
 	if err != nil {
@@ -448,6 +455,38 @@ func (s *Sender) SetSessionStatus(ctx context.Context, channel, threadTS, status
 	switch stringField(obj, "error") {
 	case "missing_scope", "feature_disabled", "not_authorized", "thread_ts_not_allowed", "not_allowed_token_type":
 		return ErrSessionNotPermitted
+	}
+	return ErrPost
+}
+
+// RemoveReaction takes one of this bot's own marks off a message. Slack only
+// removes the caller's own reaction, so this cannot disturb an operator's.
+// no_reaction is success: the mark is already gone, which is the point.
+func (s *Sender) RemoveReaction(ctx context.Context, channel, ts, name string) error {
+	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(ts) || !validReaction(name) {
+		return ErrConfig
+	}
+	endpoint := s.reactionRemoveURL
+	if endpoint == "" {
+		endpoint = reactionRemoveURL
+	}
+	body, _ := json.Marshal(struct {
+		Channel   string `json:"channel"`
+		Timestamp string `json:"timestamp"`
+		Name      string `json:"name"`
+	}{channel, ts, name})
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil {
+		return ErrPost
+	}
+	if boolField(obj, "ok") {
+		return nil
+	}
+	switch stringField(obj, "error") {
+	case "no_reaction":
+		return nil
+	case "missing_scope", "not_allowed_token_type":
+		return ErrReactionNotPermitted
 	}
 	return ErrPost
 }
