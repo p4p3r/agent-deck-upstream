@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,6 +128,15 @@ func TestOpenRejectsUnsafeResponsesAndDoesNotRedirect(t *testing.T) {
 	}
 }
 
+func keysOf(obj map[string]json.RawMessage) []string {
+	names := make([]string, 0, len(obj))
+	for name := range obj {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func TestPostTopLevelWireAndTokenSeparation(t *testing.T) {
 	var calls int
 	sender := NewSender(testBotToken)
@@ -152,8 +162,10 @@ func TestPostTopLevelWireAndTokenSeparation(t *testing.T) {
 		if err := json.Unmarshal(body, &obj); err != nil {
 			t.Fatalf("post body: %v", err)
 		}
-		if len(obj) != 2 || obj["thread_ts"] != nil {
-			t.Errorf("post JSON keys = %v; expected only channel and text", obj)
+		// channel, text and a markdown block. The text field stays as the
+		// plain fallback, and a top-level post still carries no thread.
+		if len(obj) != 3 || obj["thread_ts"] != nil || obj["blocks"] == nil {
+			t.Errorf("post JSON keys = %v; expected channel, text and blocks", keysOf(obj))
 		}
 		var channel, text string
 		_ = json.Unmarshal(obj["channel"], &channel)

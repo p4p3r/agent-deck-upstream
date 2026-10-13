@@ -316,6 +316,42 @@ func stringField(obj map[string]json.RawMessage, key string) string {
 	return value
 }
 
+// postMessage posts one message as a Markdown block, with the same text as the
+// plain fallback.
+//
+// The raw text field is Slack's own mrkdwn, where "**bold**" and fenced code
+// from an ordinary Markdown writer render literally. A markdown block renders
+// what a conductor actually writes. The block type is newer than this code's
+// floor, so a workspace that rejects it falls back to plain text rather than
+// losing the reply: nothing is posted on invalid_blocks, which makes the retry
+// safe.
+func (s *Sender) postMessage(ctx context.Context, endpoint, channel, threadTS, message string) (map[string]json.RawMessage, error) {
+	type payload struct {
+		Channel  string `json:"channel"`
+		ThreadTS string `json:"thread_ts,omitempty"`
+		Text     string `json:"text"`
+		Blocks   []any  `json:"blocks,omitempty"`
+	}
+	block := map[string]string{"type": "markdown", "text": message}
+	body, _ := json.Marshal(payload{channel, threadTS, message, []any{block}})
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil {
+		return nil, ErrPost
+	}
+	if boolField(obj, "ok") {
+		return obj, nil
+	}
+	if stringField(obj, "error") != "invalid_blocks" {
+		return nil, ErrPost
+	}
+	plain, _ := json.Marshal(payload{Channel: channel, ThreadTS: threadTS, Text: message})
+	obj, err = postJSON(ctx, s.httpClient, endpoint, s.botToken, plain)
+	if err != nil || !boolField(obj, "ok") {
+		return nil, ErrPost
+	}
+	return obj, nil
+}
+
 // PostTopLevel sends exactly channel and text as JSON; there is deliberately
 // no thread parameter. Any uncertain HTTP outcome returns ErrPost without
 // exposing provider text, the token, or the attempted message.
@@ -328,13 +364,9 @@ func (s *Sender) PostTopLevel(ctx context.Context, channel, message string) (sla
 	if endpoint == "" {
 		endpoint = postMessageURL
 	}
-	body, _ := json.Marshal(struct {
-		Channel string `json:"channel"`
-		Text    string `json:"text"`
-	}{channel, message})
-	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
-	if err != nil || !boolField(obj, "ok") {
-		return zero, ErrPost
+	obj, err := s.postMessage(ctx, endpoint, channel, "", message)
+	if err != nil {
+		return zero, err
 	}
 	actualChannel, ts := stringField(obj, "channel"), stringField(obj, "ts")
 	if actualChannel != channel || !validOpaqueID(ts) {
@@ -358,14 +390,9 @@ func (s *Sender) PostInThread(ctx context.Context, channel, threadTS, message st
 	if endpoint == "" {
 		endpoint = postMessageURL
 	}
-	body, _ := json.Marshal(struct {
-		Channel  string `json:"channel"`
-		ThreadTS string `json:"thread_ts"`
-		Text     string `json:"text"`
-	}{channel, threadTS, message})
-	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
-	if err != nil || !boolField(obj, "ok") {
-		return zero, ErrPost
+	obj, err := s.postMessage(ctx, endpoint, channel, threadTS, message)
+	if err != nil {
+		return zero, err
 	}
 	actualChannel, ts := stringField(obj, "channel"), stringField(obj, "ts")
 	if actualChannel != channel || !validOpaqueID(ts) {

@@ -15,8 +15,6 @@ var (
 	ErrPostResult = errors.New("slackgateway: ambiguous post result")
 )
 
-const MaxPostCharacters = 40000
-
 const fixedOperationFailure = "The request could not be completed safely."
 
 // Pointer bodies are fixed text. They carry no operator content and no
@@ -194,13 +192,17 @@ func (w *DeliveryWorker) DeliverOne(ctx context.Context, itemID string) (Deliver
 	if a.Item.Kind == "status" {
 		body = fixedOperationFailure
 	}
-	if !utf8.ValidString(body) || utf8.RuneCountInString(body) > MaxPostCharacters {
+	// Invalid UTF-8 is a storage fault and stays uncertain. Length is not: a
+	// reply too long for one message is shortened with the loss stated, never
+	// dropped, because silence reads as a dead conductor.
+	if !utf8.ValidString(body) {
 		if err := w.Store.MarkDeliveryUncertain(persistCtx, itemID, a.ID); err != nil {
 			return r, err
 		}
 		r.State = channelgateway.UncertainDelivery
 		return r, ErrPostResult
 	}
+	body = replyBody(body)
 	post, postErr := PostResult{}, error(nil)
 	if mode == channelgateway.ChannelStream {
 		post, postErr = w.Sender.PostTopLevel(ctx, a.ChannelID, body)

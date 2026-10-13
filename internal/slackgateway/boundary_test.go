@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/stretchr/testify/require"
@@ -582,22 +583,24 @@ func TestDeliverOneAmbiguousProviderOutcomesBecomeUncertain(t *testing.T) {
 	}
 }
 
-func TestDeliverOneOversizeUnicodeReplyNeverPostsOrRetries(t *testing.T) {
+func TestDeliverOneOversizeUnicodeReplyIsShortenedAndPostedOnce(t *testing.T) {
 	ctx := context.Background()
+	// Dropping an over-long reply reads exactly like a conductor that never
+	// answered, so it is shortened with the loss stated and posted.
 	s, _, item := pendingSlackItemWithBody(t, strings.Repeat("界", 40001))
 	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "provider-ts"}}
 	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
 	_, err := w.DeliverOne(ctx, item.ID)
-	require.ErrorIs(t, err, ErrPostResult)
-	require.Zero(t, sender.count())
-	require.NotContains(t, err.Error(), "界")
-	a, created, err := s.PrepareDelivery(ctx, item.ID)
 	require.NoError(t, err)
-	require.False(t, created)
-	require.Equal(t, channelgateway.UncertainDelivery, a.State)
+	require.Equal(t, 1, sender.count())
+	require.LessOrEqual(t, utf8.RuneCountInString(sender.text), MaxPostCharacters)
+	require.Contains(t, sender.text, "truncated")
+	items, err := s.PendingOutbox(ctx, testConversation, 10)
+	require.NoError(t, err)
+	require.Empty(t, items)
 	_, err = w.DrainPending(ctx, 10)
 	require.NoError(t, err)
-	require.Zero(t, sender.count())
+	require.Equal(t, 1, sender.count(), "a delivered reply is never resent")
 
 	// The limit is characters, not UTF-8 bytes: 40,000 multibyte runes fit.
 	s2, _, item2 := pendingSlackItemWithBody(t, strings.Repeat("界", 40000))
