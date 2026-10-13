@@ -576,6 +576,34 @@ func TestSocketCallbackAndAckFailuresArePrivate(t *testing.T) {
 	}
 }
 
+func TestSocketDisconnectBeforeHelloIsReconnectable(t *testing.T) {
+	// An over-limit app is disconnected before hello: too_many_websockets is
+	// the first frame. Reading that as a protocol violation made the conductor
+	// exit fatally, and with Restart=on-failure it looped, each attempt taking
+	// another connection slot it was already being refused for.
+	dialer, _ := localWSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"type":"disconnect","reason":"too_many_websockets"}`))
+		time.Sleep(50 * time.Millisecond)
+	}))
+	client := socketClientWithTicket(dialer, testWSSURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := client.Run(ctx, func(context.Context, []byte, func(context.Context, []byte) error) error { return nil })
+	var disconnect *DisconnectError
+	if !errors.As(err, &disconnect) || string(disconnect.Reason) != "too_many_websockets" {
+		t.Fatalf("a pre-hello disconnect must carry its reason, got %v", err)
+	}
+	if !errors.Is(err, ErrReconnect) {
+		t.Fatalf("a pre-hello disconnect must invite a reconnect, got %v", err)
+	}
+}
+
 func TestSocketUnknownDisconnectReasonIsReconnectable(t *testing.T) {
 	// too_many_websockets is backpressure Slack documents and sends. Treating
 	// it as terminal stopped a production conductor for 100 minutes: the

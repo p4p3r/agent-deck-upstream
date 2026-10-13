@@ -298,9 +298,12 @@ func (c *SocketClient) Run(ctx context.Context, handler EnvelopeHandler) error {
 			}
 			seenHello = true
 		case "disconnect":
-			if !seenHello {
-				return ErrProtocol
-			}
+			// Slack answers an over-limit app by disconnecting before it ever
+			// says hello: too_many_websockets arrives as the first frame. That
+			// is backpressure, and the reason is the whole message, so it must
+			// not be read as a protocol violation. Treating it as fatal put a
+			// conductor into a restart loop that consumed the very connection
+			// slots it was being refused for.
 			reason := DisconnectReason(stringField(obj, "reason"))
 			// Every reason is carried through. The runner decides which are
 			// terminal; the transport does not get to discard the reason.
