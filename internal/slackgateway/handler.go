@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
@@ -45,7 +46,22 @@ type Handler struct {
 type HandleResult struct {
 	Intake  channelgateway.IntakeResult
 	Ignored bool
+	// Pointer is set when the gateway parked a message rather than acting on
+	// it. Silence would be indistinguishable from a dead channel, which is the
+	// failure this whole fork exists to stop, so the caller answers in the
+	// thread the operator wrote in.
+	Pointer Pointer
 }
+
+// Pointer addresses one advisory reply: where to post it, and which thread the
+// operator should be reading instead.
+type Pointer struct {
+	ThreadTS        string
+	PointerThreadTS string
+	Superseded      bool
+}
+
+func (p Pointer) Wanted() bool { return p.ThreadTS != "" && p.PointerThreadTS != "" }
 
 func validConfig(c Config) bool {
 	if c.ConversationID == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 {
@@ -173,6 +189,7 @@ type parsed struct {
 	channelID  string
 	userID     string
 	messageID  string
+	threadID   string
 	text       string
 	ignored    bool
 }
@@ -290,7 +307,11 @@ func parse(raw []byte) (parsed, error) {
 		p.ignored = true
 		return p, nil
 	}
-	for _, key := range []string{"subtype", "bot_id", "bot_profile", "thread_ts"} {
+	// An edit, a deletion or another app's message is never an instruction.
+	// thread_ts is no longer in this list: a reply inside a thread is the
+	// ordinary way to continue a conversation, and the gateway decides whether
+	// this one belongs to a segment it owns.
+	for _, key := range []string{"subtype", "bot_id", "bot_profile"} {
 		if _, present := event[key]; present {
 			p.ignored = true
 			return p, nil
@@ -304,6 +325,15 @@ func parse(raw []byte) (parsed, error) {
 	}
 	if p.messageID, _, err = field(event, "ts", true); err != nil {
 		return p, err
+	}
+	// Slack sets thread_ts on a reply and, on a parent that has replies, to the
+	// parent's own ts. The latter is still a top-level message, so it is
+	// normalized away rather than treated as a reply to itself.
+	if p.threadID, _, err = field(event, "thread_ts", false); err != nil {
+		return p, err
+	}
+	if p.threadID == p.messageID {
+		p.threadID = ""
 	}
 	for _, key := range []string{"attachments", "files"} {
 		populated, err := populatedArray(event, key)
@@ -320,6 +350,31 @@ func parse(raw []byte) (parsed, error) {
 		return p, ErrEnvelope
 	}
 	return p, nil
+}
+
+// replyThread is the thread an answer to this message belongs in: the thread it
+// arrived in, or the message itself when it opened one.
+func replyThread(p parsed) string {
+	if p.threadID != "" {
+		return p.threadID
+	}
+	return p.messageID
+}
+
+// mentions reports whether a message addresses this bot.
+//
+// Slack renders a mention as the literal "<@U…>", with the bot's own user ID
+// and no display name, so this is an exact search rather than a parse of the
+// text a human typed. A channel shared by several conductors needs it: every
+// app in that channel receives every message, so without an address each one
+// would answer. The gateway then decides what an address means -- in
+// thread_segments mode a mention opens a conversation, and a reply inside a
+// segment this conversation already owns needs none.
+func mentions(text, botUserID string) bool {
+	if botUserID == "" {
+		return false
+	}
+	return strings.Contains(text, "<@"+botUserID+">")
 }
 
 // provenance prefixes an inbound body with the origin a conductor needs to
@@ -363,7 +418,10 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 		if err != nil {
 			return result, err
 		}
-		if mode != channelgateway.ChannelStream || boundChannel != h.Config.ChannelID {
+		if mode != channelgateway.ChannelStream && mode != channelgateway.ThreadSegments {
+			return result, ErrConfig
+		}
+		if boundChannel != h.Config.ChannelID {
 			return result, ErrConfig
 		}
 		// The agent is told where this came from. Everything reaching this
@@ -376,10 +434,28 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 		// where the real ones still exist.
 		result.Intake, err = h.Store.Ingest(ctx, channelgateway.Inbound{
 			ConversationID: h.Config.ConversationID, EventID: p.eventID, MessageID: p.messageID,
-			ChannelID: p.channelID, SenderID: p.userID, Body: provenance(p) + p.text,
+			ThreadID: p.threadID, ChannelID: p.channelID, SenderID: p.userID,
+			Mentioned: mentions(p.text, h.Config.BotUserID), Body: provenance(p) + p.text,
 		})
 		if err != nil {
 			return result, err
+		}
+		// A stored event the gateway declined to act on is as ignored to a
+		// caller as one this boundary filtered: both mean no turn. The
+		// disposition stays in result.Intake for anything that needs the
+		// distinction.
+		if result.Intake.Disposition == channelgateway.Ignored {
+			result.Ignored = true
+		}
+		// A duplicate is Slack retrying an event this gateway already answered,
+		// so its pointer was already posted and must not be posted twice.
+		if !result.Intake.Duplicate && result.Intake.PointerThreadID != "" {
+			switch result.Intake.Disposition {
+			case channelgateway.RejectedPending:
+				result.Pointer = Pointer{ThreadTS: replyThread(p), PointerThreadTS: result.Intake.PointerThreadID}
+			case channelgateway.RejectedSuperseded:
+				result.Pointer = Pointer{ThreadTS: replyThread(p), PointerThreadTS: result.Intake.PointerThreadID, Superseded: true}
+			}
 		}
 	}
 	ackBody, _ := json.Marshal(struct {

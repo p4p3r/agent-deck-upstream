@@ -1,0 +1,195 @@
+package slackgateway
+
+import (
+	"context"
+	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
+	"github.com/stretchr/testify/require"
+)
+
+// deliver runs one envelope through the handler and returns the intake.
+func deliver(t *testing.T, h Handler, v map[string]any) HandleResult {
+	t.Helper()
+	acks := 0
+	result, err := h.Handle(context.Background(), encodeEnvelope(t, v), func(context.Context, []byte) error {
+		acks++
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, acks, "every deterministic outcome is acked exactly once")
+	return result
+}
+
+func threadEnvelope(envelopeID, eventID, body, ts, threadTS string) map[string]any {
+	v := eventEnvelope(envelopeID, eventID, body)
+	_, e := envelopeFields(v)
+	e["ts"] = ts
+	if threadTS != "" {
+		e["thread_ts"] = threadTS
+	}
+	return v
+}
+
+func mention(body string) string { return "<@" + testBot + "> " + body }
+
+// A shared channel gives every app in it a copy of every message, so an
+// unaddressed top-level message must not start anything.
+func TestThreadSegmentsIgnoresUnaddressedTopLevel(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	result := deliver(t, h, threadEnvelope("e1", "ev1", "status update for someone else", "1700000000.000001", ""))
+	require.True(t, result.Ignored)
+	require.Equal(t, channelgateway.Ignored, result.Intake.Disposition)
+	turn, err := s.NextTurn(context.Background(), testConversation)
+	require.NoError(t, err)
+	require.Nil(t, turn)
+}
+
+// The mention is an address, paid once. Everything after it is ordinary text
+// in a thread this conversation now owns.
+func TestThreadSegmentsMentionOpensAndThreadContinuesWithout(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+
+	opened := deliver(t, h, threadEnvelope("e1", "ev1", mention("start the sweep"), "1700000000.000001", ""))
+	require.False(t, opened.Ignored)
+	require.Equal(t, channelgateway.Accepted, opened.Intake.Disposition)
+	require.NotEmpty(t, opened.Intake.SegmentID)
+
+	followUp := deliver(t, h, threadEnvelope("e2", "ev2", "and skip the packs repo", "1700000000.000002", "1700000000.000001"))
+	require.False(t, followUp.Ignored, "a reply in a bound thread needs no mention")
+	require.Equal(t, channelgateway.Accepted, followUp.Intake.Disposition)
+	require.Equal(t, opened.Intake.SegmentID, followUp.Intake.SegmentID)
+
+	first, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Contains(t, first.Body, "start the sweep")
+}
+
+// Another conductor's thread is silent here until it is addressed, which is
+// what lets four conductors share one channel.
+func TestThreadSegmentsIgnoresForeignThreadUntilMentioned(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+
+	foreign := deliver(t, h, threadEnvelope("e1", "ev1", "box 1 please continue", "1700000000.000002", "1700000000.000001"))
+	require.True(t, foreign.Ignored, "an unknown thread is another conductor's until addressed")
+
+	pulled := deliver(t, h, threadEnvelope("e2", "ev2", mention("what does MANDO say about this?"), "1700000000.000003", "1700000000.000001"))
+	require.False(t, pulled.Ignored, "an explicit mention reaches into any thread")
+	require.Equal(t, channelgateway.Accepted, pulled.Intake.Disposition)
+
+	after := deliver(t, h, threadEnvelope("e3", "ev3", "and the packs repo too", "1700000000.000004", "1700000000.000001"))
+	require.False(t, after.Ignored, "the thread is bound here once it has been addressed")
+	require.Equal(t, pulled.Intake.SegmentID, after.Intake.SegmentID)
+}
+
+// Slack stamps thread_ts on a parent once it has replies. That parent is still
+// a top-level message and must not look like a reply to itself.
+func TestThreadSegmentsNormalizesSelfReferentialThreadTS(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	result := deliver(t, h, threadEnvelope("e1", "ev1", "no address here", "1700000000.000001", "1700000000.000001"))
+	require.True(t, result.Ignored, "a self-referential thread_ts is still a top-level message")
+}
+
+// The mention is matched on the bot's own ID, never on a display name a human
+// typed, so a lookalike is not an address.
+func TestMentionsMatchesOnlyTheBotID(t *testing.T) {
+	require.True(t, mentions("<@U-bot> go", "U-bot"))
+	require.True(t, mentions("hello <@U-bot>", "U-bot"))
+	require.False(t, mentions("hello @U-bot", "U-bot"))
+	require.False(t, mentions("<@U-bottom> go", "U-bot"))
+	require.False(t, mentions("<@U-other> go", "U-bot"))
+	require.False(t, mentions("<@U-bot> go", ""))
+}
+
+// A third thread arrives while one segment is active and one is pending. The
+// gateway parks it, and silence would be indistinguishable from a dead
+// channel, so the operator is told where the work actually is.
+func TestParkedMessageYieldsAPointerIntoItsOwnThread(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+
+	first := deliver(t, h, threadEnvelope("e1", "ev1", mention("first"), "1700000000.000001", ""))
+	require.Equal(t, channelgateway.Accepted, first.Intake.Disposition)
+	second := deliver(t, h, threadEnvelope("e2", "ev2", mention("second"), "1700000000.000002", ""))
+	require.Equal(t, channelgateway.Accepted, second.Intake.Disposition)
+
+	third := deliver(t, h, threadEnvelope("e3", "ev3", mention("third"), "1700000000.000003", ""))
+	require.Equal(t, channelgateway.RejectedPending, third.Intake.Disposition)
+	require.True(t, third.Pointer.Wanted())
+	require.Equal(t, "1700000000.000003", third.Pointer.ThreadTS, "the answer belongs in the thread that was parked")
+	require.Equal(t, "1700000000.000002", third.Pointer.PointerThreadTS, "it points at the thread that is waiting")
+	require.False(t, third.Pointer.Superseded)
+}
+
+// Slack retries an event whose ack was lost. The gateway recognises the
+// duplicate, and a second pointer must not appear in the channel.
+func TestDuplicateParkedEventPointsOnlyOnce(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("first"), "1700000000.000001", ""))
+	deliver(t, h, threadEnvelope("e2", "ev2", mention("second"), "1700000000.000002", ""))
+
+	parked := threadEnvelope("e3", "ev3", mention("third"), "1700000000.000003", "")
+	first := deliver(t, h, parked)
+	require.True(t, first.Pointer.Wanted())
+	retry := deliver(t, h, parked)
+	require.True(t, retry.Intake.Duplicate)
+	require.False(t, retry.Pointer.Wanted(), "a retried event must not post a second pointer")
+}
+
+// An accepted message has nothing to point at.
+func TestAcceptedMessageHasNoPointer(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	accepted := deliver(t, h, threadEnvelope("e1", "ev1", mention("go"), "1700000000.000001", ""))
+	require.Equal(t, channelgateway.Accepted, accepted.Intake.Disposition)
+	require.False(t, accepted.Pointer.Wanted())
+}
+
+// The pointer is fixed text plus a link. It never carries operator content or
+// conductor output, and a missing permalink costs the link, not the pointer.
+func TestPostPointerBodyIsFixedTextAndOptionalLink(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		pointer  Pointer
+		linkErr  error
+		contains string
+		link     bool
+	}{
+		{name: "busy with link", pointer: Pointer{ThreadTS: "ts-parked", PointerThreadTS: "ts-active"}, contains: pointerBusy, link: true},
+		{name: "superseded with link", pointer: Pointer{ThreadTS: "ts-parked", PointerThreadTS: "ts-active", Superseded: true}, contains: pointerSuperseded, link: true},
+		{name: "link unavailable", pointer: Pointer{ThreadTS: "ts-parked", PointerThreadTS: "ts-active"}, linkErr: ErrPost, contains: pointerBusy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := slackStore(t, channelgateway.ThreadSegments)
+			sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "posted"}, permalinkErr: tc.linkErr}
+			w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+			require.NoError(t, w.PostPointer(ctx, tc.pointer))
+			require.Equal(t, "ts-parked", sender.threadTS)
+			require.Contains(t, sender.text, tc.contains)
+			require.NotContains(t, sender.text, "private")
+			if tc.link {
+				require.Contains(t, sender.text, "https://example.slack.com/archives/"+testChannel+"/pts-active")
+			} else {
+				require.NotContains(t, sender.text, "https://")
+			}
+		})
+	}
+}
+
+// A flat channel has no segments, so it can never park anything, and a pointer
+// there would be posted in a thread the conversation does not use.
+func TestPostPointerRefusedOnChannelStream(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ChannelStream)
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "posted"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	require.Error(t, w.PostPointer(context.Background(), Pointer{ThreadTS: "ts-parked", PointerThreadTS: "ts-active"}))
+	require.Zero(t, sender.count())
+}

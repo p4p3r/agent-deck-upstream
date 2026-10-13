@@ -40,7 +40,20 @@ type Request struct {
 
 // Config binds one Slack route to one immutable Agent Deck row. Tokens are
 // never written to the manifest or returned in an error.
+// conversationMode defaults an unset mode to channel_stream so a config
+// written before thread_segments existed keeps its exact behaviour.
+func conversationMode(cfg Config) channelgateway.Mode {
+	if cfg.Mode == channelgateway.ThreadSegments {
+		return channelgateway.ThreadSegments
+	}
+	return channelgateway.ChannelStream
+}
+
 type Config struct {
+	// Mode is immutable for a conversation, so a mode change must reach a new
+	// ConversationID rather than rewrite an existing ledger. Empty means
+	// channel_stream, which is what every pre-existing conversation is.
+	Mode            channelgateway.Mode
 	ConversationID  string
 	ConductorID     string
 	Profile         string
@@ -252,7 +265,7 @@ func run(ctx context.Context, request Request, d dependencies) error {
 	conversation := channelgateway.Conversation{
 		ID: cfg.ConversationID, ChannelID: cfg.ChannelID, ConductorID: cfg.ConductorID,
 		RowInstanceID: cfg.RowInstanceID, RowBinding: cfg.RowBinding,
-		Mode: channelgateway.ChannelStream, AllowedSenders: cfg.AllowedUserIDs,
+		Mode: conversationMode(cfg), AllowedSenders: cfg.AllowedUserIDs,
 	}
 	if err := store.CreateConversation(ctx, conversation); err != nil {
 		return storeFailure(err)

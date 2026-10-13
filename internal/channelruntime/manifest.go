@@ -132,7 +132,7 @@ func migrateV4Runtime(r Request, c Config, identity struct{ TeamID, BotUserID st
 			NewConversation: channelgateway.Conversation{
 				ID: c.ConversationID, ChannelID: c.ChannelID, ConductorID: c.ConductorID,
 				RowInstanceID: c.RowInstanceID, RowBinding: c.RowBinding,
-				Mode: channelgateway.ChannelStream, AllowedSenders: c.AllowedUserIDs,
+				Mode: conversationMode(c), AllowedSenders: c.AllowedUserIDs,
 			},
 		}
 		if err := migrateGatewayV4(context.Background(), paths.ledger, binding, c.SpoolKey); err != nil {

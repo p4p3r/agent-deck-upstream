@@ -33,6 +33,14 @@ func (testSender) PostTopLevel(context.Context, string, string) (slackgateway.Po
 	return slackgateway.PostResult{}, nil
 }
 
+func (testSender) Permalink(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (testSender) PostInThread(context.Context, string, string, string) (slackgateway.PostResult, error) {
+	return slackgateway.PostResult{}, nil
+}
+
 type testRowDriver struct{ closed int }
 
 func (*testRowDriver) SubmitRowOperation(context.Context, string, string) (rowdriver.Operation, error) {

@@ -1329,8 +1329,14 @@ type SlackV2ConductorConfig struct {
 	RetentionUncertainHours int64    `toml:"retention_uncertain_hours,omitempty"`
 	RetentionMetadataHours  int64    `toml:"retention_metadata_hours,omitempty"`
 	ControlSocket           string   `toml:"control_socket,omitempty"`
-	CodexExecutable         string   `toml:"-"`
-	CodexModel              string   `toml:"-"`
+	// "channel_stream" (default) treats the channel as a flat log and answers
+	// every allowed message. "thread_segments" answers a top-level message
+	// only when it mentions this bot, and then keeps the thread it opened
+	// without needing another mention -- which is what lets several conductors
+	// share one channel.
+	SegmentMode     string `toml:"segment_mode,omitempty"`
+	CodexExecutable string `toml:"-"`
+	CodexModel      string `toml:"-"`
 }
 
 const (

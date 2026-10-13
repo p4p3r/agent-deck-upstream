@@ -330,6 +330,17 @@ type fakeSender struct {
 }
 
 func newFakeSender() *fakeSender { return &fakeSender{posted: make(chan int, 64)} }
+
+// A channel_stream runner never threads, so a threaded post here is a bug in
+// the boundary rather than a case to emulate.
+func (s *fakeSender) Permalink(context.Context, string, string) (string, error) {
+	return "", errors.New("no permalink in this fixture")
+}
+
+func (s *fakeSender) PostInThread(context.Context, string, string, string) (slackgateway.PostResult, error) {
+	return slackgateway.PostResult{}, errors.New("channel_stream must never post in a thread")
+}
+
 func (s *fakeSender) PostTopLevel(_ context.Context, channel, text string) (slackgateway.PostResult, error) {
 	s.mu.Lock()
 	s.posts++

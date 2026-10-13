@@ -161,6 +161,18 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		seen[resolved] = true
 		settings.AllowedUserIDs[i] = resolved
 	}
+	// The mode is part of the conversation's identity: a conversation's mode
+	// is immutable, so switching modes must land on a different conversation
+	// rather than contradict the ledger that already exists.
+	mode := channelgateway.ChannelStream
+	conversationSuffix := "/channel-stream"
+	switch settings.SegmentMode {
+	case "", string(channelgateway.ChannelStream):
+	case string(channelgateway.ThreadSegments):
+		mode, conversationSuffix = channelgateway.ThreadSegments, "/thread-segments"
+	default:
+		return channelruntime.Config{}, errSlackV2Configuration
+	}
 	bindingID := selectedProfile + "/" + name
 	key, err := channelspool.KeyFromEnv()
 	if err != nil {
@@ -171,7 +183,8 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
 	config := channelruntime.Config{
-		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+"/channel-stream"),
+		Mode:           mode,
+		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+conversationSuffix),
 		ConductorID:    channelspool.AliasFromKey(key, "conductor", bindingID),
 		Profile:        selectedProfile,
 		RowInstanceID:  settings.RowInstanceID,

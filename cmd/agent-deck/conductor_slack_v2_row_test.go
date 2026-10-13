@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
 	"github.com/asheshgoplani/agent-deck/internal/channelspool"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -49,6 +50,7 @@ func TestLoadConductorSlackV2RowBindingConfig(t *testing.T) {
 		t.Fatal("synthetic spool key unavailable")
 	}
 	want := channelruntime.Config{
+		Mode:           channelgateway.ChannelStream,
 		ConversationID: channelspool.AliasFromKey(key, "conversation", "default/sample/channel-stream"),
 		ConductorID:    channelspool.AliasFromKey(key, "conductor", "default/sample"), Profile: "default",
 		RowInstanceID: "immutable-row", RowBinding: "opaque-binding", ChannelID: "fixture-channel",

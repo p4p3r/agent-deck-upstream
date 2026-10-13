@@ -198,6 +198,9 @@ func TestHandleValidIneligibleEventsAreAckedWithoutIntake(t *testing.T) {
 		"empty attachments": func(v map[string]any) { _, e := envelopeFields(v); e["attachments"] = []any{} },
 		"empty files":       func(v map[string]any) { _, e := envelopeFields(v); e["files"] = []any{} },
 		"subtype":           func(v map[string]any) { _, e := envelopeFields(v); e["subtype"] = "message_changed" },
+		// A channel_stream conversation is a flat log, so a reply inside a
+		// thread is still not an instruction there. thread_segments is the
+		// mode that reads it, and it is covered separately.
 		"thread reply":      func(v map[string]any) { _, e := envelopeFields(v); e["thread_ts"] = "1699999999.000001" },
 		"unsupported event": func(v map[string]any) { _, e := envelopeFields(v); e["type"] = "reaction_added" },
 	}
@@ -302,12 +305,13 @@ func TestHandleUnsupportedOuterTypeWithValidPayloadIsAckedOnly(t *testing.T) {
 func TestHandleStorageFailureAndIncompatibleModeNeverAck(t *testing.T) {
 	ctx := context.Background()
 	raw := encodeEnvelope(t, eventEnvelope("envelope", "event", "secret credential-marker"))
+	// Both supported modes must fail closed on a dead store, and neither may
+	// ack what it never stored. An unsupported mode is covered by
+	// TestHandleUnsupportedModeNeverAck.
 	for _, mode := range []channelgateway.Mode{channelgateway.ChannelStream, channelgateway.ThreadSegments} {
 		t.Run(string(mode), func(t *testing.T) {
 			s, _ := slackStore(t, mode)
-			if mode == channelgateway.ChannelStream {
-				require.NoError(t, s.Close())
-			}
+			require.NoError(t, s.Close())
 			h := slackHandler(s)
 			acks := 0
 			_, err := h.Handle(ctx, raw, func(context.Context, []byte) error {
@@ -343,13 +347,38 @@ func TestHandleIngestAuthorizationFailureNeverAck(t *testing.T) {
 }
 
 type fakeSender struct {
-	mu      sync.Mutex
-	calls   int
-	channel string
-	text    string
-	onPost  func()
-	result  PostResult
-	err     error
+	mu           sync.Mutex
+	permalinkTS  string
+	permalinkErr error
+	calls        int
+	channel      string
+	threadTS     string
+	text         string
+	onPost       func()
+	result       PostResult
+	err          error
+}
+
+func (f *fakeSender) Permalink(_ context.Context, channelID, ts string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permalinkTS = ts
+	if f.permalinkErr != nil {
+		return "", f.permalinkErr
+	}
+	return "https://example.slack.com/archives/" + channelID + "/p" + ts, nil
+}
+
+func (f *fakeSender) PostInThread(_ context.Context, channelID, threadTS, body string) (PostResult, error) {
+	f.mu.Lock()
+	f.calls++
+	f.channel, f.threadTS, f.text = channelID, threadTS, body
+	onPost, result, err := f.onPost, f.result, f.err
+	f.mu.Unlock()
+	if onPost != nil {
+		onPost()
+	}
+	return result, err
 }
 
 func (f *fakeSender) PostTopLevel(_ context.Context, channelID, body string) (PostResult, error) {
@@ -417,7 +446,9 @@ func TestDeliverOnePreparesBeforeTopLevelPostAndConfirmsExactResponse(t *testing
 	require.Equal(t, 1, sender.count())
 }
 
-func TestDeliverOneRejectsThreadSegmentWithoutClaimOrPost(t *testing.T) {
+// A thread_segments reply goes back into the thread that asked for it, and
+// never to the channel root.
+func TestDeliverOneThreadSegmentPostsIntoItsThread(t *testing.T) {
 	s, _ := slackStore(t, channelgateway.ThreadSegments)
 	ctx := context.Background()
 	_, err := s.Ingest(ctx, channelgateway.Inbound{
@@ -435,12 +466,32 @@ func TestDeliverOneRejectsThreadSegmentWithoutClaimOrPost(t *testing.T) {
 	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
 	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
 	_, err = w.DeliverOne(ctx, item.ID)
-	require.Error(t, err)
-	require.Zero(t, sender.count())
+	require.NoError(t, err)
+	require.Equal(t, 1, sender.count())
+	require.Equal(t, testChannel, sender.channel)
+	require.Equal(t, "root-ts", sender.threadTS, "the reply belongs to the segment's root thread")
+	require.Equal(t, "private reply", sender.text)
 	items, err := s.PendingOutbox(ctx, testConversation, 10)
 	require.NoError(t, err)
-	require.Len(t, items, 1)
-	require.Equal(t, channelgateway.PendingDelivery, items[0].State)
+	require.Empty(t, items)
+}
+
+// The ledger and this boundary must agree about threading. A channel_stream
+// item carrying a thread, or a thread_segments item without one, is refused
+// before anything is claimed or posted.
+func TestDeliverOneRefusesThreadingThatContradictsTheMode(t *testing.T) {
+	for _, mode := range []channelgateway.Mode{channelgateway.ChannelStream, channelgateway.ThreadSegments} {
+		t.Run(string(mode), func(t *testing.T) {
+			require.False(t, threadingAgrees(mode, map[channelgateway.Mode]string{
+				channelgateway.ChannelStream:  "root-ts",
+				channelgateway.ThreadSegments: "",
+			}[mode]))
+			require.True(t, threadingAgrees(mode, map[channelgateway.Mode]string{
+				channelgateway.ChannelStream:  "",
+				channelgateway.ThreadSegments: "root-ts",
+			}[mode]))
+		})
+	}
 }
 
 func TestDrainRecoveryNeverResendsPreparedOrAmbiguousSend(t *testing.T) {

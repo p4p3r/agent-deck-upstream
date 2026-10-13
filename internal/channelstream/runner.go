@@ -387,6 +387,13 @@ func (r *Runner) callback(ctx context.Context, raw []byte, ack func(context.Cont
 		// persisted turn still needs a wake; successful ack is socket progress.
 		signal(wake) // Handle has returned only after the exact ack succeeds
 	}
+	// A parked message is answered with an advisory pointer so that being busy
+	// never looks like being dead. It is best effort by design: it is not in
+	// the outbox, nothing retries it, and failing to post one must not fail the
+	// socket callback that has already acked the event.
+	if result.Pointer.Wanted() && r.Delivery != nil {
+		_ = r.Delivery.PostPointer(ctx, result.Pointer)
+	}
 	return nil
 }
 

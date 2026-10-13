@@ -21,6 +21,7 @@ const (
 	connectionsOpenURL = "https://slack.com/api/apps.connections.open"
 	authTestURL        = "https://slack.com/api/auth.test"
 	postMessageURL     = "https://slack.com/api/chat.postMessage"
+	permalinkURL       = "https://slack.com/api/chat.getPermalink"
 	maxResponseBytes   = 64 << 10
 	httpTimeout        = 10 * time.Second
 )
@@ -56,16 +57,17 @@ func (e openFailure) Is(target error) bool {
 // Sender implements slackgateway.Sender. Only a bot token is held here; it
 // cannot open a Socket Mode connection.
 type Sender struct {
-	botToken   string
-	httpClient *http.Client // same-package local-fake test seam
-	postURL    string       // same-package local-fake test seam
-	authURL    string       // same-package local-fake test seam
+	botToken     string
+	httpClient   *http.Client // same-package local-fake test seam
+	postURL      string       // same-package local-fake test seam
+	authURL      string       // same-package local-fake test seam
+	permalinkURL string       // same-package local-fake test seam
 }
 
 var _ slackgateway.Sender = (*Sender)(nil)
 
 func NewSender(botToken string) *Sender {
-	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL}
+	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL, permalinkURL: permalinkURL}
 }
 
 // Identity is the minimal bot identity needed to bind an offline gateway.
@@ -274,6 +276,21 @@ func boolField(obj map[string]json.RawMessage, key string) bool {
 	return bytes.Equal(bytes.TrimSpace(obj[key]), []byte("true"))
 }
 
+// nestedString reads one string out of a nested object, returning "" when the
+// path is absent or shaped differently. An absent value is not an error: a
+// caller decides what a missing field means.
+func nestedString(obj map[string]json.RawMessage, key, inner string) string {
+	raw, present := obj[key]
+	if !present {
+		return ""
+	}
+	var nested map[string]json.RawMessage
+	if json.Unmarshal(raw, &nested) != nil {
+		return ""
+	}
+	return stringField(nested, inner)
+}
+
 func stringField(obj map[string]json.RawMessage, key string) string {
 	var value string
 	if len(obj[key]) == 0 || json.Unmarshal(obj[key], &value) != nil {
@@ -307,6 +324,71 @@ func (s *Sender) PostTopLevel(ctx context.Context, channel, message string) (sla
 		return zero, ErrPost
 	}
 	return slackgateway.PostResult{OK: true, ChannelID: actualChannel, TS: ts}, nil
+}
+
+// PostInThread posts a reply inside one thread. threadTS is the segment's root
+// message, so a malformed one must not silently become a channel-root post:
+// Slack drops an unknown thread_ts and answers ok with a top-level message, in
+// the wrong place and with no error, which is why the value is validated here
+// and the posted result is checked below.
+func (s *Sender) PostInThread(ctx context.Context, channel, threadTS, message string) (slackgateway.PostResult, error) {
+	var zero slackgateway.PostResult
+	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(threadTS) ||
+		!utf8.ValidString(message) || utf8.RuneCountInString(message) > slackgateway.MaxPostCharacters {
+		return zero, ErrConfig
+	}
+	endpoint := s.postURL
+	if endpoint == "" {
+		endpoint = postMessageURL
+	}
+	body, _ := json.Marshal(struct {
+		Channel  string `json:"channel"`
+		ThreadTS string `json:"thread_ts"`
+		Text     string `json:"text"`
+	}{channel, threadTS, message})
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil || !boolField(obj, "ok") {
+		return zero, ErrPost
+	}
+	actualChannel, ts := stringField(obj, "channel"), stringField(obj, "ts")
+	if actualChannel != channel || !validOpaqueID(ts) {
+		return zero, ErrPost
+	}
+	// The reply must have landed in the thread that was asked for. Slack
+	// echoes the parent back, and a mismatch means the message is somewhere
+	// the conversation does not own.
+	if postedThread := nestedString(obj, "message", "thread_ts"); postedThread != "" && postedThread != threadTS {
+		return zero, ErrPost
+	}
+	return slackgateway.PostResult{OK: true, ChannelID: actualChannel, TS: ts}, nil
+}
+
+// Permalink resolves one message's public link. It is advisory, used only to
+// make a pointer clickable, so every failure is reported plainly and the
+// caller posts without a link rather than not at all.
+func (s *Sender) Permalink(ctx context.Context, channel, ts string) (string, error) {
+	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(ts) {
+		return "", ErrConfig
+	}
+	endpoint := s.permalinkURL
+	if endpoint == "" {
+		endpoint = permalinkURL
+	}
+	body, _ := json.Marshal(struct {
+		Channel   string `json:"channel"`
+		MessageTS string `json:"message_ts"`
+	}{channel, ts})
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil || !boolField(obj, "ok") {
+		return "", ErrPost
+	}
+	link := stringField(obj, "permalink")
+	// Only an https Slack link is ever posted: this value is pasted into a
+	// message, and anything else is not a permalink whatever the field says.
+	if !strings.HasPrefix(link, "https://") || len(link) > 1024 || strings.ContainsAny(link, " \r\n\t") {
+		return "", ErrProtocol
+	}
+	return link, nil
 }
 
 func safeSocketURL(raw string) bool {
