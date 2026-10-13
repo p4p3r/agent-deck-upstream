@@ -46,6 +46,9 @@ type Handler struct {
 type HandleResult struct {
 	Intake  channelgateway.IntakeResult
 	Ignored bool
+	// AcceptedMessageTS is the operator's own message, to be marked as heard.
+	// Set only for a freshly accepted event: a duplicate was already marked.
+	AcceptedMessageTS string
 	// Pointer is set when the gateway parked a message rather than acting on
 	// it. Silence would be indistinguishable from a dead channel, which is the
 	// failure this whole fork exists to stop, so the caller answers in the
@@ -446,6 +449,9 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 		// distinction.
 		if result.Intake.Disposition == channelgateway.Ignored {
 			result.Ignored = true
+		}
+		if !result.Intake.Duplicate && result.Intake.Disposition == channelgateway.Accepted {
+			result.AcceptedMessageTS = p.messageID
 		}
 		// A duplicate is Slack retrying an event this gateway already answered,
 		// so its pointer was already posted and must not be posted twice.

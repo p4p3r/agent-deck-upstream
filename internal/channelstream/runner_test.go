@@ -333,6 +333,8 @@ func newFakeSender() *fakeSender { return &fakeSender{posted: make(chan int, 64)
 
 // A channel_stream runner never threads, so a threaded post here is a bug in
 // the boundary rather than a case to emulate.
+func (s *fakeSender) AddReaction(context.Context, string, string, string) error { return nil }
+
 func (s *fakeSender) Permalink(context.Context, string, string) (string, error) {
 	return "", errors.New("no permalink in this fixture")
 }

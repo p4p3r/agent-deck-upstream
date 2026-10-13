@@ -121,6 +121,11 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 				return ErrStorage
 			}
 		}
+		// Sealed in both modes: acting on a message later -- a reaction, a
+		// status -- is not a property of how the channel is read.
+		if s.saveMessageID(tx, messageID) != nil {
+			return ErrStorage
+		}
 
 		out.Disposition = Ignored
 		if c.mode == ChannelStream {
@@ -310,6 +315,17 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 		if err != nil {
 			return nil, err
 		}
+	}
+	// A turn that predates message sealing -- anything migrated from v4 -- has
+	// no exact timestamp to recover. That costs a reaction, not a turn, so the
+	// alias is dropped and the caller sees an empty MessageID rather than an
+	// error that would strand real work.
+	if out.MessageID != "" {
+		exact, err := s.exactMessage(out.MessageID)
+		if err != nil {
+			exact = ""
+		}
+		out.MessageID = exact
 	}
 	return out, nil
 }

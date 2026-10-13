@@ -22,6 +22,7 @@ const (
 	authTestURL        = "https://slack.com/api/auth.test"
 	postMessageURL     = "https://slack.com/api/chat.postMessage"
 	permalinkURL       = "https://slack.com/api/chat.getPermalink"
+	reactionAddURL     = "https://slack.com/api/reactions.add"
 	maxResponseBytes   = 64 << 10
 	httpTimeout        = 10 * time.Second
 )
@@ -62,12 +63,14 @@ type Sender struct {
 	postURL      string       // same-package local-fake test seam
 	authURL      string       // same-package local-fake test seam
 	permalinkURL string       // same-package local-fake test seam
+	reactionURL  string       // same-package local-fake test seam
 }
 
 var _ slackgateway.Sender = (*Sender)(nil)
 
 func NewSender(botToken string) *Sender {
-	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL, permalinkURL: permalinkURL}
+	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL,
+		permalinkURL: permalinkURL, reactionURL: reactionAddURL}
 }
 
 // Identity is the minimal bot identity needed to bind an offline gateway.
@@ -136,6 +139,11 @@ func postJSON(ctx context.Context, client *http.Client, endpoint, token string, 
 	}
 	return decodeObject(data)
 }
+
+// ErrReactionNotPermitted separates "this app may not react yet" from a
+// failed call, so a box whose app has not been reinstalled degrades quietly
+// instead of logging a fault on every turn.
+var ErrReactionNotPermitted = errors.New("slacknetwork: reactions not permitted for this app")
 
 var errAPITransport = errors.New("slacknetwork: api transport failed")
 
@@ -389,6 +397,55 @@ func (s *Sender) Permalink(ctx context.Context, channel, ts string) (string, err
 		return "", ErrProtocol
 	}
 	return link, nil
+}
+
+// AddReaction marks one message with one emoji.
+//
+// already_reacted is success: the mark is the point, not who put it there, and
+// a retry after an uncertain response must not look like a failure.
+// missing_scope is reported plainly so a caller can tell "not permitted yet"
+// from "did not work", which matters while the apps are mid-reinstall.
+func (s *Sender) AddReaction(ctx context.Context, channel, ts, name string) error {
+	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(ts) || !validReaction(name) {
+		return ErrConfig
+	}
+	endpoint := s.reactionURL
+	if endpoint == "" {
+		endpoint = reactionAddURL
+	}
+	body, _ := json.Marshal(struct {
+		Channel   string `json:"channel"`
+		Timestamp string `json:"timestamp"`
+		Name      string `json:"name"`
+	}{channel, ts, name})
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil {
+		return ErrPost
+	}
+	if boolField(obj, "ok") {
+		return nil
+	}
+	switch stringField(obj, "error") {
+	case "already_reacted":
+		return nil
+	case "missing_scope", "not_allowed_token_type":
+		return ErrReactionNotPermitted
+	}
+	return ErrPost
+}
+
+// validReaction accepts only Slack's own emoji name shape, because the value
+// is sent as an API argument rather than rendered as text.
+func validReaction(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '+') {
+			return false
+		}
+	}
+	return true
 }
 
 func safeSocketURL(raw string) bool {

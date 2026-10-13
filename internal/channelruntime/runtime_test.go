@@ -33,6 +33,8 @@ func (testSender) PostTopLevel(context.Context, string, string) (slackgateway.Po
 	return slackgateway.PostResult{}, nil
 }
 
+func (testSender) AddReaction(context.Context, string, string, string) error { return nil }
+
 func (testSender) Permalink(context.Context, string, string) (string, error) {
 	return "", nil
 }

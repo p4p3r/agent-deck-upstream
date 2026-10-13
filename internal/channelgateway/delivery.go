@@ -50,6 +50,30 @@ func (s *Store) ConversationRoute(ctx context.Context, conversationID string) (M
 
 // OutboxRecord reads an item without claiming it, so a transport can reject
 // an incompatible route before altering delivery state.
+// TurnMessage is the exact provider timestamp of the message that opened a
+// turn, for acting on it afterwards. It is empty, with no error, when that
+// message predates message sealing: a missing reaction is not a failure.
+func (s *Store) TurnMessage(ctx context.Context, turnID string) (string, error) {
+	if turnID == "" {
+		return "", ErrInvalid
+	}
+	var alias string
+	err := s.db.QueryRowContext(ctx, `SELECT e.message_id FROM inbound_events e
+		JOIN turns t ON t.conversation_id=e.conversation_id AND t.event_ordinal=e.ordinal
+		WHERE t.id=?`, turnID).Scan(&alias)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", ErrStorage
+	}
+	exact, err := s.exactMessage(alias)
+	if err != nil {
+		return "", nil
+	}
+	return exact, nil
+}
+
 func (s *Store) OutboxRecord(ctx context.Context, itemID string) (OutboxItem, error) {
 	var o OutboxItem
 	var expired int64

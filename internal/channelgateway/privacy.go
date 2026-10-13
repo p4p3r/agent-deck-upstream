@@ -89,6 +89,27 @@ func (s *Store) providerMessage(itemID string) (string, error) {
 	return string(data), nil
 }
 
+// A message ID is sealed for the same reason a thread ID is: the ledger stores
+// an alias, and anything that acts on a message after intake -- a reaction, a
+// status, a link -- needs the exact provider timestamp back.
+func (s *Store) saveMessageID(tx *writeTx, exact string) error {
+	if exact == "" {
+		return nil
+	}
+	return s.seal(tx, "message", s.alias("message", exact), []byte(exact))
+}
+
+func (s *Store) exactMessage(alias string) (string, error) {
+	if alias == "" {
+		return "", nil
+	}
+	data, err := s.spool.Read("message", alias)
+	if err != nil || s.alias("message", string(data)) != alias {
+		return "", ErrStorage
+	}
+	return string(data), nil
+}
+
 func (s *Store) saveThreadID(tx *writeTx, exact string) error {
 	if exact == "" {
 		return nil

@@ -193,3 +193,73 @@ func TestPostPointerRefusedOnChannelStream(t *testing.T) {
 	require.Error(t, w.PostPointer(context.Background(), Pointer{ThreadTS: "ts-parked", PointerThreadTS: "ts-active"}))
 	require.Zero(t, sender.count())
 }
+
+// The operator's own message is marked as heard. Without it, a message sent
+// into a busy or broken conductor looks identical.
+func TestAcceptedEventReportsTheMessageToMark(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	accepted := deliver(t, h, threadEnvelope("e1", "ev1", mention("go"), "1700000000.000001", ""))
+	require.Equal(t, "1700000000.000001", accepted.AcceptedMessageTS)
+
+	retry := deliver(t, h, threadEnvelope("e1", "ev1", mention("go"), "1700000000.000001", ""))
+	require.True(t, retry.Intake.Duplicate)
+	require.Empty(t, retry.AcceptedMessageTS, "a retried event was already marked")
+
+	ignored := deliver(t, h, threadEnvelope("e2", "ev2", "no address", "1700000000.000002", ""))
+	require.Empty(t, ignored.AcceptedMessageTS)
+}
+
+// A delivered reply marks the message that asked for it; the fixed-failure
+// status item marks failure instead.
+func TestDeliveryMarksTheTurnThatAsked(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("do the thing"), "1700000000.000001", ""))
+
+	turn, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NotNil(t, turn)
+	require.Equal(t, "1700000000.000001", turn.MessageID, "the exact message is recoverable after intake")
+	require.NoError(t, s.AcceptTurn(ctx, turn.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, turn.ID, "accepted-1", "private reply")
+	require.NoError(t, err)
+
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	_, err = w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{testChannel + "/1700000000.000001/" + ReactionDone}, sender.reactions)
+}
+
+// A reaction is advisory everywhere: an app without the scope yet, or a
+// message that cannot be marked, must not fail the delivery that succeeded.
+func TestMarkFailureNeverFailsDelivery(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("do the thing"), "1700000000.000001", ""))
+	turn, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NoError(t, s.AcceptTurn(ctx, turn.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, turn.ID, "accepted-1", "private reply")
+	require.NoError(t, err)
+
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}, reactionErr: ErrPost}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	r, err := w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err)
+	require.Equal(t, channelgateway.DeliveredDelivery, r.State)
+}
+
+// A turn migrated from a ledger written before message sealing has no exact
+// timestamp. That costs the mark, never the turn.
+func TestUnsealedMessageIsNotMarkedAndIsNotAnError(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	w.markTurn(ctx, "turn-that-does-not-exist", ReactionDone)
+	require.Empty(t, sender.reactions)
+}

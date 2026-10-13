@@ -350,6 +350,8 @@ type fakeSender struct {
 	mu           sync.Mutex
 	permalinkTS  string
 	permalinkErr error
+	reactions    []string
+	reactionErr  error
 	calls        int
 	channel      string
 	threadTS     string
@@ -357,6 +359,13 @@ type fakeSender struct {
 	onPost       func()
 	result       PostResult
 	err          error
+}
+
+func (f *fakeSender) AddReaction(_ context.Context, channelID, ts, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, channelID+"/"+ts+"/"+name)
+	return f.reactionErr
 }
 
 func (f *fakeSender) Permalink(_ context.Context, channelID, ts string) (string, error) {

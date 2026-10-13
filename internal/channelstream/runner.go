@@ -387,6 +387,13 @@ func (r *Runner) callback(ctx context.Context, raw []byte, ack func(context.Cont
 		// persisted turn still needs a wake; successful ack is socket progress.
 		signal(wake) // Handle has returned only after the exact ack succeeds
 	}
+	// Mark the operator's message as heard before anything else happens. This
+	// is the only signal between sending a message and reading an answer, and
+	// its absence is exactly what made a dead channel indistinguishable from a
+	// busy one.
+	if result.AcceptedMessageTS != "" && r.Delivery != nil {
+		r.Delivery.Mark(ctx, result.AcceptedMessageTS, slackgateway.ReactionAccepted)
+	}
 	// A parked message is answered with an advisory pointer so that being busy
 	// never looks like being dead. It is best effort by design: it is not in
 	// the outbox, nothing retries it, and failing to post one must not fail the

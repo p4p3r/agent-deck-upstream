@@ -19,6 +19,14 @@ const fixedOperationFailure = "The request could not be completed safely."
 
 // Pointer bodies are fixed text. They carry no operator content and no
 // conductor output, only a thread reference the operator can already see.
+// Lifecycle marks. Each is one emoji on the operator's own message, which is
+// the cheapest honest answer to "did it hear me, and is it still going?".
+const (
+	ReactionAccepted = "eyes"
+	ReactionDone     = "white_check_mark"
+	ReactionFailed   = "x"
+)
+
 const (
 	pointerBusy       = "Working in another thread; this is parked until that one finishes."
 	pointerSuperseded = "This conversation has been replaced; the active one continues elsewhere."
@@ -42,6 +50,9 @@ type Sender interface {
 	// Permalink is advisory: a pointer is still worth posting without a link,
 	// so a failure here is not a delivery failure.
 	Permalink(ctx context.Context, channelID, ts string) (string, error)
+	// AddReaction is advisory for the same reason. It is also the only signal
+	// an operator gets between sending a message and reading an answer.
+	AddReaction(ctx context.Context, channelID, ts, name string) error
 }
 
 type DeliveryWorker struct {
@@ -163,7 +174,37 @@ func (w *DeliveryWorker) DeliverOne(ctx context.Context, itemID string) (Deliver
 		return r, err
 	}
 	r.State, r.ProviderTS = channelgateway.DeliveredDelivery, post.TS
+	// The answer is out; mark the message that asked for it. A status item is
+	// the fixed-failure path, so it marks failure instead.
+	reaction := ReactionDone
+	if a.Item.Kind == "status" {
+		reaction = ReactionFailed
+	}
+	w.markTurn(persistCtx, a.Item.TurnID, reaction)
 	return r, nil
+}
+
+// Mark puts one lifecycle reaction on a message. Advisory in full: an app that
+// has not been granted reactions yet, or a message too old to react to, costs
+// the mark and nothing else.
+func (w *DeliveryWorker) Mark(ctx context.Context, messageTS, reaction string) {
+	if w == nil || w.Sender == nil || messageTS == "" || reaction == "" {
+		return
+	}
+	_ = w.Sender.AddReaction(ctx, w.ChannelID, messageTS, reaction)
+}
+
+// markTurn resolves a turn's opening message before marking it. A turn that
+// predates message sealing has no timestamp to mark, which is not an error.
+func (w *DeliveryWorker) markTurn(ctx context.Context, turnID, reaction string) {
+	if w == nil || w.Store == nil || turnID == "" {
+		return
+	}
+	ts, err := w.Store.TurnMessage(ctx, turnID)
+	if err != nil || ts == "" {
+		return
+	}
+	w.Mark(ctx, ts, reaction)
 }
 
 // PostPointer answers a parked message in the thread it arrived in.
