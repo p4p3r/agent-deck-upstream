@@ -2,6 +2,7 @@ package slackgateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
@@ -262,4 +263,71 @@ func TestUnsealedMessageIsNotMarkedAndIsNotAnError(t *testing.T) {
 	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
 	w.markTurn(ctx, "turn-that-does-not-exist", ReactionDone)
 	require.Empty(t, sender.reactions)
+}
+
+// The thread shows it is working from acceptance until its answer is out. The
+// closing "active" is mandatory: the indicator does not clear when the app
+// posts, so a missing one leaves the thread spinning forever.
+func TestSessionIndicatorOpensOnAcceptAndClosesOnDelivery(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	accepted := deliver(t, h, threadEnvelope("e1", "ev1", mention("sweep the packs repo"), "1700000000.000001", ""))
+	require.Equal(t, "1700000000.000001", accepted.AcceptedThreadTS)
+	require.Equal(t, "sweep the packs repo", accepted.AcceptedTitle)
+
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	w.Session(ctx, accepted.AcceptedThreadTS, SessionWorking, accepted.AcceptedTitle)
+
+	turn, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NoError(t, s.AcceptTurn(ctx, turn.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, turn.ID, "accepted-1", "private reply")
+	require.NoError(t, err)
+	_, err = w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err)
+
+	require.Equal(t, []string{
+		testChannel + "/1700000000.000001/" + SessionWorking + "/sweep the packs repo",
+		testChannel + "/1700000000.000001/" + SessionIdle + "/",
+	}, sender.sessions)
+}
+
+// A flat channel has no thread to drive, so the indicator is never attempted.
+func TestSessionIndicatorSkippedOnChannelStream(t *testing.T) {
+	s, _ := slackStore(t, channelgateway.ChannelStream)
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	w.Session(context.Background(), "1700000000.000001", SessionWorking, "title")
+	require.Empty(t, sender.sessions)
+}
+
+// A title names the thread after the message that opened it, without the
+// mention markup and without a second line.
+func TestSessionTitleIsTheFirstLineWithoutMentions(t *testing.T) {
+	require.Equal(t, "sweep the packs repo", sessionTitle("<@U-bot> sweep the packs repo"))
+	require.Equal(t, "first line", sessionTitle("<@U-bot> first line\nsecond line"))
+	require.Equal(t, "ask box 4 and box 2", sessionTitle("ask <@U-a> box 4 and <@U-b> box 2"))
+	require.Equal(t, "", sessionTitle("<@U-bot>"))
+	require.LessOrEqual(t, len([]rune(sessionTitle(strings.Repeat("x", 400)))), 120)
+}
+
+// An app that is not declared as an agent, or a workspace without the feature,
+// has no indicator and must not have a failed turn either.
+func TestSessionFailureNeverFailsDelivery(t *testing.T) {
+	ctx := context.Background()
+	s, _ := slackStore(t, channelgateway.ThreadSegments)
+	h := slackHandler(s)
+	deliver(t, h, threadEnvelope("e1", "ev1", mention("go"), "1700000000.000001", ""))
+	turn, err := s.NextTurn(ctx, testConversation)
+	require.NoError(t, err)
+	require.NoError(t, s.AcceptTurn(ctx, turn.ID, "accepted-1"))
+	item, err := s.CompleteTurn(ctx, turn.ID, "accepted-1", "private reply")
+	require.NoError(t, err)
+	sender := &fakeSender{result: PostResult{OK: true, ChannelID: testChannel, TS: "post-ts"}, sessionErr: ErrPost}
+	w := DeliveryWorker{Store: s, Sender: sender, ConversationID: testConversation, ChannelID: testChannel}
+	r, err := w.DeliverOne(ctx, item.ID)
+	require.NoError(t, err)
+	require.Equal(t, channelgateway.DeliveredDelivery, r.State)
 }

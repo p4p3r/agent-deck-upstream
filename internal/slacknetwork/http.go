@@ -23,6 +23,7 @@ const (
 	postMessageURL     = "https://slack.com/api/chat.postMessage"
 	permalinkURL       = "https://slack.com/api/chat.getPermalink"
 	reactionAddURL     = "https://slack.com/api/reactions.add"
+	sessionStatusURL   = "https://slack.com/api/agents.sessions.setStatus"
 	maxResponseBytes   = 64 << 10
 	httpTimeout        = 10 * time.Second
 )
@@ -64,13 +65,14 @@ type Sender struct {
 	authURL      string       // same-package local-fake test seam
 	permalinkURL string       // same-package local-fake test seam
 	reactionURL  string       // same-package local-fake test seam
+	sessionURL   string       // same-package local-fake test seam
 }
 
 var _ slackgateway.Sender = (*Sender)(nil)
 
 func NewSender(botToken string) *Sender {
 	return &Sender{botToken: botToken, postURL: postMessageURL, authURL: authTestURL,
-		permalinkURL: permalinkURL, reactionURL: reactionAddURL}
+		permalinkURL: permalinkURL, reactionURL: reactionAddURL, sessionURL: sessionStatusURL}
 }
 
 // Identity is the minimal bot identity needed to bind an offline gateway.
@@ -144,6 +146,10 @@ func postJSON(ctx context.Context, client *http.Client, endpoint, token string, 
 // failed call, so a box whose app has not been reinstalled degrades quietly
 // instead of logging a fault on every turn.
 var ErrReactionNotPermitted = errors.New("slacknetwork: reactions not permitted for this app")
+
+// ErrSessionNotPermitted covers every denial that means the app or workspace is
+// not configured for agent sessions, as distinct from a call that failed.
+var ErrSessionNotPermitted = errors.New("slacknetwork: agent sessions not permitted for this app")
 
 var errAPITransport = errors.New("slacknetwork: api transport failed")
 
@@ -397,6 +403,53 @@ func (s *Sender) Permalink(ctx context.Context, channel, ts string) (string, err
 		return "", ErrProtocol
 	}
 	return link, nil
+}
+
+// SetSessionStatus drives the agent-session indicator on one thread.
+//
+// title is honoured only when the session is created, which is why it is sent
+// with every call and ignored thereafter rather than tracked here. The status
+// does not clear itself when the app posts: a finished turn must set "active"
+// explicitly or the thread shows a spinner forever.
+//
+// Several denials mean "this workspace or app is not set up for sessions yet"
+// rather than "this call failed", and are reported separately so a box
+// degrades quietly instead of logging a fault on every turn.
+func (s *Sender) SetSessionStatus(ctx context.Context, channel, threadTS, status, title string) error {
+	if s == nil || !validSecret(s.botToken) || !validOpaqueID(channel) || !validOpaqueID(threadTS) {
+		return ErrConfig
+	}
+	switch status {
+	case "active", "processing", "suspended", "closed":
+	default:
+		return ErrConfig
+	}
+	if utf8.RuneCountInString(title) > 200 || !utf8.ValidString(title) {
+		return ErrConfig
+	}
+	endpoint := s.sessionURL
+	if endpoint == "" {
+		endpoint = sessionStatusURL
+	}
+	payload := struct {
+		Channel  string `json:"channel_id"`
+		ThreadTS string `json:"thread_ts"`
+		Status   string `json:"status"`
+		Title    string `json:"title,omitempty"`
+	}{channel, threadTS, status, title}
+	body, _ := json.Marshal(payload)
+	obj, err := postJSON(ctx, s.httpClient, endpoint, s.botToken, body)
+	if err != nil {
+		return ErrPost
+	}
+	if boolField(obj, "ok") {
+		return nil
+	}
+	switch stringField(obj, "error") {
+	case "missing_scope", "feature_disabled", "not_authorized", "thread_ts_not_allowed", "not_allowed_token_type":
+		return ErrSessionNotPermitted
+	}
+	return ErrPost
 }
 
 // AddReaction marks one message with one emoji.

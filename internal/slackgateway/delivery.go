@@ -21,6 +21,14 @@ const fixedOperationFailure = "The request could not be completed safely."
 // conductor output, only a thread reference the operator can already see.
 // Lifecycle marks. Each is one emoji on the operator's own message, which is
 // the cheapest honest answer to "did it hear me, and is it still going?".
+// Agent-session statuses. "active" is the finished state, not a cleared one:
+// the indicator does not disappear when the app posts, so a turn that ends
+// without setting it leaves the thread spinning forever.
+const (
+	SessionWorking = "processing"
+	SessionIdle    = "active"
+)
+
 const (
 	ReactionAccepted = "eyes"
 	ReactionDone     = "white_check_mark"
@@ -53,6 +61,10 @@ type Sender interface {
 	// AddReaction is advisory for the same reason. It is also the only signal
 	// an operator gets between sending a message and reading an answer.
 	AddReaction(ctx context.Context, channelID, ts, name string) error
+	// SetSessionStatus drives the thread's agent-session indicator. Advisory:
+	// an app not declared as an agent, or a workspace without the feature,
+	// simply has no indicator.
+	SetSessionStatus(ctx context.Context, channelID, threadTS, status, title string) error
 }
 
 type DeliveryWorker struct {
@@ -181,6 +193,7 @@ func (w *DeliveryWorker) DeliverOne(ctx context.Context, itemID string) (Deliver
 		reaction = ReactionFailed
 	}
 	w.markTurn(persistCtx, a.Item.TurnID, reaction)
+	w.sessionIdleForTurn(persistCtx, a.Item.TurnID)
 	return r, nil
 }
 
@@ -205,6 +218,33 @@ func (w *DeliveryWorker) markTurn(ctx context.Context, turnID, reaction string) 
 		return
 	}
 	w.Mark(ctx, ts, reaction)
+}
+
+// Session drives the agent-session indicator for one thread. Advisory in full,
+// and meaningless outside thread_segments, where there is no thread to drive.
+func (w *DeliveryWorker) Session(ctx context.Context, threadTS, status, title string) {
+	if w == nil || w.Sender == nil || threadTS == "" || status == "" {
+		return
+	}
+	mode, err := w.route(ctx)
+	if err != nil || mode != channelgateway.ThreadSegments {
+		return
+	}
+	_ = w.Sender.SetSessionStatus(ctx, w.ChannelID, threadTS, status, title)
+}
+
+// sessionIdleForTurn returns a turn's thread to its idle state once its answer
+// is out. Looked up rather than passed because delivery runs after the socket
+// callback that knew it.
+func (w *DeliveryWorker) sessionIdleForTurn(ctx context.Context, turnID string) {
+	if w == nil || w.Store == nil || turnID == "" {
+		return
+	}
+	thread, err := w.Store.TurnThread(ctx, turnID)
+	if err != nil || thread == "" {
+		return
+	}
+	w.Session(ctx, thread, SessionIdle, "")
 }
 
 // PostPointer answers a parked message in the thread it arrived in.

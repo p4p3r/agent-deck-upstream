@@ -49,6 +49,11 @@ type HandleResult struct {
 	// AcceptedMessageTS is the operator's own message, to be marked as heard.
 	// Set only for a freshly accepted event: a duplicate was already marked.
 	AcceptedMessageTS string
+	// AcceptedThreadTS is the thread that message belongs to, and
+	// AcceptedTitle a short name for it. Both drive the thread's agent-session
+	// indicator; the title is honoured only when the session is created.
+	AcceptedThreadTS string
+	AcceptedTitle    string
 	// Pointer is set when the gateway parked a message rather than acting on
 	// it. Silence would be indistinguishable from a dead channel, which is the
 	// failure this whole fork exists to stop, so the caller answers in the
@@ -364,6 +369,39 @@ func replyThread(p parsed) string {
 	return p.messageID
 }
 
+// sessionTitle names a thread after the message that opened it.
+//
+// The text is the operator's own message, posted back into the channel it came
+// from, so this discloses nothing new. Mentions are stripped because "<@U...>"
+// is markup rather than words, the first line is enough to recognise a thread
+// in a list, and Slack caps a title at 200 characters.
+func sessionTitle(text string) string {
+	line := text
+	if cut := strings.IndexAny(line, "\r\n"); cut >= 0 {
+		line = line[:cut]
+	}
+	for {
+		open := strings.Index(line, "<@")
+		if open < 0 {
+			break
+		}
+		close := strings.Index(line[open:], ">")
+		if close < 0 {
+			break
+		}
+		line = line[:open] + line[open+close+1:]
+	}
+	// Removing markup leaves the gaps it occupied, so the words are rejoined
+	// rather than trimmed at the ends only.
+	line = strings.Join(strings.Fields(line), " ")
+	const maxTitle = 120
+	if utf8.RuneCountInString(line) > maxTitle {
+		runes := []rune(line)
+		line = strings.TrimSpace(string(runes[:maxTitle]))
+	}
+	return line
+}
+
 // mentions reports whether a message addresses this bot.
 //
 // Slack renders a mention as the literal "<@U…>", with the bot's own user ID
@@ -452,6 +490,8 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 		}
 		if !result.Intake.Duplicate && result.Intake.Disposition == channelgateway.Accepted {
 			result.AcceptedMessageTS = p.messageID
+			result.AcceptedThreadTS = replyThread(p)
+			result.AcceptedTitle = sessionTitle(p.text)
 		}
 		// A duplicate is Slack retrying an event this gateway already answered,
 		// so its pointer was already posted and must not be posted twice.

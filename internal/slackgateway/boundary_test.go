@@ -352,6 +352,8 @@ type fakeSender struct {
 	permalinkErr error
 	reactions    []string
 	reactionErr  error
+	sessions     []string
+	sessionErr   error
 	calls        int
 	channel      string
 	threadTS     string
@@ -359,6 +361,13 @@ type fakeSender struct {
 	onPost       func()
 	result       PostResult
 	err          error
+}
+
+func (f *fakeSender) SetSessionStatus(_ context.Context, channelID, threadTS, status, title string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions = append(f.sessions, channelID+"/"+threadTS+"/"+status+"/"+title)
+	return f.sessionErr
 }
 
 func (f *fakeSender) AddReaction(_ context.Context, channelID, ts, name string) error {

@@ -74,6 +74,29 @@ func (s *Store) TurnMessage(ctx context.Context, turnID string) (string, error) 
 	return exact, nil
 }
 
+// TurnThread is the exact root thread of the segment a turn belongs to, for
+// driving that thread's indicator after the turn ends. Empty, with no error,
+// when the conversation is not segmented or the thread predates sealing.
+func (s *Store) TurnThread(ctx context.Context, turnID string) (string, error) {
+	if turnID == "" {
+		return "", ErrInvalid
+	}
+	var alias string
+	err := s.db.QueryRowContext(ctx, `SELECT g.root_thread_id FROM turns t
+		JOIN segments g ON g.id=t.segment_id WHERE t.id=?`, turnID).Scan(&alias)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", ErrStorage
+	}
+	exact, err := s.exactThread(alias)
+	if err != nil {
+		return "", nil
+	}
+	return exact, nil
+}
+
 func (s *Store) OutboxRecord(ctx context.Context, itemID string) (OutboxItem, error) {
 	var o OutboxItem
 	var expired int64
