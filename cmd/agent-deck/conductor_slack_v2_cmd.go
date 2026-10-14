@@ -21,6 +21,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/channelgateway"
 	"github.com/asheshgoplani/agent-deck/internal/channelruntime"
 	"github.com/asheshgoplani/agent-deck/internal/channelspool"
+	"github.com/asheshgoplani/agent-deck/internal/channelstream"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -173,6 +174,22 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 	default:
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
+	// The conductor learns what is waiting for it through the gateway, behind
+	// the same single writer as a turn. Absent or zero means no summaries,
+	// which is what a box runs until it is configured for them.
+	var attention channelstream.AttentionSource
+	var attentionInterval time.Duration
+	if settings.AttentionIntervalMinutes > 0 {
+		attentionInterval = time.Duration(settings.AttentionIntervalMinutes) * time.Minute
+		// The rules file is prose for the conductor, not selection logic, and
+		// the tick only stamps it so an edit counts as a change. A box without
+		// one -- box 1 had lost its copy -- still gets summaries.
+		rules := ""
+		if dir, err := session.ConductorNameDir(name); err == nil {
+			rules = filepath.Join(dir, "HEARTBEAT_RULES.md")
+		}
+		attention = &heartbeatAttention{profile: selectedProfile, name: name, rules: rules}
+	}
 	bindingID := selectedProfile + "/" + name
 	key, err := channelspool.KeyFromEnv()
 	if err != nil {
@@ -183,21 +200,23 @@ func loadConductorSlackV2Config(profile, name, dir string, lookupEnv func(string
 		return channelruntime.Config{}, errSlackV2Configuration
 	}
 	config := channelruntime.Config{
-		Mode:           mode,
-		ConversationID: channelspool.AliasFromKey(key, "conversation", bindingID+conversationSuffix),
-		ConductorID:    channelspool.AliasFromKey(key, "conductor", bindingID),
-		Profile:        selectedProfile,
-		RowInstanceID:  settings.RowInstanceID,
-		RowBinding:     settings.RowBindingToken,
-		ChannelID:      settings.ChannelID,
-		AppID:          settings.AppID,
-		TeamID:         settings.TeamID,
-		AllowedUserIDs: settings.AllowedUserIDs,
-		AppToken:       settings.AppToken,
-		BotToken:       settings.BotToken,
-		SpoolKey:       key,
-		Retention:      retention,
-		ControlSocket:  settings.ControlSocket,
+		Mode:              mode,
+		Attention:         attention,
+		AttentionInterval: attentionInterval,
+		ConversationID:    channelspool.AliasFromKey(key, "conversation", bindingID+conversationSuffix),
+		ConductorID:       channelspool.AliasFromKey(key, "conductor", bindingID),
+		Profile:           selectedProfile,
+		RowInstanceID:     settings.RowInstanceID,
+		RowBinding:        settings.RowBindingToken,
+		ChannelID:         settings.ChannelID,
+		AppID:             settings.AppID,
+		TeamID:            settings.TeamID,
+		AllowedUserIDs:    settings.AllowedUserIDs,
+		AppToken:          settings.AppToken,
+		BotToken:          settings.BotToken,
+		SpoolKey:          key,
+		Retention:         retention,
+		ControlSocket:     settings.ControlSocket,
 	}
 	if config.ControlSocket != "" {
 		config.BinarySHA256, err = runningBinarySHA256()

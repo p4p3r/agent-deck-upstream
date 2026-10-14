@@ -50,6 +50,11 @@ func conversationMode(cfg Config) channelgateway.Mode {
 }
 
 type Config struct {
+	// Attention summarises work waiting for the conductor and is supplied by
+	// the command layer, which owns what "waiting" means. Nil disables it, and
+	// a zero interval does too.
+	Attention         channelstream.AttentionSource
+	AttentionInterval time.Duration
 	// Mode is immutable for a conversation, so a mode change must reach a new
 	// ConversationID rather than rewrite an existing ledger. Empty means
 	// channel_stream, which is what every pre-existing conversation is.
@@ -276,8 +281,10 @@ func run(ctx context.Context, request Request, d dependencies) error {
 	}
 	defer driver.Close()
 	runner := &channelstream.Runner{
-		Retention: cfg.Retention,
-		Socket:    d.socket(cfg.AppToken),
+		Attention:         cfg.Attention,
+		AttentionInterval: cfg.AttentionInterval,
+		Retention:         cfg.Retention,
+		Socket:            d.socket(cfg.AppToken),
 		Handler: slackgateway.Handler{Store: store, Config: slackgateway.Config{
 			ConversationID: cfg.ConversationID, AppID: cfg.AppID, TeamID: identity.TeamID,
 			ChannelID: cfg.ChannelID, BotUserID: identity.BotUserID,

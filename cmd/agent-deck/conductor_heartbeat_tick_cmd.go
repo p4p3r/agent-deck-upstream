@@ -32,43 +32,11 @@ func handleConductorHeartbeatTick(profile string, args []string) {
 	}
 	name := fs.Arg(0)
 
-	storage, err := session.NewStorageWithProfile(profile)
+	in, prev, err := heartbeatTickInputs(profile, name, *rules)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "heartbeat-tick: %v\n", err)
 		os.Exit(1)
 	}
-	instances, _, err := storage.LoadWithGroups()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "heartbeat-tick: %v\n", err)
-		os.Exit(1)
-	}
-	session.RefreshInstancesForCLIStatus(instances)
-
-	in := session.HeartbeatTickInput{
-		Name:       name,
-		RulesPath:  *rules,
-		RulesStamp: session.HeartbeatRulesStamp(*rules),
-	}
-	conductorTitle := session.ConductorSessionTitle(name)
-	prev := session.LoadHeartbeatTickState(name)
-	for _, inst := range instances {
-		if inst.Title == conductorTitle {
-			n, digest, err := session.InboxSnapshot(inst.ID)
-			in.InboxPending = n
-			in.InboxDigest = digest
-			in.InboxError = in.InboxError || err != nil
-			continue
-		}
-		if strings.HasPrefix(inst.Title, "conductor-") ||
-			(inst.GroupPath != name && !strings.HasPrefix(inst.GroupPath, name+"/")) {
-			continue
-		}
-		_ = inst.UpdateStatus()
-		in.Sessions = append(in.Sessions, session.HeartbeatSessionView{
-			Title: inst.Title, Status: inst.Status, Path: inst.ProjectPath,
-		})
-	}
-
 	msg, next := session.BuildHeartbeatTick(in, prev)
 	if *commitMessage != "" {
 		if msg != *commitMessage {
@@ -89,4 +57,48 @@ func handleConductorHeartbeatTick(profile string, args []string) {
 	if msg != "" {
 		fmt.Println(msg)
 	}
+}
+
+// heartbeatTickInputs gathers exactly what the heartbeat tick is computed
+// from: every row in the conductor's own group tree, plus the conductor's
+// inbox. It is shared with the gateway so there is one definition of "waiting
+// for the conductor" rather than two that drift.
+func heartbeatTickInputs(profile, name, rulesPath string) (session.HeartbeatTickInput, session.HeartbeatTickState, error) {
+	var in session.HeartbeatTickInput
+	var prev session.HeartbeatTickState
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		return in, prev, err
+	}
+	instances, _, err := storage.LoadWithGroups()
+	if err != nil {
+		return in, prev, err
+	}
+	session.RefreshInstancesForCLIStatus(instances)
+
+	in = session.HeartbeatTickInput{
+		Name:       name,
+		RulesPath:  rulesPath,
+		RulesStamp: session.HeartbeatRulesStamp(rulesPath),
+	}
+	conductorTitle := session.ConductorSessionTitle(name)
+	prev = session.LoadHeartbeatTickState(name)
+	for _, inst := range instances {
+		if inst.Title == conductorTitle {
+			n, digest, err := session.InboxSnapshot(inst.ID)
+			in.InboxPending = n
+			in.InboxDigest = digest
+			in.InboxError = in.InboxError || err != nil
+			continue
+		}
+		if strings.HasPrefix(inst.Title, "conductor-") ||
+			(inst.GroupPath != name && !strings.HasPrefix(inst.GroupPath, name+"/")) {
+			continue
+		}
+		_ = inst.UpdateStatus()
+		in.Sessions = append(in.Sessions, session.HeartbeatSessionView{
+			Title: inst.Title, Status: inst.Status, Path: inst.ProjectPath,
+		})
+	}
+	return in, prev, nil
 }

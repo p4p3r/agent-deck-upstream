@@ -1334,9 +1334,14 @@ type SlackV2ConductorConfig struct {
 	// only when it mentions this bot, and then keeps the thread it opened
 	// without needing another mention -- which is what lets several conductors
 	// share one channel.
-	SegmentMode     string `toml:"segment_mode,omitempty"`
-	CodexExecutable string `toml:"-"`
-	CodexModel      string `toml:"-"`
+	SegmentMode string `toml:"segment_mode,omitempty"`
+	// Minutes between summaries of work waiting for the conductor. Zero, the
+	// default, sends none: the legacy heartbeat unit produced these by typing
+	// into the conductor's pane, and nothing should until the gateway carries
+	// them behind its single writer.
+	AttentionIntervalMinutes int64  `toml:"attention_interval_minutes,omitempty"`
+	CodexExecutable          string `toml:"-"`
+	CodexModel               string `toml:"-"`
 }
 
 const (

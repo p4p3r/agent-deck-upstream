@@ -12,10 +12,11 @@ import (
 )
 
 type fakeAttention struct {
-	mu      sync.Mutex
-	summary string
-	err     error
-	calls   int
+	mu        sync.Mutex
+	summary   string
+	err       error
+	calls     int
+	delivered []string
 }
 
 func (f *fakeAttention) Attention(context.Context) (string, error) {
@@ -23,6 +24,13 @@ func (f *fakeAttention) Attention(context.Context) (string, error) {
 	defer f.mu.Unlock()
 	f.calls++
 	return f.summary, f.err
+}
+
+func (f *fakeAttention) Delivered(_ context.Context, summary string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.delivered = append(f.delivered, summary)
+	return nil
 }
 
 func (f *fakeAttention) set(summary string) {
@@ -147,6 +155,27 @@ func TestAttentionFailureIsQuietAndRateLimited(t *testing.T) {
 	*now = now.Add(time.Hour)
 	f.runner.attend(ctx)
 	require.Equal(t, []string{"recovered"}, submitted(f.driver))
+}
+
+// The source's delta state must not advance past what the row received: a
+// nudge committed before delivery is a nudge lost.
+func TestDeliveredRecordsOnlyWhatTheRowAccepted(t *testing.T) {
+	ctx := context.Background()
+	f, source, now := attentive(t)
+	f.runner.attend(ctx)
+	source.mu.Lock()
+	require.Equal(t, []string{"1 session waiting: impl"}, source.delivered)
+	source.mu.Unlock()
+
+	f.driver.mu.Lock()
+	f.driver.startErr = errors.New("row refused")
+	f.driver.mu.Unlock()
+	source.set("2 sessions waiting: impl, review")
+	*now = now.Add(time.Hour)
+	f.runner.attend(ctx)
+	source.mu.Lock()
+	require.Len(t, source.delivered, 1, "a refused submit commits nothing")
+	source.mu.Unlock()
 }
 
 func TestAttentionIsOffByDefault(t *testing.T) {

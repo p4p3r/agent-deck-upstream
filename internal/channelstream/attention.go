@@ -17,6 +17,12 @@ import (
 // An empty summary means there is nothing to say, which is the ordinary case.
 type AttentionSource interface {
 	Attention(ctx context.Context) (string, error)
+	// Delivered records that the row accepted this exact summary, so the next
+	// call can report the delta against it. It mirrors the two-phase commit
+	// the heartbeat CLI already used: print, send, then commit. A send that
+	// reports success is not a delivery, and committing before the row has it
+	// loses the nudge outright.
+	Delivered(ctx context.Context, summary string) error
 }
 
 // attend tells the conductor what is waiting for it, at most once per
@@ -62,6 +68,9 @@ func (r *Runner) attend(ctx context.Context) {
 		return
 	}
 	r.attentionDigest = fingerprint
+	// Only now: the source's own delta state must not advance past what the
+	// row actually received.
+	_ = r.Attention.Delivered(ctx, summary)
 }
 
 // now is injectable for tests. The Runner's Clock only makes timers, which is
