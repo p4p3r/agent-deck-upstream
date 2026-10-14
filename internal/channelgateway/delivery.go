@@ -50,6 +50,35 @@ func (s *Store) ConversationRoute(ctx context.Context, conversationID string) (M
 
 // OutboxRecord reads an item without claiming it, so a transport can reject
 // an incompatible route before altering delivery state.
+// ConversationBusy reports whether this conversation has a turn in flight.
+//
+// Anything the gateway sends on its own behalf must wait for one: the row
+// takes a single operation at a time, and a second writer typing into the same
+// pane is the failure the writer fence exists to prevent.
+func (s *Store) ConversationBusy(ctx context.Context, conversationID string) (bool, error) {
+	if conversationID == "" {
+		return false, ErrInvalid
+	}
+	var open int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM turns WHERE conversation_id=? AND status='active'`,
+		conversationID).Scan(&open)
+	if err != nil {
+		return false, ErrStorage
+	}
+	if open > 0 {
+		return true, nil
+	}
+	// A reply still waiting to be posted is work in flight too.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM outbox WHERE conversation_id=? AND state!='delivered'`,
+		conversationID).Scan(&open)
+	if err != nil {
+		return false, ErrStorage
+	}
+	return open > 0, nil
+}
+
 // TurnMessage is the exact provider timestamp of the message that opened a
 // turn, for acting on it afterwards. It is empty, with no error, when that
 // message predates message sealing: a missing reaction is not a failure.

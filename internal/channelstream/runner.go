@@ -100,15 +100,23 @@ type Runner struct {
 	BackoffMax   time.Duration
 	Clock        Clock
 	Retention    channelgateway.RetentionPolicy
+	// Attention summarises work waiting for the conductor; nil disables it.
+	Attention AttentionSource
+	// AttentionInterval bounds how often that summary may reach the row.
+	AttentionInterval time.Duration
+	// Now is injectable so the interval is testable without sleeping.
+	Now func() time.Time
 
-	mu            sync.Mutex
-	running       bool
-	terminal      bool
-	status        Status
-	lastProgress  time.Time
-	progressKnown bool
-	progress      atomic.Uint64
-	lastRetention time.Time // pump goroutine only
+	mu              sync.Mutex
+	running         bool
+	terminal        bool
+	status          Status
+	lastProgress    time.Time
+	progressKnown   bool
+	progress        atomic.Uint64
+	lastRetention   time.Time // pump goroutine only
+	lastAttention   time.Time // pump goroutine only
+	attentionDigest string    // pump goroutine only
 }
 
 type PumpHealth struct {
@@ -313,6 +321,9 @@ func (r *Runner) step(ctx context.Context, wake chan<- struct{}) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// After draining Slack work, before claiming more: a nudge is what the
+	// conductor hears when nobody is talking to it.
+	r.attend(ctx)
 	if r.Status().Degraded {
 		return progressed, nil
 	}
