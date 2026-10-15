@@ -3,6 +3,7 @@ package channelstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -182,4 +183,74 @@ func TestAttentionIsOffByDefault(t *testing.T) {
 	f := newRunnerFixture(t)
 	f.runner.attend(context.Background())
 	require.Empty(t, submitted(f.driver))
+}
+
+// The gateway is otherwise silent. On 2026-10-15 box 4 committed a nudge's
+// digest while the pane never showed it, and there was nothing anywhere to say
+// whether the row had refused it, queued it, or never been asked. These lines
+// are that evidence.
+func TestAttentionRecordsWhatItDecided(t *testing.T) {
+	ctx := context.Background()
+	f, source, now := attentive(t)
+	var lines []string
+	f.runner.Log = func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+
+	f.runner.attend(ctx)
+	require.Len(t, lines, 1)
+	require.Contains(t, lines[0], "attention: submitted")
+	require.Contains(t, lines[0], "state=")
+
+	// Same summary a full interval later: the suppression is reported, because
+	// silence and suppression look identical from outside.
+	*now = now.Add(time.Hour)
+	f.runner.attend(ctx)
+	require.Contains(t, lines[len(lines)-1], "unchanged since the last nudge")
+
+	source.set("")
+	*now = now.Add(time.Hour)
+	f.runner.attend(ctx)
+	require.Contains(t, lines[len(lines)-1], "nothing waiting")
+}
+
+func TestAttentionRecordsASubmitFailure(t *testing.T) {
+	ctx := context.Background()
+	f, _, _ := attentive(t)
+	var lines []string
+	f.runner.Log = func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	f.driver.mu.Lock()
+	f.driver.startErr = errors.New("row is gone")
+	f.driver.mu.Unlock()
+
+	f.runner.attend(ctx)
+	require.Len(t, lines, 1)
+	require.Contains(t, lines[0], "attention: submit failed")
+	require.Contains(t, lines[0], "row is gone")
+}
+
+// A nudge held back by a live turn is the commonest reason for silence, and
+// the one that cost three hours to identify on box 4.
+func TestAttentionRecordsThatTheRowIsBusy(t *testing.T) {
+	ctx := context.Background()
+	f, _, _ := attentive(t)
+	var lines []string
+	f.runner.Log = func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	_, err := f.store.Ingest(ctx, channelgateway.Inbound{
+		ConversationID: runConversation, EventID: "ev1", MessageID: "ts1",
+		ChannelID: runChannel, SenderID: runUser, Body: "real work",
+	})
+	require.NoError(t, err)
+	turn, err := f.store.NextTurn(ctx, runConversation)
+	require.NoError(t, err)
+	require.NotNil(t, turn)
+
+	f.runner.attend(ctx)
+	require.Empty(t, submitted(f.driver))
+	require.Len(t, lines, 1)
+	require.Contains(t, lines[0], "owns the row")
 }

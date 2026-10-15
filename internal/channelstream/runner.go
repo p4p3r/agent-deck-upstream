@@ -106,6 +106,11 @@ type Runner struct {
 	AttentionInterval time.Duration
 	// Now is injectable so the interval is testable without sleeping.
 	Now func() time.Time
+	// Log records what the attention path decided and what the row did with
+	// it. The gateway is otherwise silent, which is why a nudge that was
+	// accepted by the driver and never reached the pane left no trace at all
+	// on box 4 (2026-10-15). nil keeps tests quiet.
+	Log func(format string, args ...any)
 
 	mu              sync.Mutex
 	running         bool

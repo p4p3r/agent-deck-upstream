@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +56,10 @@ type Config struct {
 	// a zero interval does too.
 	Attention         channelstream.AttentionSource
 	AttentionInterval time.Duration
+	// AttentionLog receives one line per attention decision. nil sends them to
+	// stderr, which under systemd is the service journal; a caller that wants
+	// silence passes a function that discards.
+	AttentionLog func(format string, args ...any)
 	// Mode is immutable for a conversation, so a mode change must reach a new
 	// ConversationID rather than rewrite an existing ledger. Empty means
 	// channel_stream, which is what every pre-existing conversation is.
@@ -280,9 +285,14 @@ func run(ctx context.Context, request Request, d dependencies) error {
 		return &Error{Kind: KindAgent}
 	}
 	defer driver.Close()
+	attentionLog := cfg.AttentionLog
+	if attentionLog == nil {
+		attentionLog = log.New(os.Stderr, "slack-v2: ", log.LstdFlags|log.LUTC).Printf
+	}
 	runner := &channelstream.Runner{
 		Attention:         cfg.Attention,
 		AttentionInterval: cfg.AttentionInterval,
+		Log:               attentionLog,
 		Retention:         cfg.Retention,
 		Socket:            d.socket(cfg.AppToken),
 		Handler: slackgateway.Handler{Store: store, Config: slackgateway.Config{

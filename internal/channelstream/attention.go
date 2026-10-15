@@ -48,11 +48,21 @@ func (r *Runner) attend(ctx context.Context) {
 	// Never speak over an in-flight turn. The row takes one operation at a
 	// time, and the answer to a Slack message matters more than a nudge.
 	busy, err := r.Handler.Store.ConversationBusy(ctx, r.Handler.Config.ConversationID)
-	if err != nil || busy {
+	if err != nil {
+		r.logf("attention: busy check failed: %v", err)
+		return
+	}
+	if busy {
+		r.logf("attention: skipped, a turn or an undelivered reply owns the row")
 		return
 	}
 	summary, err := r.Attention.Attention(ctx)
-	if err != nil || summary == "" {
+	if err != nil {
+		r.logf("attention: source failed: %v", err)
+		return
+	}
+	if summary == "" {
+		r.logf("attention: nothing waiting")
 		return
 	}
 	digest := sha256.Sum256([]byte(summary))
@@ -60,17 +70,38 @@ func (r *Runner) attend(ctx context.Context) {
 	if fingerprint == r.attentionDigest {
 		// Nothing changed since the last nudge. Repeating it would cost the
 		// conductor a whole turn to read something it has already seen.
+		r.logf("attention: unchanged since the last nudge, digest=%s", fingerprint[:16])
 		return
 	}
-	if _, err := r.Worker.RowDriver.SubmitRowOperation(ctx, "attention-"+fingerprint[:16], summary); err != nil {
+	op, err := r.Worker.RowDriver.SubmitRowOperation(ctx, "attention-"+fingerprint[:16], summary)
+	if err != nil {
 		// Advisory in full: the next interval tries again, and a failure here
 		// never touches the Slack path.
+		r.logf("attention: submit failed: digest=%s: %v", fingerprint[:16], err)
 		return
 	}
+	// A submit returns as soon as the send is QUEUED. The row types it later,
+	// so this line records what the driver actually said: a send that never
+	// leaves "queued" is the shape of a nudge that reaches the ledger and
+	// never reaches the pane.
+	r.logf("attention: submitted digest=%s send=%s state=%s bytes=%d",
+		fingerprint[:16], op.SendID, op.State, len(summary))
 	r.attentionDigest = fingerprint
 	// Only now: the source's own delta state must not advance past what the
 	// row actually received.
-	_ = r.Attention.Delivered(ctx, summary)
+	if err := r.Attention.Delivered(ctx, summary); err != nil {
+		r.logf("attention: commit failed: digest=%s: %v", fingerprint[:16], err)
+	}
+}
+
+// logf writes one line about the attention path. The gateway logs nothing
+// else, so these lines are the only evidence of a nudge that was accepted and
+// then lost; they are at most one per interval per decision.
+func (r *Runner) logf(format string, args ...any) {
+	if r.Log == nil {
+		return
+	}
+	r.Log(format, args...)
 }
 
 // now is injectable for tests. The Runner's Clock only makes timers, which is
