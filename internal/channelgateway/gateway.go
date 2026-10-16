@@ -70,6 +70,29 @@ type Inbound struct {
 	SenderID       string
 	Mentioned      bool
 	Body           string
+	// Control is an instruction to the gateway rather than to the agent:
+	// ControlLeave or ControlLeaveAll, decided by the adapter from the text a
+	// human addressed to this bot. It never becomes a turn, so no agent can
+	// decline it -- the whole point, after a conductor kept acting on a thread
+	// it had been told twice to ignore.
+	Control Control
+}
+
+// Control is an instruction the gateway executes itself.
+type Control string
+
+const (
+	ControlNone     Control = ""
+	ControlLeave    Control = "leave"
+	ControlLeaveAll Control = "leave_all"
+)
+
+// ControlResult reports what a Control did, so the adapter can say so in the
+// thread. Silence after "leave" is indistinguishable from a bot that ignored
+// it, which is the failure this feature exists to end.
+type ControlResult struct {
+	Control Control
+	Closed  int
 }
 
 type IntakeResult struct {
@@ -77,7 +100,9 @@ type IntakeResult struct {
 	Duplicate       bool
 	SegmentID       string
 	SegmentState    string
+	SegmentOwner    string
 	PointerThreadID string
+	ControlResult   ControlResult
 }
 
 // TurnID is stable across retries and restarts. A driver must reconcile an
@@ -121,7 +146,7 @@ type Store struct {
 	now   func() time.Time
 }
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 const v3ArchiveSuffix = ".v3-archive"
 
@@ -424,7 +449,17 @@ var schemaDDL = []string{
 	)`,
 	`CREATE TABLE segments (
 		id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
-		root_thread_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending','open','superseded')),
+		root_thread_id TEXT NOT NULL,
+		-- state is where this segment sits in the conversation's queue, and
+		-- 'closed' is the operator having said leave.
+		state TEXT NOT NULL CHECK (state IN ('pending','open','superseded','closed')),
+		-- ownership is a separate question from scheduling: a guest segment is a
+		-- thread this conversation did not open, entered by an explicit mention.
+		-- It is scheduled exactly like any other -- otherwise its messages would
+		-- be accepted and never answered -- but it accepts ONLY messages that
+		-- address this bot, so a cross-mention can never subscribe a bot to
+		-- somebody else's conversation.
+		ownership TEXT NOT NULL DEFAULT 'owner' CHECK (ownership IN ('owner','guest')),
 		created_event_id TEXT, superseded_by TEXT,
 		UNIQUE (conversation_id, root_thread_id)
 	)`,

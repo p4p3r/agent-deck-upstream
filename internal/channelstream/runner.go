@@ -421,6 +421,12 @@ func (r *Runner) callback(ctx context.Context, raw []byte, ack func(context.Cont
 	if result.Pointer.Wanted() && r.Delivery != nil {
 		_ = r.Delivery.PostPointer(ctx, result.Pointer)
 	}
+	// A gateway instruction is answered the same way, and as best effort: the
+	// leave itself is already committed in the ledger, so a failed courtesy
+	// never leaves the bot still following the thread.
+	if result.Control.Wanted() && r.Delivery != nil {
+		_ = r.Delivery.PostControl(ctx, result.Control)
+	}
 	return nil
 }
 

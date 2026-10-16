@@ -72,6 +72,76 @@ func promotePending(tx *writeTx, conversationID string) error {
 	return err
 }
 
+// reopenAsGuest answers an explicit address in a thread this conversation has
+// left. The segment comes back as a guest whatever it was before: being asked
+// one more question is not a reason to resume following a thread, and a guest
+// claims no slot, so picking one thread back up cannot park another.
+func reopenAsGuest(tx *writeTx, segmentID string) error {
+	_, err := tx.exec(`UPDATE segments SET state='open',ownership='guest' WHERE id=?`, segmentID)
+	return err
+}
+
+// closeSegments executes a leave. It returns how many segments it closed.
+//
+// Closing the ACTIVE segment promotes the pending one in its place; without
+// that the conversation keeps an active segment that answers nothing and the
+// bot goes quiet everywhere, which is the obvious way to get this wrong.
+func closeSegments(tx *writeTx, conversationID string, c conversationState, threadID string, control Control) (int, error) {
+	// Every query below selects the same set, so the counts and the update can
+	// never disagree: one transaction, one predicate.
+	where := `conversation_id=? AND state IN ('open','pending')`
+	args := []any{conversationID}
+	if control != ControlLeaveAll {
+		if threadID == "" {
+			// "leave" at the top level names no thread, so there is nothing to
+			// leave. Reported as zero rather than as an error: the operator
+			// still gets an answer saying so.
+			return 0, nil
+		}
+		where += ` AND root_thread_id=?`
+		args = append(args, threadID)
+	}
+	counts := func(extra string, extraArgs ...any) (int, error) {
+		var n int
+		query := `SELECT count(*) FROM segments WHERE ` + where + extra
+		if err := tx.row(query, append(append([]any{}, args...), extraArgs...)...).Scan(&n); err != nil {
+			return 0, ErrStorage
+		}
+		return n, nil
+	}
+	closed, err := counts("")
+	if err != nil || closed == 0 {
+		return 0, err
+	}
+	closedActive, err := counts(` AND id=?`, c.active)
+	if err != nil {
+		return 0, err
+	}
+	closedPending, err := counts(` AND id=?`, c.pending)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.exec(`UPDATE segments SET state='closed' WHERE `+where, args...); err != nil {
+		return 0, err
+	}
+	switch {
+	case closedActive > 0 && closedPending == 0 && c.pending != "":
+		if _, err := tx.exec(`UPDATE conversations SET active_segment_id=pending_segment_id,pending_segment_id=NULL WHERE id=?`, conversationID); err != nil {
+			return 0, err
+		}
+	case closedActive > 0:
+		if _, err := tx.exec(`UPDATE conversations SET active_segment_id=NULL WHERE id=?`, conversationID); err != nil {
+			return 0, err
+		}
+	}
+	if closedPending > 0 {
+		if _, err := tx.exec(`UPDATE conversations SET pending_segment_id=NULL WHERE id=?`, conversationID); err != nil {
+			return 0, err
+		}
+	}
+	return closed, nil
+}
+
 // Ingest atomically authenticates, deduplicates, and routes an external event.
 // The adapter should acknowledge delivery only after this call succeeds.
 func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
@@ -128,7 +198,17 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 		}
 
 		out.Disposition = Ignored
-		if c.mode == ChannelStream {
+		if in.Control != ControlNone && c.mode == ThreadSegments {
+			// A control is executed here, inside the same transaction that
+			// deduplicates the event, so a Slack retry cannot run it twice and
+			// cannot post its confirmation twice either. It never reaches the
+			// agent: the disposition stays Ignored.
+			closed, err := closeSegments(tx, in.ConversationID, c, in.ThreadID, in.Control)
+			if err != nil {
+				return err
+			}
+			out.ControlResult = ControlResult{Control: in.Control, Closed: closed}
+		} else if c.mode == ChannelStream {
 			if in.ThreadID == "" {
 				out.Disposition, out.SegmentID = Accepted, c.active
 			}
@@ -139,21 +219,36 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 			if root == "" {
 				root = s.alias("thread", messageID)
 			}
-			var segmentID, state string
-			err = tx.row(`SELECT id,state FROM segments WHERE conversation_id=? AND root_thread_id=?`, in.ConversationID, root).
-				Scan(&segmentID, &state)
+			var segmentID, state, owner string
+			err = tx.row(`SELECT id,state,ownership FROM segments WHERE conversation_id=? AND root_thread_id=?`, in.ConversationID, root).
+				Scan(&segmentID, &state, &owner)
 			switch {
 			case err == nil:
 				out.SegmentID = segmentID
+				// A guest thread answers only what addresses it, and never
+				// follows a conversation between two other parties.
+				if owner == "guest" && !in.Mentioned {
+					state = "muted"
+				}
 				switch state {
+				case "muted":
 				case "pending":
 					out.Disposition = Accepted
 				case "open":
-					if c.pending == "" {
+					if c.pending == "" || owner == "guest" {
 						out.Disposition = Accepted
 					} else {
 						out.Disposition = RejectedPending
 						out.PointerThreadID, err = segmentRoot(tx, c.pending)
+					}
+				case "closed":
+					// Left. An unmentioned reply is nothing to do with us; an
+					// explicit address is answered once, as a guest, which is
+					// also how the thread can be picked up again.
+					if in.Mentioned {
+						if err = reopenAsGuest(tx, segmentID); err == nil {
+							out.Disposition, out.SegmentID = Accepted, segmentID
+						}
 					}
 				case "superseded":
 					out.Disposition = RejectedSuperseded
@@ -166,10 +261,27 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 				}
 			case errors.Is(err, sql.ErrNoRows):
 				if in.Mentioned {
-					if c.pending != "" {
+					// A guest is never parked behind a pending successor: it
+					// claims no slot, so there is nothing for it to wait for.
+					if c.pending != "" && in.ThreadID == "" {
 						out.Disposition = RejectedPending
 						out.PointerThreadID, err = segmentRoot(tx, c.pending)
 						if err != nil {
+							return err
+						}
+					} else if in.ThreadID != "" {
+						// A mention inside a thread somebody else opened enters
+						// it as a guest. It answers that message and never an
+						// unmentioned reply, and it claims neither the active
+						// nor the pending slot: being asked a question in
+						// someone else's thread must not park the thread the
+						// operator is actually working in. On 2026-10-14 two
+						// boxes were cross-mentioned in a third box's thread,
+						// each took ownership of it, and then answered every
+						// later reply -- including the ones telling them to
+						// stop.
+						out.Disposition, out.SegmentID = Accepted, uuid.NewString()
+						if _, err := tx.exec(`INSERT INTO segments(id,conversation_id,root_thread_id,state,ownership,created_event_id) VALUES(?,?,?,'open','guest',?)`, out.SegmentID, in.ConversationID, root, in.EventID); err != nil {
 							return err
 						}
 					} else {
@@ -214,7 +326,7 @@ func (s *Store) Ingest(ctx context.Context, in Inbound) (IntakeResult, error) {
 			return err
 		}
 		if out.SegmentID != "" {
-			if err := tx.row(`SELECT state FROM segments WHERE id=?`, out.SegmentID).Scan(&out.SegmentState); err != nil {
+			if err := tx.row(`SELECT state,ownership FROM segments WHERE id=?`, out.SegmentID).Scan(&out.SegmentState, &out.SegmentOwner); err != nil {
 				return ErrStorage
 			}
 		}
@@ -266,22 +378,30 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 			return err
 		}
 		c, err = loadConversation(tx, conversationID)
-		if err != nil || c.active == "" {
+		if err != nil {
 			return err
 		}
+		// No active segment is not the same as no work: a guest thread carries
+		// its own queue and owns no slot.
 		var ordinal int64
 		var t Turn
-		err = tx.row(`SELECT ordinal,event_id,message_id,thread_id,content_ref FROM inbound_events
-			WHERE conversation_id=? AND segment_id=? AND disposition='accepted' AND turn_id IS NULL
-			ORDER BY ordinal LIMIT 1`, conversationID, c.active).
-			Scan(&ordinal, &t.EventID, &t.MessageID, &t.ThreadID, &t.Body)
+		var segmentID string
+		// The active segment's queue, plus anything addressed to this bot in a
+		// thread it is only a guest in. A guest owns no slot, so without this
+		// its messages would be accepted and never answered.
+		err = tx.row(`SELECT ordinal,segment_id,event_id,message_id,thread_id,content_ref FROM inbound_events
+			WHERE conversation_id=? AND disposition='accepted' AND turn_id IS NULL
+			  AND (segment_id=? OR segment_id IN
+				(SELECT id FROM segments WHERE conversation_id=? AND ownership='guest'))
+			ORDER BY ordinal LIMIT 1`, conversationID, c.active, conversationID).
+			Scan(&ordinal, &segmentID, &t.EventID, &t.MessageID, &t.ThreadID, &t.Body)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
 			return ErrStorage
 		}
-		t.ID, t.ConversationID, t.SegmentID, t.AttemptState = uuid.NewString(), conversationID, c.active, Unprepared
+		t.ID, t.ConversationID, t.SegmentID, t.AttemptState = uuid.NewString(), conversationID, segmentID, Unprepared
 		if err := tx.row(`SELECT next_turn FROM conversations WHERE id=?`, conversationID).Scan(&t.Number); err != nil {
 			return ErrStorage
 		}
@@ -290,7 +410,7 @@ func (s *Store) NextTurn(ctx context.Context, conversationID string) (*Turn, err
 			return err
 		}
 		if _, err := tx.exec(`INSERT INTO turns(id,conversation_id,number,event_ordinal,segment_id,status)
-			VALUES(?,?,?,?,?,'active')`, t.ID, conversationID, t.Number, ordinal, c.active); err != nil {
+			VALUES(?,?,?,?,?,'active')`, t.ID, conversationID, t.Number, ordinal, segmentID); err != nil {
 			return err
 		}
 		if _, err := tx.exec(`UPDATE inbound_events SET turn_id=? WHERE ordinal=?`, t.ID, ordinal); err != nil {

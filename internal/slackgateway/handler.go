@@ -62,6 +62,11 @@ type HandleResult struct {
 	// failure this whole fork exists to stop, so the caller answers in the
 	// thread the operator wrote in.
 	Pointer Pointer
+	// Control is set when the message was an instruction to the gateway
+	// itself. It is answered for the same reason a pointer is: an operator who
+	// says "leave" and hears nothing cannot tell obedience from the behaviour
+	// they were trying to stop.
+	Control Control
 }
 
 // Pointer addresses one advisory reply: where to post it, and which thread the
@@ -73,6 +78,63 @@ type Pointer struct {
 }
 
 func (p Pointer) Wanted() bool { return p.ThreadTS != "" && p.PointerThreadTS != "" }
+
+// Control answers a gateway instruction in the thread it was given in.
+type Control struct {
+	ThreadTS string
+	Kind     channelgateway.Control
+	Closed   int
+}
+
+func (c Control) Wanted() bool { return c.ThreadTS != "" && c.Kind != channelgateway.ControlNone }
+
+// controlWord is the single word this gateway obeys, and it must be the whole
+// message once the mentions are removed. One word, exactly matched, so that
+// "@bot stop doing that" stays an instruction to the agent and only a
+// deliberate "@bot leave" is an instruction to the gateway.
+const controlWord = "leave"
+
+// controlAll extends it to every thread this bot is following.
+const controlAll = "leave all"
+
+// control reads a message addressed to this bot as a gateway instruction.
+//
+// It is matched here, before intake, so no agent ever sees it and no agent can
+// decline it. On 2026-10-14 a conductor was told twice in plain English to
+// ignore a thread it had been cross-mentioned into, and went on acting on it;
+// an instruction a model can reason about is not a control.
+func control(text, botUserID string) channelgateway.Control {
+	if botUserID == "" || !mentions(text, botUserID) {
+		return channelgateway.ControlNone
+	}
+	// Remove every mention, not just this bot's: "@deck2 @deck4 leave" is one
+	// message addressed to two bots, and each must read it the same way.
+	var b strings.Builder
+	rest := text
+	for {
+		open := strings.Index(rest, "<@")
+		if open < 0 {
+			b.WriteString(rest)
+			break
+		}
+		close := strings.Index(rest[open:], ">")
+		if close < 0 {
+			b.WriteString(rest)
+			break
+		}
+		b.WriteString(rest[:open])
+		b.WriteString(" ")
+		rest = rest[open+close+1:]
+	}
+	words := strings.Fields(strings.ToLower(b.String()))
+	switch strings.Join(words, " ") {
+	case controlWord:
+		return channelgateway.ControlLeave
+	case controlAll:
+		return channelgateway.ControlLeaveAll
+	}
+	return channelgateway.ControlNone
+}
 
 func validConfig(c Config) bool {
 	if c.ConversationID == "" || c.AppID == "" || c.TeamID == "" || c.ChannelID == "" || c.BotUserID == "" || len(c.AllowedUserIDs) == 0 {
@@ -480,9 +542,18 @@ func (h Handler) Handle(ctx context.Context, raw []byte, ack func(context.Contex
 			ConversationID: h.Config.ConversationID, EventID: p.eventID, MessageID: p.messageID,
 			ThreadID: p.threadID, ChannelID: p.channelID, SenderID: p.userID,
 			Mentioned: mentions(p.text, h.Config.BotUserID), Body: provenance(p) + p.text,
+			Control: control(p.text, h.Config.BotUserID),
 		})
 		if err != nil {
 			return result, err
+		}
+		// A duplicate's control already ran and was already answered.
+		if !result.Intake.Duplicate && result.Intake.ControlResult.Control != channelgateway.ControlNone {
+			result.Control = Control{
+				ThreadTS: replyThread(p),
+				Kind:     result.Intake.ControlResult.Control,
+				Closed:   result.Intake.ControlResult.Closed,
+			}
 		}
 		// A stored event the gateway declined to act on is as ignored to a
 		// caller as one this boundary filtered: both mean no turn. The

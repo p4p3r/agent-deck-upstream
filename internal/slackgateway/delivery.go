@@ -39,6 +39,11 @@ const (
 	pointerBusy       = "Working in another thread; this is parked until that one finishes."
 	pointerSuperseded = "This conversation has been replaced; the active one continues elsewhere."
 	pointerFollow     = " Follow it here: "
+	// Control answers. Fixed text, no operator content, like the pointers.
+	controlLeft     = "Left this thread. Mention me to start a new one."
+	controlNotHere  = "Not following this thread."
+	controlLeftAll  = "Left every thread I was following. Mention me to start a new one."
+	controlNoneOpen = "I was not following any thread."
 )
 
 type PostResult struct {
@@ -344,6 +349,42 @@ func (w *DeliveryWorker) PostPointer(ctx context.Context, p Pointer) error {
 		body += pointerFollow + link
 	}
 	post, err := w.Sender.PostInThread(ctx, w.ChannelID, p.ThreadTS, body)
+	if err != nil || !post.OK {
+		return ErrPost
+	}
+	return nil
+}
+
+// PostControl answers a gateway instruction in the thread it was given in.
+//
+// Outside the outbox for the same reason a pointer is: there is no turn to
+// hang it off and a late answer is worse than none. It matters more than a
+// pointer, though -- an operator who types "leave" and hears nothing has no
+// way to tell a bot that obeyed from one that is about to answer again.
+func (w *DeliveryWorker) PostControl(ctx context.Context, c Control) error {
+	if !c.Wanted() {
+		return ErrConfig
+	}
+	mode, err := w.route(ctx)
+	if err != nil {
+		return err
+	}
+	// Only a segmented conversation follows threads, so only it can leave one.
+	if mode != channelgateway.ThreadSegments {
+		return ErrConfig
+	}
+	var body string
+	switch {
+	case c.Kind == channelgateway.ControlLeaveAll && c.Closed > 0:
+		body = controlLeftAll
+	case c.Kind == channelgateway.ControlLeaveAll:
+		body = controlNoneOpen
+	case c.Closed > 0:
+		body = controlLeft
+	default:
+		body = controlNotHere
+	}
+	post, err := w.Sender.PostInThread(ctx, w.ChannelID, c.ThreadTS, body)
 	if err != nil || !post.OK {
 		return ErrPost
 	}

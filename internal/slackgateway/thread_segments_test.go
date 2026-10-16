@@ -84,9 +84,16 @@ func TestThreadSegmentsIgnoresForeignThreadUntilMentioned(t *testing.T) {
 	require.False(t, pulled.Ignored, "an explicit mention reaches into any thread")
 	require.Equal(t, channelgateway.Accepted, pulled.Intake.Disposition)
 
+	// Being addressed does NOT subscribe this conductor to a thread somebody
+	// else opened. On 2026-10-14 two boxes were cross-mentioned in a third
+	// box's thread, bound themselves to it, and then answered every later
+	// reply -- including the two telling them to stop.
 	after := deliver(t, h, threadEnvelope("e3", "ev3", "and the packs repo too", "1700000000.000004", "1700000000.000001"))
-	require.False(t, after.Ignored, "the thread is bound here once it has been addressed")
-	require.Equal(t, pulled.Intake.SegmentID, after.Intake.SegmentID)
+	require.True(t, after.Ignored, "a guest answers what addresses it and nothing else")
+
+	addressed := deliver(t, h, threadEnvelope("e4", "ev4", mention("and the packs repo too"), "1700000000.000005", "1700000000.000001"))
+	require.False(t, addressed.Ignored, "addressed again, it answers again")
+	require.Equal(t, pulled.Intake.SegmentID, addressed.Intake.SegmentID)
 }
 
 // Slack stamps thread_ts on a parent once it has replies. That parent is still
