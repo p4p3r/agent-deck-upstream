@@ -19,8 +19,10 @@ import (
 // hookEventHistoryMax events, so the next late Stop can be traced against
 // the pane and the transcript after the fact.
 //
-// Diagnostic only: nothing reads this file on any status path (the hook
-// watcher ignores non-.json names, the CLI cold load reads <id>.json). It is
+// Not diagnostic only any more: session.CodexTurnCompleted reads it to settle
+// a correlated send whose completion was masked before anyone saw it (the
+// 2026-10-17 box 2 stall). The hook watcher still ignores non-.json names and
+// the CLI cold load still reads <id>.json. It is
 // pruned with the instance's other hook artifacts (session.PruneHookArtifacts)
 // and disabled together with the runtime health sampler by
 // `[health] enabled = false` in config.toml — the same kill switch, so one
@@ -50,6 +52,15 @@ type hookEvent struct {
 	PID       int    `json:"pid"`
 	// Sequence is the Hermes generation-lock sequence when one applies.
 	Sequence uint64 `json:"sequence,omitempty"`
+	// The Codex turn generations this event started and completed. The status
+	// file holds only the last event and a later "running" sample masks a
+	// completion for reuse-safety, so without these a completion that nobody
+	// read in the seconds it was visible is gone for good: on 2026-10-17 box 2
+	// completed a turn at 06:44:08, the completion was masked at 06:44:14, and
+	// the Slack reply for it was never posted. This line is the durable
+	// evidence that it happened.
+	CodexStartedGeneration   string `json:"codex_started_generation,omitempty"`
+	CodexCompletedGeneration string `json:"codex_completed_generation,omitempty"`
 }
 
 // hookEventHistoryEnabled shares the health sampler's kill switch.
@@ -66,12 +77,17 @@ func hookEventHistoryPath(hooksDir, instanceID string) string {
 // appendHookEvent records one written status-file event. Errors are logged
 // at debug level and never affect the status write that preceded it.
 func appendHookEvent(instanceID string, sf hookStatusFile) {
-	if !hookEventHistoryEnabled() {
+	// A line that carries a completed Codex generation is no longer only a
+	// diagnostic: it is the evidence a correlated send is settled against, so
+	// it is written whether or not the health sampler is on.
+	if !hookEventHistoryEnabled() && sf.CodexCompletedGeneration == "" {
 		return
 	}
 	ev := hookEvent{
 		At: time.Now().UTC().Format(time.RFC3339Nano), Event: sf.Event, Status: sf.Status,
 		SessionID: sf.SessionID, PID: os.Getpid(), Sequence: sf.Sequence,
+		CodexStartedGeneration:   sf.CodexStartedGeneration,
+		CodexCompletedGeneration: sf.CodexCompletedGeneration,
 	}
 	if err := appendBoundedJSONL(hookEventHistoryPath(getHooksDir(), instanceID), ev, hookEventHistoryMax); err != nil {
 		hookHandlerLog.Debug("hook_event_history_failed",

@@ -121,7 +121,7 @@ func TestSendWorkerRestartAfterChildVanishedSettlesUnknown(t *testing.T) {
 		t.Fatalf("record = %+v, want settled typed with an unknown outcome", got)
 	}
 	// A later worker has nothing left to do for this target.
-	if next := nextPending(dir, "target-1"); next != nil {
+	if next := nextPending(dir, "target-1", nil); next != nil {
 		t.Fatalf("settled record still pending: %+v", next)
 	}
 }

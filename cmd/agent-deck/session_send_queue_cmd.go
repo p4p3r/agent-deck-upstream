@@ -519,6 +519,14 @@ func sendRetryBackoffMax() time.Duration {
 	return envDuration("AGENTDECK_SEND_RETRY_BACKOFF_MAX", sendqueue.DefaultRetryBackoffMax)
 }
 
+// correlatedCompletionWindow bounds one wait for a Codex turn to complete
+// before the worker goes back to the queue. A correlated operation used to
+// wait on its record deadline -- seven days -- and because the worker takes
+// one record at a time, a single turn whose completion was missed silenced
+// the whole row: on 2026-10-17 box 2 and box 4 answered nothing in Slack for
+// hours behind exactly one such operation.
+const correlatedCompletionWindow = 2 * time.Minute
+
 // sendLandWindow is how long a delivered send is watched for in the
 // transcript before it is settled without a landed row.
 func sendLandWindow() time.Duration {
@@ -552,25 +560,37 @@ func handleSessionSendWorker(profile string, args []string) {
 		if err != nil || !ok {
 			return // another worker owns this target
 		}
+		// Records this pass has already worked on. A correlated operation that
+		// is waiting for its turn to finish stays non-final, and without this
+		// the worker picks the same one again for ever and every send queued
+		// behind it is never typed -- the whole row goes silent, which is what
+		// box 2 and box 4 did on 2026-10-17.
+		attempted := map[string]bool{}
 		for {
-			rec := nextPending(dir, *target)
+			rec := nextPending(dir, *target, attempted)
 			if rec == nil {
 				break
 			}
+			attempted[rec.SendID] = true
 			deliverQueuedAsync(profile, dir, rec)
 		}
 		startPendingWatchers(profile, dir, *target)
 		releaseQueueLock(lock)
-		// A send queued while this worker was finishing: pick it up.
-		if nextPending(dir, *target) == nil {
+		// A send queued while this worker was finishing: pick it up. Records
+		// already attempted in the pass above are excluded, so a correlated
+		// operation still waiting for its turn does not spin the worker.
+		if nextPending(dir, *target, attempted) == nil {
 			return
 		}
 	}
 }
 
-func nextPending(dir, target string) *sendqueue.Record {
+func nextPending(dir, target string, attempted map[string]bool) *sendqueue.Record {
 	recs, _ := sendqueue.List(dir, target)
 	for _, r := range recs {
+		if attempted[r.SendID] {
+			continue
+		}
 		if r.Correlated() && !r.Final() {
 			return r
 		}
@@ -963,9 +983,28 @@ func completeCorrelatedOperation(profile string, record *sendqueue.Record, deadl
 	if deadline.IsZero() {
 		deadline = time.Now().Add(sendqueue.RetainUncertainBodies)
 	}
-	response, err := waitForCodexTurnOutput(bound, record.AcceptedTurn.TurnGeneration, deadline)
+	// Bounded, and never the record's seven-day retention: a wait that long is
+	// indistinguishable from a hang, and it holds the row's queue behind it.
+	window := time.Now().Add(correlatedCompletionWindow)
+	if window.After(deadline) {
+		window = deadline
+	}
+	response, err := waitForCodexTurnOutput(bound, record.AcceptedTurn.TurnGeneration, window)
 	if err != nil {
-		setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		// The warm completion can be masked before anyone reads it, so ask the
+		// durable history whether this exact generation finished. If it did,
+		// the turn is over and the operation must not keep waiting for it --
+		// the content is simply not recoverable, which is what
+		// result_unavailable says.
+		if session.CodexTurnCompleted(record.SessionID, record.AcceptedTurn.TurnGeneration) {
+			setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+			return
+		}
+		if !time.Now().Before(deadline) {
+			setCorrelatedTerminal(record, sendqueue.OperationResultUnavailable, false, set)
+		}
+		// Still inside the record's own budget and no evidence either way:
+		// leave it for the next pass rather than deciding on no information.
 		return
 	}
 	_ = set(func(current *sendqueue.Record) {

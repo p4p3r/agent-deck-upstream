@@ -70,7 +70,7 @@ func TestPendingQueueDoesNotWaitForEarlierTranscript(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if next := nextPending(dir, "busy-claude"); next == nil || next.SendID != last {
+	if next := nextPending(dir, "busy-claude", nil); next == nil || next.SendID != last {
 		t.Fatalf("next send = %+v, want final queued message", next)
 	}
 	// The earlier sends remain readable for independent transcript watchers.
